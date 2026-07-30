@@ -1,10 +1,9 @@
-name: PR Title Lint
+name: PR Lint
 description: >-
-  Validate that a pull request title follows Conventional Commits, posting a
-  sticky comment on failure and removing it once fixed. Run as a step inside a
-  job the consumer names, so the resulting status-check context is the job name
-  (use this when a required check must keep an exact name; otherwise the sibling
-  reusable workflow pr-lint.yml is simpler to call).
+  Lint a pull request. Currently validates that the PR title follows Conventional
+  Commits, posting a sticky comment on failure and removing it once fixed;
+  further PR-level lint steps can be added here over time. Run as a step inside a
+  job the consumer names, so the resulting status-check context is that job name.
 
 inputs:
   types:
