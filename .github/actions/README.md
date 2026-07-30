@@ -13,9 +13,33 @@ Reusable Tier-1 Claude CI actions for MegaETH repositories.
 - `.github/actions/claude-label-check` - pull request label validation.
 - `.github/actions/claude-issue-triage` - newly opened issue triage.
 
-See also `../workflows/pr-lint.yml` — a reusable workflow (`workflow_call`) that
-lints the PR title against Conventional Commits, callable at
-`megaeth-labs/.github/.github/workflows/pr-lint.yml`.
+- `.github/actions/pr-lint` - lint the PR (currently: PR title against Conventional Commits, with a sticky comment on failure).
+
+### pr-lint
+
+Run it as a step inside a job the consumer owns and names. The status-check
+context is that job's name, so a repo whose branch ruleset requires an exact
+check name (e.g. mega-reth requires `Validate PR title is Conventional Commit`)
+just names the job accordingly:
+
+```yaml
+name: PR Lint
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize]
+  merge_group:
+jobs:
+  conventional-title:
+    name: Validate PR title is Conventional Commit
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: megaeth-labs/.github/.github/actions/pr-lint@main
+```
+
+`types` (newline-separated allowed Conventional Commit types) can be overridden;
+it defaults to the org convention.
 
 ## Inputs
 
