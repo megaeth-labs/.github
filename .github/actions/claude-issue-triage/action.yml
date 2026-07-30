@@ -1,0 +1,61 @@
+name: Claude Issue Triage
+description: Run the centralized MegaETH Claude issue triage.
+
+inputs:
+  claude_code_oauth_token:
+    required: true
+    description: OAuth token for Claude Code.
+  allowed_bots:
+    required: false
+    default: mega-putin
+    description: Bot accounts allowed to trigger Claude Code.
+  extra_allowed_tools:
+    required: false
+    default: ""
+    description: Additional Claude tools to append to the canonical allowedTools list.
+  extra_prompt:
+    required: false
+    default: ""
+    description: Additional prompt text appended after the canonical prompt.
+
+runs:
+  using: composite
+  steps:
+    - id: compose
+      shell: bash
+      env:
+        EXTRA_ALLOWED_TOOLS: ${{ inputs.extra_allowed_tools }}
+      run: |
+        set -euo pipefail
+
+        allowed_tools='Read,Glob,Grep,Bash(gh issue view:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh label list:*),Bash(ls:*)'
+        if [[ -n "$EXTRA_ALLOWED_TOOLS" ]]; then
+          allowed_tools="${allowed_tools},${EXTRA_ALLOWED_TOOLS}"
+        fi
+
+        echo "allowed_tools=${allowed_tools}" >> "$GITHUB_OUTPUT"
+
+    - uses: anthropics/claude-code-action@c3d45e8e941e1b2ad7b278c57482d9c5bf1f35b3 # v1
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        claude_args: |
+          --allowedTools "${{ steps.compose.outputs.allowed_tools }}"
+        prompt: |
+          REPO: ${{ github.repository }}
+          ISSUE NUMBER: ${{ github.event.issue.number }}
+
+          Triage this newly opened issue.
+
+          First, read and respect this repository's own conventions and agent instruction files
+          if they exist: README.md, CLAUDE.md, AGENTS.md, and any other repo-level agent guidance
+          (including any documented triage or labeling rules). These per-repo rules take precedence
+          wherever they conflict with the general guidance below.
+
+          1. Read the issue using `gh issue view ${{ github.event.issue.number }}`.
+          2. Fetch available labels using `gh label list`.
+          3. Based on the issue content and the codebase, apply the appropriate labels using `gh issue edit ${{ github.event.issue.number }} --add-label "label1,label2"`.
+          4. Remove the `triage:needed` label using `gh issue edit ${{ github.event.issue.number }} --remove-label "triage:needed"`.
+          5. If the issue is unclear or you are not confident about the labels, leave `triage:needed` and add a comment asking for clarification.
+
+          ${{ inputs.extra_prompt }}

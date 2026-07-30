@@ -1,0 +1,69 @@
+name: Claude Label Check
+description: Run the centralized MegaETH Claude pull request label check.
+
+inputs:
+  claude_code_oauth_token:
+    required: true
+    description: OAuth token for Claude Code.
+  allowed_bots:
+    required: false
+    default: mega-putin
+    description: Bot accounts allowed to trigger Claude Code.
+  extra_allowed_tools:
+    required: false
+    default: ""
+    description: Additional Claude tools to append to the canonical allowedTools list.
+  extra_prompt:
+    required: false
+    default: ""
+    description: Additional prompt text appended after the canonical prompt.
+
+runs:
+  using: composite
+  steps:
+    - id: compose
+      shell: bash
+      env:
+        EXTRA_ALLOWED_TOOLS: ${{ inputs.extra_allowed_tools }}
+      run: |
+        set -euo pipefail
+
+        allowed_tools='Read,Glob,Grep,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh api:*),Bash(gh label list:*),Bash(git log:*),Bash(git diff:*),Bash(ls:*)'
+        if [[ -n "$EXTRA_ALLOWED_TOOLS" ]]; then
+          allowed_tools="${allowed_tools},${EXTRA_ALLOWED_TOOLS}"
+        fi
+
+        echo "allowed_tools=${allowed_tools}" >> "$GITHUB_OUTPUT"
+
+    - uses: anthropics/claude-code-action@c3d45e8e941e1b2ad7b278c57482d9c5bf1f35b3 # v1
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        claude_args: |
+          --allowedTools "${{ steps.compose.outputs.allowed_tools }}"
+        prompt: |
+          REPO: ${{ github.repository }}
+          PR NUMBER: ${{ github.event.pull_request.number }}
+
+          Check if the current labels on this PR are correct.
+
+          First, read and respect this repository's own conventions and agent instruction files
+          if they exist: README.md, CLAUDE.md, AGENTS.md, and any other repo-level agent guidance
+          (including any documented labeling rules). These per-repo rules take precedence wherever
+          they conflict with the general guidance below.
+
+          Read the PR diff using `gh pr diff` and check the current labels using `gh pr view`.
+          Fetch the complete list of available labels using `gh label list`.
+
+          Before commenting, check existing PR comments using `gh pr view --comments`.
+          If you already posted a label-related comment on this PR:
+          - If the labels have been fixed to match your suggestions, delete your previous comment using `gh api` — the feedback is no longer relevant.
+          - If there are still label issues but they changed, edit your existing comment using `gh pr comment --edit-last` instead of posting a new one.
+          - If the labels are unchanged from your previous comment, do nothing.
+          Only post a NEW comment if there is no prior label-related comment from you AND there are label issues to report.
+
+          If any labels are incorrect or missing, post exactly ONE comment explaining all label issues.
+          Do NOT add or remove labels yourself. Only comment.
+          If all labels look correct, do nothing — no comment needed.
+
+          ${{ inputs.extra_prompt }}

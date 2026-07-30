@@ -1,0 +1,41 @@
+name: Claude Interactive
+description: Run the interactive @claude handler with centralized MegaETH permissions.
+
+inputs:
+  claude_code_oauth_token:
+    required: true
+    description: OAuth token for Claude Code.
+  allowed_bots:
+    required: false
+    default: mega-putin
+    description: Bot accounts allowed to trigger Claude Code.
+  extra_allowed_tools:
+    required: false
+    default: ""
+    description: Additional Claude tools to append to the canonical allowedTools list.
+
+runs:
+  using: composite
+  steps:
+    - id: compose
+      shell: bash
+      env:
+        EXTRA_ALLOWED_TOOLS: ${{ inputs.extra_allowed_tools }}
+      run: |
+        set -euo pipefail
+
+        allowed_tools='Read,Write,Edit,Glob,Grep,mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr edit:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue list:*),Bash(gh label list:*),Bash(gh run view:*),Bash(gh run list:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git blame:*),Bash(git status:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git checkout:*),Bash(ls:*),Bash(tree:*)'
+        if [[ -n "$EXTRA_ALLOWED_TOOLS" ]]; then
+          allowed_tools="${allowed_tools},${EXTRA_ALLOWED_TOOLS}"
+        fi
+
+        echo "allowed_tools=${allowed_tools}" >> "$GITHUB_OUTPUT"
+
+    - uses: anthropics/claude-code-action@c3d45e8e941e1b2ad7b278c57482d9c5bf1f35b3 # v1
+      with:
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        additional_permissions: |
+          actions: read
+        claude_args: |
+          --allowedTools "${{ steps.compose.outputs.allowed_tools }}"
