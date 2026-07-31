@@ -2402,8 +2402,9 @@ def render_status_body(
         "> **Living comment — rewritten in place.** The review workflow keeps"
         " this single comment up to date instead of posting a new one each"
         " round, so it always describes the latest reviewed commit and the"
-        " earlier text is intentionally gone. No reply is needed here; answer"
-        " findings and questions in the review threads it links to.",
+        " earlier text is intentionally gone. No reply is needed here; reply to"
+        " a finding in its own review thread, and answer an open question in a"
+        " reply on this PR. The next review round reconciles your answer.",
         "",
         status_title,
         "",
