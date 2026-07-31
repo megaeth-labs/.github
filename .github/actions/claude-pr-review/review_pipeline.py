@@ -1043,6 +1043,29 @@ def write_github_output(values: dict[str, Any]) -> None:
             output.write(f"{key}={value}\n")
 
 
+def manifest_has_open_items(manifest: dict[str, Any]) -> bool:
+    """True when the manifest still has an open question or open finding.
+
+    Gates comment-triggered rounds: a PR comment only warrants a new review
+    round when the reviewer is still waiting on something the comment might
+    answer, justify, or invalidate. Findings count too, not just questions —
+    a comment can push back on a finding, not only answer a question.
+    """
+    findings = manifest.get("findings")
+    if isinstance(findings, dict) and any(
+        isinstance(finding, dict) and finding.get("status") == "open"
+        for finding in findings.values()
+    ):
+        return True
+    questions = manifest.get("questions")
+    if isinstance(questions, dict) and any(
+        isinstance(question, dict) and question.get("status") == "open"
+        for question in questions.values()
+    ):
+        return True
+    return False
+
+
 def prepare(args: argparse.Namespace) -> None:
     action_dir = Path(__file__).resolve().parent
     state_dir = Path(args.state_dir)
@@ -1163,16 +1186,39 @@ def prepare(args: argparse.Namespace) -> None:
         comparison.get("files", []) if isinstance(comparison, dict) else []
     )
     comparison_complete = len(comparison_files) < 300
-    if previous_head == current_head and version_matches:
-        mode = "skip"
-        mode_reason = "current head already reviewed"
-    elif (
+    ancestor_cursor = bool(
         previous_head
         and version_matches
         and comparison
         and comparison.get("status") in {"ahead", "identical"}
         and comparison_complete
-    ):
+    )
+    if args.event_name == "issue_comment":
+        # A comment never adds code to review — it can only answer an open
+        # question or justify/invalidate an open finding. Run a reconcile-only
+        # incremental round when the reviewer is still waiting on something and
+        # the prior manifest is usable; otherwise skip, so routine chatter does
+        # not spend a review. When the head has not moved the delta is empty and
+        # the round exists purely to reconcile the new discussion.
+        if (
+            version_matches
+            and manifest_has_open_items(manifest)
+            and (previous_head == current_head or ancestor_cursor)
+        ):
+            mode = "incremental"
+            mode_reason = "comment received while items are open"
+            incremental_paths = [
+                str(file["filename"])
+                for file in comparison_files
+                if isinstance(file, dict) and file.get("filename")
+            ]
+        else:
+            mode = "skip"
+            mode_reason = "comment received with nothing open to reconcile"
+    elif previous_head == current_head and version_matches:
+        mode = "skip"
+        mode_reason = "current head already reviewed"
+    elif ancestor_cursor:
         mode = "incremental"
         mode_reason = "valid prior manifest and ancestor review cursor"
         incremental_paths = [
@@ -2970,6 +3016,7 @@ def parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--pull-request", type=int, required=True)
     prepare_parser.add_argument("--event-head")
     prepare_parser.add_argument("--event-base")
+    prepare_parser.add_argument("--event-name", default="pull_request")
     prepare_parser.add_argument("--state-dir", required=True)
     prepare_parser.add_argument(
         "--resolve-threads",

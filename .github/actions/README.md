@@ -151,6 +151,41 @@ Questions published before the `<details>` shape existed fall back to a single-l
 A question that is already open is never re-asked; the original stays the copy the author
 answers.
 
+### Comment-triggered reconciliation (opt-in)
+
+By default the review only runs on `pull_request` events, so an author who answers an open
+question in a PR comment sees nothing happen until the next push. A consumer can also let a
+comment drive a reconcile round by adding an `issue_comment` trigger:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  pr-review:
+    # Only human comments on a PR; ignore issue comments and bot chatter.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request != null &&
+       github.event.comment.user.type != 'Bot')
+    concurrency:
+      # issue_comment payloads carry issue.number, not pull_request.number.
+      group: claude-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+```
+
+The action gates the round cheaply so routine chatter does not spend a review: on an
+`issue_comment` event, `prepare` skips unless the PR still has an **open question or open
+finding** in the manifest (something a comment could answer, justify, or invalidate). When it
+does run it is an incremental round that reuses the same sticky-comment manifest — so the
+reviewer keeps its full prior context, unlike a fresh `@claude` session — and it runs on the
+cheaper incremental model tier. If the comment turns out not to change anything, the publisher
+posts nothing (no new review, no notification). A comment with no new commit reconciles the
+discussion against the existing head; a comment that races a push reviews the new delta too.
+
 ## Per-Repo Conventions
 
 The prompt-bearing actions instruct Claude to read and respect a consumer repo's own agent

@@ -77,9 +77,10 @@ runs:
         set -euo pipefail
         python3 "$GITHUB_ACTION_PATH/review_pipeline.py" prepare \
           --repository "$GITHUB_REPOSITORY" \
-          --pull-request "${{ github.event.pull_request.number }}" \
+          --pull-request "${{ github.event.pull_request.number || github.event.issue.number }}" \
           --event-head "${{ github.event.pull_request.head.sha }}" \
           --event-base "${{ github.event.pull_request.base.sha }}" \
+          --event-name "$GITHUB_EVENT_NAME" \
           --state-dir "$STATE_DIR" \
           --resolve-threads "${{ inputs.github_identity_token != '' }}" \
           --review-depth "$REVIEW_DEPTH" \
