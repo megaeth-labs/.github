@@ -166,11 +166,14 @@ on:
 
 jobs:
   pr-review:
-    # Only human comments on a PR; ignore issue comments and bot chatter.
+    # Any PR comment except the reviewer's own status comment, which is posted
+    # by the CI app and would otherwise retrigger the review. Other bots are
+    # allowed — their comments may answer a question or push back on a finding.
+    # Replace mega-maxwell[bot] with your reviewer app's login.
     if: >-
       github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request != null &&
-       github.event.comment.user.type != 'Bot')
+       github.event.comment.user.login != 'mega-maxwell[bot]')
     concurrency:
       # issue_comment payloads carry issue.number, not pull_request.number.
       group: claude-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
