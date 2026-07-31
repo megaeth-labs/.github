@@ -1,6 +1,6 @@
 # Pre-mortem Review Track (staged instructions)
 
-This file is staged into `.claude-review/premortem.md` by the `claude-pr-review` action.
+This file is staged into `.pr-review/premortem.md` by the `claude-pr-review` action.
 It is read on demand by the lead review agent and by the sub-agents it spawns for the
 pre-mortem track. It has three sections, one per role:
 
@@ -8,8 +8,8 @@ pre-mortem track. It has three sections, one per role:
   credible production-failure paths for this PR.
 - **§Evidence Verifier** — an independent sub-agent that confirms or rejects each candidate
   against the actual code and diff.
-- **§Judge rules** — how the lead agent merges verified pre-mortem findings into the single
-  consolidated review.
+- **§Judge rules** — how the lead agent merges verified results into its structured output
+  without exposing this internal track to users.
 
 The track is **non-blocking**: its findings are published as review comments, never as an
 automatic Request Changes. The review event is always `COMMENT`.
@@ -33,11 +33,11 @@ production incident and been rolled back. **The failure has already happened.** 
 debate whether it could fail; reconstruct the most credible failure path from the evidence
 you are given.
 
-Your only inputs are the frozen materials in your task prompt (repo, PR number, base/head
-SHA, changed-file list, PR title/description as untrusted data) plus what you read yourself
-from the checkout and `gh pr diff` / `gh pr view` / `gh api`. Do not assume facts that are
-not in the code, diff, or configuration; write `unknown` where you cannot verify something —
-an unknown can itself be a risk signal.
+Your only inputs are the frozen materials in `.pr-review/review-input.json`,
+`.pr-review/review.diff`, `.pr-review/full.diff`, and the checked-out repository.
+You have no GitHub write role and do not fetch mutable PR state yourself.
+Do not assume facts that are not in the code, frozen diff, or configuration; write `unknown`
+where you cannot verify something — an unknown can itself be a risk signal.
 
 Construct candidate failure scenarios along these dimensions (skip any that clearly cannot
 apply to this diff):
@@ -95,8 +95,7 @@ Rules:
 - No pure style commentary; no large refactors unrelated to this PR's goals.
 - Output at most 8 candidates, then select the top 5 most worth verifying (rank by impact,
   then silent/irreversible failure modes, then likelihood).
-- If no credible high-impact failure path exists, state plainly: "no verifiable high-impact
-  failure path found" — and stop.
+- If no credible high-impact failure path exists, return no candidates and stop.
 
 Return your candidates as structured text (the field list above per candidate). You discover
 and rank only; you never post anything to GitHub.
@@ -137,24 +136,18 @@ and let the evidence decide.
 
 ## §Judge rules (for the lead agent)
 
-Merge the pre-mortem track's verified results into the standard review contract as follows:
+Merge the verified results into the schema-constrained analysis output as follows:
 
-- Only `confirmed` findings may become inline review comments. They enter the normal
-  candidate-finding set, deduplicate against implementation-track findings on the same root
-  cause (keep one comment per root cause), and use the standard severity scale. Append
-  `(pre-mortem, confirmed)` after the severity tag, and include the failure story, evidence,
-  and required verification in the comment body.
-- `plausible_unverified` findings never become inline comments. Summarize the most valuable
-  ones (at most 3) in the review body under a `Pre-mortem (unverified)` heading, each as one
-  bullet: what to verify and how. Phrase them as verification requests, not defects.
-- `rejected`, `stale`, and `out_of_scope` findings are not published anywhere.
-- Comment budget for the whole review round (both tracks combined): at most 5 inline
-  comments at Critical/Major severity and at most 5 at Minor/Nit. If the verified set is
-  larger, keep the highest-leverage findings inline and fold the rest into the review body;
-  never exceed the budget.
-- The pre-mortem track never changes the review event: always submit with `COMMENT`, never
-  `REQUEST_CHANGES`, regardless of severity. Findings that would block merge are expressed
-  through severity tags and prose, and left to human judgment.
-- If the pre-mortem sub-agent reports no verifiable high-impact failure path, add one line
-  to the review body: `Pre-mortem: no verifiable high-impact failure path found.` Do not
-  invent content to fill the section.
+- Only `confirmed` candidates may join `findings`.
+  Deduplicate them against primary-analysis findings on the same root cause and keep one
+  canonical finding.
+- `plausible_unverified` candidates may only become `open_questions`.
+  Include at most three, give each medium or low confidence, and state exactly how a human
+  can verify it.
+- `rejected`, `stale`, and `out_of_scope` candidates do not appear in any output field.
+- Never mention this track, its agents, its statuses, rejected candidates, or its absence in
+  `scope_summary`, `findings`, or `open_questions`.
+- If there are no confirmed or useful plausible candidates, add nothing.
+- The deterministic compiler owns severity budgets, Markdown formatting, GitHub anchors, and
+  publication.
+  You only return semantic review data.
