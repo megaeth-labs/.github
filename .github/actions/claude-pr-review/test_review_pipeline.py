@@ -133,6 +133,38 @@ class ReviewPipelineTests(unittest.TestCase):
             action,
         )
 
+    def test_manifest_has_open_items_gates_comment_rounds(self):
+        # The gate that decides whether a PR comment is worth a review round:
+        # true only while a question or finding is still open.
+        self.assertFalse(pipeline.manifest_has_open_items({}))
+        self.assertFalse(
+            pipeline.manifest_has_open_items(
+                {
+                    "findings": {"F-1": {"status": "resolved"}},
+                    "questions": {"Q-1": {"status": "answered"}},
+                }
+            )
+        )
+        self.assertTrue(
+            pipeline.manifest_has_open_items(
+                {"findings": {"F-1": {"status": "open"}}, "questions": {}}
+            )
+        )
+        self.assertTrue(
+            pipeline.manifest_has_open_items(
+                {"findings": {}, "questions": {"Q-1": {"status": "open"}}}
+            )
+        )
+
+    def test_action_wires_comment_trigger_inputs(self):
+        action = Path(pipeline.__file__).with_name("action.yml").read_text(
+            encoding="utf-8"
+        )
+        # On an issue_comment event the PR number falls back to the issue
+        # number, and the event name is passed so prepare can gate the round.
+        self.assertIn("github.event.issue.number", action)
+        self.assertIn("--event-name", action)
+
     def test_action_exposes_optional_github_identity_token(self):
         action = Path(pipeline.__file__).with_name("action.yml").read_text(
             encoding="utf-8"
