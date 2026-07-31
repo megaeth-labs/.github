@@ -103,7 +103,7 @@ Can the next person change and run this safely?
 ## Routing to detailed checks (read on demand)
 
 Before finalizing, if the diff touches any of these areas, read the matching section of
-`.claude-review/rubric-detail.md` and apply it; skip areas the diff does not touch (these are
+`.pr-review/rubric-detail.md` and apply it; skip areas the diff does not touch (these are
 line-level checks — do not load them when irrelevant):
 
 - **Persistence / on-disk writes / serialization** → §Persistence

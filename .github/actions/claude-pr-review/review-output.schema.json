@@ -1,0 +1,153 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scope_summary",
+    "findings",
+    "open_questions",
+    "prior_findings",
+    "prior_questions"
+  ],
+  "properties": {
+    "scope_summary": {
+      "type": "string",
+      "maxLength": 240
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "path",
+          "symbol",
+          "line",
+          "severity",
+          "confidence",
+          "root_cause",
+          "impact",
+          "suggested_fix"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "symbol": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "start_line": {
+            "type": ["integer", "null"],
+            "minimum": 1
+          },
+          "severity": {
+            "enum": ["critical", "major", "minor", "nit"]
+          },
+          "confidence": {
+            "const": "high"
+          },
+          "root_cause": {
+            "type": "string",
+            "maxLength": 600
+          },
+          "impact": {
+            "type": "string",
+            "maxLength": 800
+          },
+          "suggested_fix": {
+            "type": "string",
+            "maxLength": 800
+          },
+          "prior_finding_id": {
+            "type": ["string", "null"],
+            "maxLength": 80
+          }
+        }
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "question",
+          "confidence",
+          "why_it_matters",
+          "verification"
+        ],
+        "properties": {
+          "question": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "confidence": {
+            "enum": ["medium", "low"]
+          },
+          "why_it_matters": {
+            "type": "string",
+            "maxLength": 600
+          },
+          "verification": {
+            "type": "string",
+            "maxLength": 600
+          }
+        }
+      }
+    },
+    "prior_questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question_id", "disposition", "reason"],
+        "properties": {
+          "question_id": {
+            "type": "string",
+            "maxLength": 80
+          },
+          "disposition": {
+            "enum": ["open", "answered", "withdrawn"]
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 300
+          }
+        }
+      }
+    },
+    "prior_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "disposition", "reason"],
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "maxLength": 80
+          },
+          "disposition": {
+            "enum": ["open", "resolved"]
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 600
+          }
+        }
+      }
+    }
+  }
+}

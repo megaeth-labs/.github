@@ -57,9 +57,99 @@ The `interactive` action does not accept `extra_prompt` because `@claude` is nat
 
 The `pr-review` action additionally accepts:
 
-- `model` - optional, defaults to `opus`. Passed through to `claude --model`. Set another model id to override, or empty to fall through to the Claude Code CLI default (Sonnet class). Note the `opus` default means every consumer runs reviews on Opus out of the box.
-- `review_depth` - optional, defaults to `standard` (single-agent review). Set to `deep` for multi-agent orchestration: the lead agent fans out one sub-agent per review dimension, adversarially verifies each finding, then converges on the same single consolidated review. `deep` costs more tokens and wall-clock, so raise the calling job's `timeout-minutes` (see Concurrency) and prefer gating it per-PR (e.g. a label) rather than enabling it for every review.
-- `premortem` - optional, defaults to `on`. Adds an independent pre-mortem track to the review: a fresh sub-agent with no shared context assumes the PR already shipped and caused a production incident, reconstructs the most credible failure paths (top 5 candidates), an evidence-verifier sub-agent confirms or rejects each one against the actual code at head, and only `confirmed` findings are published as inline comments (marked `(pre-mortem, confirmed)`). `plausible_unverified` items appear only as non-blocking verification requests in the review body; rejected/stale/out-of-scope candidates are suppressed. The track is non-blocking — the review event is always `COMMENT`, never `REQUEST_CHANGES` — and caps the round at 5 Critical/Major plus 5 Minor/Nit inline comments across both tracks. It adds sub-agent wall-clock, so give the calling job `timeout-minutes` of at least `35`. Set to `off` to disable. The role prompts live in `claude-pr-review/premortem.md`.
+- `github_identity_token` - optional, defaults to empty.
+  When supplied, this token is the single identity for creating reviews,
+  posting or updating status comments, and resolving addressed automated
+  review threads.
+  When omitted, publication uses the job token and leaves GitHub thread state
+  unchanged.
+- `model` - optional, defaults to `claude-opus-4-7`.
+  This strong model handles initial, high-risk, and explicitly deep reviews.
+- `incremental_model` - optional, defaults to empty, which uses the Claude Code default
+  (Sonnet class).
+  It handles low-risk incremental reviews.
+- `review_depth` - optional, defaults to `standard`.
+  Set it to `deep` to make the semantic-analysis stage fan out relevant review dimensions
+  and adversarially verify the candidates before returning one structured result.
+- `premortem` - optional, defaults to `auto`.
+  Automatic mode runs the independent production-failure analysis for initial and high-risk
+  reviews, but skips it for ordinary incremental updates.
+  `on` always enables it and `off` disables it.
+
+The semantic-analysis stage runs under a turn budget: 12 for a low-risk incremental review,
+36 for a strong-tier one, and 56 for `deep`.
+Roughly ten turns go on mandated context — six pipeline files plus repo guidance — before the
+diff is read, and a small diff inside a large file spends many more paging through it, so the
+budget tracks files to understand rather than lines changed.
+The retry gets half again as many turns as the first attempt, because exhausting the budget is
+deterministic and replaying it with the same budget cannot succeed.
+
+Consumers that already create a GitHub App token can opt into the unified identity with:
+
+```yaml
+with:
+  github_identity_token: ${{ steps.app-token.outputs.token }}
+```
+
+The semantic stage is bounded to 12 turns for fast incremental reviews, 24 for standard
+full or high-risk reviews, and 40 for explicit deep reviews.
+
+### PR review pipeline
+
+The PR reviewer is an explicit staged pipeline:
+
+1. A deterministic preparation step freezes the base and head SHAs, loads the durable review
+   manifest, fetches prior automated threads, computes the full or incremental diff, and
+   selects the model tier. It then posts or updates the sticky status comment to
+   `🔄 Review in progress`, so the PR shows the round has started instead of staying silent
+   until the review lands minutes later.
+2. Claude performs semantic analysis and verification with read-only tools.
+   It returns schema-constrained data and cannot publish comments or resolve threads.
+3. A deterministic compiler validates findings, enforces severity budgets, checks RIGHT-side
+   anchors, formats the standard human-facing messages, and suppresses internal review
+   machinery.
+4. A deterministic publisher rechecks the live head, submits at most one review, optionally
+   resolves addressed automated threads, and updates one sticky status comment.
+
+The sticky comment contains a hidden, versioned manifest with the last published head,
+reviewer and rubric versions, stable finding IDs, thread IDs, and finding dispositions.
+Later runs use that manifest as a checkpoint and fall back to GitHub review history if the
+manifest is unavailable.
+The manifest never contains complete diffs, PR prose, tool output, secrets, or Claude session
+transcripts.
+Inline findings are linked back to the exact published review and comment IDs, with bounded
+retries for GitHub API propagation.
+When `github_identity_token` is configured, the publisher does not mark a GitHub thread
+resolved unless GitHub confirms the resolution mutation.
+The configured identity is stored in the review manifest while historical `claude` and
+`github-actions` state remains readable for migration.
+
+The action performs a full review when there is no valid checkpoint, the previous head is not
+an ancestor, or the pipeline or rubric version changed.
+Otherwise it reviews only the delta since the last published head and rechecks open findings.
+It discards output if the PR head changes during analysis.
+
+Internal production-failure analysis is never named in GitHub review output.
+Confirmed issues become ordinary findings.
+Useful uncertainty becomes an `Open question` with medium or low confidence and a concrete
+verification request.
+Rejected candidates and an empty internal analysis remain invisible.
+
+Open questions have the same durable lifecycle as findings.
+Each one gets a stable ID and a hidden marker on its status line, and the manifest records
+which review asked it.
+Each question is published inside a `<details>` block that starts expanded.
+A later round dispositions every open question as `open`, `answered`, or `withdrawn`, and the
+publisher edits the original review body in place so the summary line reads
+`✅ **Answered**` or `🚫 **Withdrawn**` with a one-line reason, and the block collapses.
+The rationale bullets are kept rather than deleted, so an answered question stays one green
+line that expands to the original question, why it mattered, and how to verify it.
+Editing a submitted review body creates no new review and no new notification, and rewriting
+reproduces the same header (marker included), so the update is idempotent and retried on the
+next round if GitHub rejects it.
+Questions published before the `<details>` shape existed fall back to a single-line rewrite.
+A question that is already open is never re-asked; the original stays the copy the author
+answers.
 
 ## Per-Repo Conventions
 
@@ -69,19 +159,37 @@ other repo-level agent guidance), with those per-repo rules taking precedence ov
 canonical inline prompt. Use these files for repo-specific rules; reserve `extra_prompt` for
 small deltas that do not belong in a checked-in convention file.
 
-`pr-review` lets Claude iterate through multiple review passes before submission and stop only after it converges on no new actionable findings.
-It blocks the standalone inline-comment tool and requires new findings to be submitted through one pending GitHub review that is submitted once, so a completed review round should create one review notification.
-When old automated review threads are addressed, the action instructs Claude to resolve them silently instead of adding per-thread confirmation replies.
-It also tags every inline comment with a bold severity label (`**[Critical]**`, `**[Major]**`, `**[Minor]**`, `**[Nit]**`).
-A consumer repo's `REVIEW.md` may override or extend this severity scale.
+`pr-review` tags every inline finding with a bold severity label (`**[Critical]**`,
+`**[Major]**`, `**[Minor]**`, or `**[Nit]**`).
+Clean reviews and re-reviews update the sticky status without creating another review
+notification.
+Rounds with findings or new open questions submit one atomic review and update the same sticky
+status.
+The sticky status comment states up front that it is a living comment rewritten in place on
+every run, so a reader who meets it mid-thread can tell it describes the current head rather
+than the moment it first appeared.
+It carries the reviewed range, an update timestamp, this round's counts, and a roll-up of the
+questions still awaiting an answer with a link to the review that asked each one.
+It moves through three phases: `🔄 Review in progress` from preparation, then either the
+finished verdict or `🛠️ Review did not finish` for a round that ends without publishing.
+Every non-publishing path — a failure, a discarded stale head — retires the in-progress phase
+itself, so the comment never sits at "in progress" after the job ends. A skip-mode round
+publishes nothing and is never announced.
+When old automated review threads are addressed, the deterministic publisher resolves them
+without adding confirmation replies.
+A consumer repo's `REVIEW.md` may override or extend the semantic severity guidance.
 
 ## Consumer Requirements
 
-Consumer jobs should pin these actions to a commit SHA (with a `# main` comment), e.g.
-`megaeth-labs/.github/.github/actions/claude-interactive@<sha>`. Bumping the pinned SHA after a
-merge to `.github` `main` rolls the change out to that consumer.
-The available actions are `claude-interactive`, `claude-pr-review`, `claude-label-check`, and
-`claude-issue-triage`.
+Consumer jobs should pin these actions to `@main`. A merge to this repository's `main` goes live
+for every consumer automatically, with no consumer workflow edits required.
+Use `megaeth-labs/.github/.github/actions/claude-interactive@main`,
+`megaeth-labs/.github/.github/actions/claude-pr-review@main`,
+`megaeth-labs/.github/.github/actions/claude-label-check@main`, or
+`megaeth-labs/.github/.github/actions/claude-issue-triage@main`.
+
+Because the same merge ships to every consumer at once, changes here are covered by the
+`Actions` workflow, which runs the `claude-pr-review` pipeline's unit tests on every PR.
 
 Consumer jobs must run `actions/checkout` before these actions. They must also provide the
 `CLAUDE_CODE_OAUTH_TOKEN` secret and set role-appropriate job permissions:
@@ -91,9 +199,8 @@ Consumer jobs must run `actions/checkout` before these actions. They must also p
 - `claude-label-check`: `contents: read`, `pull-requests: write`, `id-token: write`
 - `claude-issue-triage`: `contents: read`, `issues: write`, `id-token: write`
 
-Before consumer repositories can reference these actions, an org maintainer must enable
-Settings -> Actions -> General -> Access -> "Accessible from repositories in the megaeth-labs organization"
-on this (`.github`) repository.
+Before consumer repositories can reference these private actions, maintainers must enable
+Settings -> Actions -> General -> Access -> "Accessible from repositories in the megaeth-labs organization".
 
 ## Example
 
@@ -112,7 +219,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/.github/.github/actions/claude-pr-review@<sha> # main
+      - uses: megaeth-labs/.github/.github/actions/claude-pr-review@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           extra_allowed_tools: "Bash(cargo:*)"
@@ -125,18 +232,21 @@ jobs:
 > `claude-code-action` validates that workflow against the default branch before it exchanges
 > its app token, so self-modifying PRs cannot run the review step safely.
 > This only affects the repo that changed its own workflow.
-> It does not affect consumers pinned to a SHA in normal operation.
+> It does not affect consumers pinned to `@main` in normal operation.
 
 ## Concurrency (pr-review)
 
-Consumers should give the `pr-review` job a `timeout-minutes` value of at least `25` (`35` when the default-on pre-mortem track is enabled) plus a job-level concurrency group with `cancel-in-progress: false`.
-This helps an in-progress multi-turn review finish instead of being cancelled mid-run, because the action resolves addressed automated threads silently and posts one consolidated review per round.
-Cancelling can leave partial state:
+Consumers should give the `pr-review` job a `timeout-minutes` value of at least `25` plus a
+job-level concurrency group with `cancel-in-progress: true`.
+The publisher revalidates the live PR base and head immediately before each GitHub mutation,
+and review submissions are pinned to the frozen head commit. If either revision changes,
+publication stops without advancing the manifest.
+Latest-only cancellation avoids spending review time on queued, obsolete heads:
 
 ```yaml
 pr-review:
   timeout-minutes: 25
   concurrency:
     group: claude-pr-review-${{ github.event.pull_request.number }}
-    cancel-in-progress: false
+    cancel-in-progress: true
 ```
