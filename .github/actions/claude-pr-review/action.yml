@@ -40,6 +40,14 @@ inputs:
     description: >
       `standard` runs one lead review. `deep` asks the lead to fan out review
       dimensions and adversarially verify them before returning structured data.
+  debug_logs:
+    required: false
+    default: "false"
+    description: >
+      `true` prints the analysis session's full output, including its tool
+      calls, into the job log. Off by default because the log is long and the
+      review itself is the product; turn it on to answer why a review reached
+      the verdict it did — which files it opened, and which it never read.
   premortem:
     required: false
     default: auto
@@ -112,9 +120,12 @@ runs:
         # on context before the diff is even read; a review whose diff sits in
         # a large file spends many more paging through it. 24 proved too tight
         # for exactly that shape (a small diff inside a big file) even though
-        # it is ample for a typical PR.
+        # it is ample for a typical PR. The strong tier gets more room still
+        # because the contract asks it to look past the changed files — at
+        # callers, companion config or data, and comparable earlier commits —
+        # and that reading has to fit alongside the diff itself.
         selected_model="$STRONG_MODEL"
-        max_turns=36
+        max_turns=44
         if [[ "$MODEL_TIER" == "fast" ]]; then
           selected_model="$INCREMENTAL_MODEL"
           max_turns=12
@@ -150,7 +161,7 @@ runs:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         allowed_bots: ${{ inputs.allowed_bots }}
         display_report: false
-        show_full_output: false
+        show_full_output: ${{ inputs.debug_logs == 'true' }}
         additional_permissions: |
           actions: read
         claude_args: |
@@ -193,6 +204,12 @@ runs:
           1. Respect the frozen mode and SHA scope in review-input.json. For an
              incremental review, discover new findings only in review.diff. Use the
              current files and full.diff to decide whether prior findings were fixed.
+             The frozen scope bounds which *changes* you may raise findings about; it
+             does not bound what you may read. The changed files are the starting
+             point of a review, not its boundary — a full review is expected to open
+             the repository around the diff (callers, siblings, the config, schema,
+             data, or docs the change depends on, and `git log` on comparable earlier
+             commits) whenever that is what deciding the change requires.
           2. Examine every open manifest finding. Return a prior_findings disposition
              (`open` or `resolved`) for each finding you assessed. An omitted finding
              remains open; only an explicit `resolved` disposition closes one. Never
@@ -244,6 +261,14 @@ runs:
           7. Use path and RIGHT-side line candidates from the full PR diff. The
              deterministic compiler will validate anchors and move unanchorable items
              into the review body.
+             One finding class is anchored differently: an omitted companion change —
+             something this pull request should have updated and did not. Anchor it on
+             the existing file that should have changed, at the line that is now stale
+             or that the missing entry should follow, even though that file is absent
+             from the diff. The compiler accepts any path present in the checkout and
+             publishes these in the review body. Do not downgrade or drop such a
+             finding because it has no inline anchor, and do not restate it as an open
+             question when you have verified the omission against the repository.
           8. Keep scope_summary to one short sentence describing what was reviewed.
 
           If review-input.json sets `review_scope.run_premortem` to true, read
@@ -273,7 +298,7 @@ runs:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         allowed_bots: ${{ inputs.allowed_bots }}
         display_report: false
-        show_full_output: false
+        show_full_output: ${{ inputs.debug_logs == 'true' }}
         additional_permissions: |
           actions: read
         claude_args: |

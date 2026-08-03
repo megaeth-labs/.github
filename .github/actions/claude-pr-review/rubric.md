@@ -58,7 +58,29 @@ What does this disturb that others depend on?
 - Don't change the semantics of an existing function — add a new one.
 - Treat stable wire, on-disk, and public surfaces as sacred.
 
-### 4. Change & operate
+### 4. Completeness — what the diff leaves undone
+
+The changed files are where you start, not where you stop. A change that is correct on every
+line it touches still ships broken when the file it depends on was never updated, and no
+amount of line-reading finds that. Ask what a complete version of _this_ change touches, then
+check whether each piece is actually there.
+
+- **Derive the companion set from the stated intent**, not from the diff. The PR description,
+  title, and the changed files themselves make a promise; verify the rest of the repo keeps it.
+- Recurring shapes: a value declared in one file and consumed in another (schema, config,
+  genesis, constant table, feature flag); docs, release notes, or a changelog that announce
+  behavior the data or code does not yet have; a new enum/match arm added at one site but not
+  its siblings; a rename applied to code but not to configs, fixtures, or docs; a version, ID,
+  or date that must agree across several files; a new failure mode with no metric, alert, or
+  test.
+- **Read the history for the convention.** `git log`/`git show` on the last few commits of the
+  same shape is the cheapest way to learn which files move together in this repo. A companion
+  file that changed in every prior commit of this kind and not in this one is a finding.
+- An omission has no line on the RIGHT side of the diff, which makes it easy to skip and easy
+  to under-rate. It is not a weaker finding for being unanchorable — report it against the file
+  that should have changed, and let the compiler place it in the review body.
+
+### 5. Change & operate
 
 Can the next person change and run this safely?
 
