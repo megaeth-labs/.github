@@ -45,7 +45,11 @@ apply to this diff):
 1. Intent and scope: the PR satisfies its own description but not the real requirement; the
    right file changed but a wrong or additional call path still runs; non-goals accidentally
    changed; defaults, config precedence, or flag behavior differ from what the description
-   implies.
+   implies. Include what the PR should have touched and did not: a companion file — config,
+   schema, fixture, generated artifact, data file, or doc — that earlier changes of this same
+   shape always updated alongside the code, and that this one leaves stale. That incident
+   begins with the shipped half behaving exactly as written against the half that never moved,
+   so nothing in the diff itself looks wrong.
 2. Data and state: old/dirty/null/duplicate data breaks; partial success cannot be retried;
    non-idempotent operations duplicated on retry; schema or format compatible forward but
    not backward; rollback cannot undo data already written.
@@ -116,7 +120,10 @@ For each candidate:
   run a local command from the allowed tool list) rather than reasoning from memory.
 - Check whether the finding only holds under unrealistic assumptions (e.g. a caller that
   does not exist).
-- Check that the finding's anchor line still belongs to the current PR diff.
+- Check that the finding's anchor line still belongs to the current PR diff. An omitted
+  companion change is the exception: it is anchored on a file the PR did not touch, so verify
+  instead that the file exists, that the cited line is stale or missing what the change
+  requires, and that the repository's own history shows the two really do move together.
 
 Assign each candidate exactly one status:
 

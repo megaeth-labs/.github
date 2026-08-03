@@ -375,6 +375,24 @@ def canonicalize_path(value: Any) -> str:
     return path
 
 
+def tracked_file_exists(root: Path, path: str) -> bool:
+    """Whether `path` names a regular file inside the checkout at `root`.
+
+    Used to accept findings on files the pull request did not change. The
+    resolved path must stay under `root` so a model-supplied `../` or absolute
+    path cannot make the compiler read outside the workspace.
+    """
+    if not path:
+        return False
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return False
+    resolved = (root / candidate).resolve()
+    if resolved != root and root not in resolved.parents:
+        return False
+    return resolved.is_file()
+
+
 def pull_base_head(pull: dict[str, Any]) -> tuple[str, str]:
     return str(pull["base"]["sha"]), str(pull["head"]["sha"])
 
@@ -1483,6 +1501,7 @@ def render_question(question: dict[str, Any]) -> str:
 def compile_review(
     review_input: dict[str, Any],
     model_output: dict[str, Any] | None,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     manifest = copy.deepcopy(review_input["manifest"])
     scope = review_input["review_scope"]
@@ -1609,6 +1628,7 @@ def compile_review(
         )
 
     changed_paths = set(scope["full_pr_paths"])
+    root = (repo_root or Path.cwd()).resolve()
     commentable = {
         path: set(lines)
         for path, lines in review_input["commentable_lines"].items()
@@ -1631,9 +1651,17 @@ def compile_review(
                 f"finding {index} has invalid severity or confidence",
                 code="FINDING_OUTPUT_INVALID",
             )
-        if path not in changed_paths:
+        # A finding may point at a file the PR did not touch — that is how an
+        # omitted companion change is reported ("this release note lands but
+        # the config it promises was never updated"). Such a path has no RIGHT
+        # side in the diff, so it can never be anchored inline and the renderer
+        # below routes it into the review body. Requiring the file to exist in
+        # the checkout keeps the anti-hallucination guard that rejecting
+        # unchanged paths used to provide.
+        if path not in changed_paths and not tracked_file_exists(root, path):
             raise PipelineError(
-                f"finding {index} references unchanged path: {path!r}",
+                f"finding {index} references a path that is neither changed "
+                f"by this pull request nor present in the checkout: {path!r}",
                 code="FINDING_ANCHOR_INVALID",
             )
         try:

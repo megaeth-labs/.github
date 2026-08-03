@@ -37,7 +37,8 @@
           },
           "path": {
             "type": "string",
-            "maxLength": 500
+            "maxLength": 500,
+            "description": "Repository-relative file the finding is about, normally one this pull request changed. To report an omitted companion change, name the existing file that should have been updated and was not; that finding has no inline anchor and is published in the review body."
           },
           "symbol": {
             "type": "string",
@@ -45,7 +46,8 @@
           },
           "line": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "description": "Line in the current version of `path`. For an omitted companion change, cite the line a reader should look at — the stale value, or the last entry the missing one should follow."
           },
           "start_line": {
             "type": ["integer", "null"],
