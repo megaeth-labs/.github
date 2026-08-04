@@ -214,6 +214,10 @@ runs:
              (`open` or `resolved`) for each finding you assessed. An omitted finding
              remains open; only an explicit `resolved` disposition closes one. Never
              resolve human-authored threads.
+             Disposition only findings whose manifest `status` is `open`. A finding
+             already carrying another status was closed outside this round; it appears
+             in the manifest as context so you do not re-raise it, and a disposition
+             for it is ignored.
              Do the same for every open manifest question: return a prior_questions
              disposition (`open`, `answered`, or `withdrawn`) with a one-line reason.
              An omitted question stays open. Disposition each question from the whole

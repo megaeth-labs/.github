@@ -1000,9 +1000,61 @@ class ReviewPipelineTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             pipeline.PipelineError,
-            "not open",
+            "not in the manifest",
         ):
             pipeline.compile_review(review_input(), output)
+
+    def test_disposition_for_externally_resolved_finding_is_tolerated(self):
+        value = review_input()
+        value["thread_resolution_enabled"] = True
+        value["manifest"]["findings"]["F-existing"] = {
+            "status": "resolved",
+            "severity": "major",
+            "thread_id": "THREAD",
+            "thread_resolution": "confirmed",
+            "resolved_sha": "a" * 40,
+        }
+        output = clean_output()
+        output["prior_findings"] = [
+            {
+                "finding_id": "F-existing",
+                "disposition": "resolved",
+                "reason": "The head commit applies the requested change.",
+            }
+        ]
+
+        payload = pipeline.compile_review(value, output)
+
+        item = payload["manifest"]["findings"]["F-existing"]
+        self.assertEqual(item["status"], "resolved")
+        self.assertEqual(item["thread_resolution"], "confirmed")
+        self.assertEqual(payload["resolve_thread_ids"], [])
+
+    def test_open_disposition_cannot_reopen_externally_resolved_finding(self):
+        value = review_input()
+        value["thread_resolution_enabled"] = True
+        value["manifest"]["findings"]["F-existing"] = {
+            "status": "resolved",
+            "severity": "major",
+            "thread_id": "THREAD",
+            "thread_resolution": "confirmed",
+            "resolved_sha": "a" * 40,
+        }
+        output = clean_output()
+        output["prior_findings"] = [
+            {
+                "finding_id": "F-existing",
+                "disposition": "open",
+                "reason": "The issue looks unaddressed.",
+            }
+        ]
+
+        payload = pipeline.compile_review(value, output)
+
+        item = payload["manifest"]["findings"]["F-existing"]
+        self.assertEqual(item["status"], "resolved")
+        self.assertEqual(item["thread_resolution"], "confirmed")
+        self.assertEqual(item["resolved_sha"], "a" * 40)
 
     def test_skip_with_open_finding_preserves_manifest(self):
         value = review_input(mode="skip")
