@@ -1543,10 +1543,10 @@ def compile_review(
         }
     model_output = validate_model_output(model_output)
 
-    expected_prior_ids = {
+    known_prior_ids = {
         item_id
         for item_id, item in manifest["findings"].items()
-        if isinstance(item, dict) and item.get("status") == "open"
+        if isinstance(item, dict)
     }
     returned_prior_ids = [
         str(item.get("finding_id") or "")
@@ -1558,10 +1558,10 @@ def compile_review(
             "prior_findings contains duplicate finding IDs",
             code="PRIOR_FINDING_INVALID",
         )
-    unknown = sorted(set(returned_prior_ids) - expected_prior_ids)
+    unknown = sorted(set(returned_prior_ids) - known_prior_ids)
     if unknown:
         raise PipelineError(
-            "prior_findings references findings that are not open "
+            "prior_findings references findings that are not in the manifest "
             f"(unknown={unknown})",
             code="PRIOR_FINDING_INVALID",
         )
@@ -1598,6 +1598,20 @@ def compile_review(
                 f"prior_findings has invalid disposition for {item_id}",
                 code="PRIOR_FINDING_INVALID",
             )
+        if (
+            item.get("status") == "resolved"
+            and item.get("thread_resolution") == "confirmed"
+        ):
+            # Someone resolved the thread on GitHub between rounds, so prepare
+            # already closed this finding. That human action is authoritative:
+            # a concordant `resolved` is a no-op, and an `open` must not reopen
+            # a thread a reviewer deliberately closed.
+            print(
+                f"ignoring {status} disposition for {item_id}: already "
+                "resolved on GitHub",
+                file=sys.stderr,
+            )
+            continue
         item["status"] = status
         item["last_checked_sha"] = head
         if status == "resolved":
