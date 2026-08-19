@@ -71,13 +71,17 @@ The `pr-review` action additionally accepts:
 - `review_depth` - optional, defaults to `standard`.
   Set it to `deep` to make the semantic-analysis stage fan out relevant review dimensions
   and adversarially verify the candidates before returning one structured result.
+- `max_turns` - optional, defaults to empty.
+  Overrides the per-invocation turn budget (`--max-turns`) that is otherwise derived from the
+  model tier and review depth. Set a positive integer to pin the main analysis ceiling; the
+  retry keeps its 1.5x headroom relative to it. A non-integer or non-positive value fails the run.
 - `premortem` - optional, defaults to `auto`.
   Automatic mode runs the independent production-failure analysis for initial and high-risk
   reviews, but skips it for ordinary incremental updates.
   `on` always enables it and `off` disables it.
 
 The semantic-analysis stage runs under a turn budget: 12 for a low-risk incremental review,
-36 for a strong-tier one, and 56 for `deep`.
+44 for a strong-tier one, and 56 for `deep`. Set `max_turns` to override any of these.
 Roughly ten turns go on mandated context — six pipeline files plus repo guidance — before the
 diff is read, and a small diff inside a large file spends many more paging through it, so the
 budget tracks files to understand rather than lines changed.
@@ -91,8 +95,8 @@ with:
   github_identity_token: ${{ steps.app-token.outputs.token }}
 ```
 
-The semantic stage is bounded to 12 turns for fast incremental reviews, 24 for standard
-full or high-risk reviews, and 40 for explicit deep reviews.
+The semantic stage is bounded to 12 turns for fast incremental reviews, 44 for standard
+full or high-risk reviews, and 56 for explicit deep reviews, unless `max_turns` overrides it.
 
 ### PR review pipeline
 
