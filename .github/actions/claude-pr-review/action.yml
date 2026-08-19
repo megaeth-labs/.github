@@ -40,6 +40,15 @@ inputs:
     description: >
       `standard` runs one lead review. `deep` asks the lead to fan out review
       dimensions and adversarially verify them before returning structured data.
+  max_turns:
+    required: false
+    default: ""
+    description: >
+      Optional override for the per-invocation turn budget (`--max-turns`).
+      Empty (default) uses the built-in budget derived from model tier and
+      review depth (fast 12, standard 44, deep 56). Set a positive integer to
+      pin the ceiling for the main analysis pass; the retry pass keeps its 1.5x
+      headroom relative to this value.
   debug_logs:
     required: false
     default: "false"
@@ -103,6 +112,7 @@ runs:
         INCREMENTAL_MODEL: ${{ inputs.incremental_model }}
         MODEL_TIER: ${{ steps.prepare.outputs.model_tier }}
         REVIEW_DEPTH: ${{ inputs.review_depth }}
+        MAX_TURNS_OVERRIDE: ${{ inputs.max_turns }}
         RUN_PREMORTEM: ${{ steps.prepare.outputs.run_premortem }}
       run: |
         set -euo pipefail
@@ -132,6 +142,17 @@ runs:
         fi
         if [[ "$REVIEW_DEPTH" == "deep" ]]; then
           max_turns=56
+        fi
+        # An explicit max_turns input overrides the tier/depth-derived budget,
+        # letting a consumer repo tune the analysis ceiling without editing this
+        # action. Validate up front so a typo fails the step loudly instead of
+        # silently disabling the turn cap.
+        if [[ -n "$MAX_TURNS_OVERRIDE" ]]; then
+          if [[ ! "$MAX_TURNS_OVERRIDE" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::max_turns must be a positive integer, got '$MAX_TURNS_OVERRIDE'" >&2
+            exit 1
+          fi
+          max_turns="$MAX_TURNS_OVERRIDE"
         fi
         # Exhausting the budget is deterministic: retrying with the same one
         # burns a second full model run that cannot succeed. Give the retry
