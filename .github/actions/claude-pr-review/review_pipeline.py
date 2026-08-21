@@ -70,6 +70,9 @@ LEGACY_REVIEWER_LOGINS = {
 GITHUB_LINK_RETRY_ATTEMPTS = 5
 GITHUB_LINK_RETRY_DELAY_SECONDS = 1
 FAILURE_FILENAME = "failure.json"
+TRACE_FILENAME = "trace.log"
+MODEL_OUTPUT_FILENAME = "model-output.json"
+TRACE_LIST_LIMIT = 40
 
 DEFAULT_REMEDIATIONS = {
     "prepare": (
@@ -254,7 +257,62 @@ def sanitize_text(value: Any, *, maximum: int) -> str:
     return text[:maximum].rstrip()
 
 
+def log(message: str) -> None:
+    """Write one line to the job log, unbuffered so ordering survives."""
+    print(message, flush=True)
+
+
+def emit_trace(
+    state_dir: Path | None,
+    title: str,
+    lines: list[str],
+) -> None:
+    """Print a collapsible trace block and persist it beside the state.
+
+    The job log is where someone looks first when a review surprises them, and
+    the persisted copy is what the run's artifact still carries once the runner
+    is gone. Both are rendered from the same lines so they cannot disagree.
+    """
+    if not lines:
+        return
+    log(f"::group::{title}")
+    for line in lines:
+        log(line)
+    log("::endgroup::")
+    if state_dir is None:
+        return
+    try:
+        with (state_dir / TRACE_FILENAME).open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(f"### {title}\n\n")
+            handle.write("\n".join(lines).rstrip() + "\n\n")
+    except OSError:
+        # Tracing is diagnostic. Never fail a review because the log could not
+        # be written.
+        pass
+
+
+def read_trace(state_dir: Path) -> str:
+    try:
+        return (state_dir / TRACE_FILENAME).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def trace_list(label: str, items: list[str]) -> list[str]:
+    """Render a bounded bullet list, saying so when it had to truncate."""
+    if not items:
+        return [f"{label}: (none)"]
+    lines = [f"{label} ({len(items)}):"]
+    lines.extend(f"  - {item}" for item in items[:TRACE_LIST_LIMIT])
+    if len(items) > TRACE_LIST_LIMIT:
+        lines.append(f"  - … {len(items) - TRACE_LIST_LIMIT} more")
+    return lines
+
+
 def read_json_file(path: Path) -> dict[str, Any] | None:
+
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -1084,7 +1142,103 @@ def manifest_has_open_items(manifest: dict[str, Any]) -> bool:
     return False
 
 
+def open_items(container: Any) -> list[tuple[str, dict[str, Any]]]:
+    if not isinstance(container, dict):
+        return []
+    return [
+        (str(item_id), item)
+        for item_id, item in container.items()
+        if isinstance(item, dict) and item.get("status") == "open"
+    ]
+
+
+def prepare_trace(
+    input_value: dict[str, Any],
+    *,
+    prior_state_source: str,
+    version_matches: bool,
+    comparison_status: str | None,
+    comparison_files: int,
+    full_diff_bytes: int,
+    review_diff_bytes: int,
+) -> list[str]:
+    """Explain how this round was routed and what the model was handed.
+
+    Routing is the single most opaque decision in the pipeline: whether a run
+    reviewed everything, only a delta, or nothing at all determines what the
+    model could possibly have found, and until now that reasoning existed only
+    inside `review-input.json` on a runner that is about to disappear.
+    """
+    scope = input_value["review_scope"]
+    manifest = input_value.get("manifest") or {}
+    conversation = input_value.get("conversation") or {}
+    threads = input_value.get("review_threads") or []
+    findings = manifest.get("findings") or {}
+    questions = manifest.get("questions") or {}
+    open_findings = open_items(findings)
+    open_questions = open_items(questions)
+    previous = scope.get("previous_reviewed_head") or "(none)"
+
+    lines = [
+        f"pull request: {input_value['repository']}"
+        f"#{input_value['pull_request']}",
+        f"publisher login: {input_value.get('publisher_login') or '(unknown)'}",
+        f"pipeline version: {input_value.get('pipeline_version')}"
+        f" · rubric version: {input_value.get('rubric_version')}",
+        f"prior state: {prior_state_source}"
+        f" · version match: {str(version_matches).lower()}",
+        f"previous reviewed head: {previous}",
+        f"current head: {scope['current_head']}",
+        "compare previous..current: "
+        f"status={comparison_status or '(not compared)'}"
+        f" files={comparison_files}",
+        f"MODE: {scope['mode']} — {scope['reason']}",
+        f"model tier: {scope['model_tier']}"
+        f" · high risk: {str(scope['high_risk']).lower()}"
+        f" · pre-mortem: {str(scope['run_premortem']).lower()}",
+        f"thread resolution: "
+        f"{'enabled' if input_value.get('thread_resolution_enabled') else 'disabled'}",
+        f"review.diff: {review_diff_bytes} bytes"
+        f" · full.diff: {full_diff_bytes} bytes",
+        f"conversation: {conversation.get('included_entries', 0)} of "
+        f"{conversation.get('total_entries', 0)} timeline entries"
+        f" · {conversation.get('included_body_chars', 0)} chars"
+        f" · truncated={str(bool(conversation.get('truncated'))).lower()}",
+        f"review threads: {len(threads)}",
+        f"previous automated review: "
+        f"{'present' if conversation.get('previous_automated_review') else 'none'}",
+    ]
+    lines.extend(
+        trace_list("changed paths in scope", list(scope["changed_paths"]))
+    )
+    if scope["mode"] == "incremental":
+        lines.append(
+            f"full PR paths (context only): {len(scope['full_pr_paths'])}"
+        )
+    lines.extend(
+        trace_list(
+            "open prior findings",
+            [
+                f"{item_id} [{item.get('severity')}] "
+                f"{item.get('path')}:{item.get('line')} — {item.get('title')}"
+                for item_id, item in open_findings
+            ],
+        )
+    )
+    lines.extend(
+        trace_list(
+            "open prior questions",
+            [
+                f"{item_id} [{item.get('confidence')}] {item.get('question')}"
+                for item_id, item in open_questions
+            ],
+        )
+    )
+    return lines
+
+
 def prepare(args: argparse.Namespace) -> None:
+
     action_dir = Path(__file__).resolve().parent
     state_dir = Path(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -1145,6 +1299,13 @@ def prepare(args: argparse.Namespace) -> None:
         publisher_login=publisher_login,
     )
     prior_state = sticky_state or review_state
+    prior_state_source = (
+        "sticky status comment"
+        if sticky_state is not None
+        else "previous review body"
+        if review_state is not None
+        else "none (first review of this PR)"
+    )
     manifest = (
         copy.deepcopy(prior_state)
         if prior_state is not None
@@ -1366,6 +1527,24 @@ def prepare(args: argparse.Namespace) -> None:
         json.dumps(input_value, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    emit_trace(
+        state_dir,
+        "Review routing",
+        prepare_trace(
+            input_value,
+            prior_state_source=prior_state_source,
+            version_matches=version_matches,
+            comparison_status=(
+                str(comparison.get("status"))
+                if isinstance(comparison, dict)
+                else None
+            ),
+            comparison_files=len(comparison_files),
+            full_diff_bytes=len(full_diff.encode("utf-8")),
+            review_diff_bytes=len(incremental_diff.encode("utf-8")),
+        ),
+    )
+
     schema = json.loads(
         (action_dir / "review-output.schema.json").read_text(encoding="utf-8")
     )
@@ -1516,6 +1695,10 @@ def compile_review(
         f"<!-- claude-review-round:v1 "
         f"{round_id} -->"
     )
+    # Every branch below that silently drops, dedupes, or reroutes a model
+    # result appends its reason here. Without it, "the model reported it but
+    # the PR never showed it" is unanswerable after the fact.
+    trace: list[str] = []
 
     if scope["mode"] == "skip":
         model_output = {
@@ -1606,12 +1789,24 @@ def compile_review(
             # already closed this finding. That human action is authoritative:
             # a concordant `resolved` is a no-op, and an `open` must not reopen
             # a thread a reviewer deliberately closed.
+            trace.append(
+                f"prior finding {item_id}: ignored '{status}' disposition — "
+                "already resolved on GitHub"
+            )
             print(
                 f"ignoring {status} disposition for {item_id}: already "
                 "resolved on GitHub",
                 file=sys.stderr,
             )
             continue
+        trace.append(
+            f"prior finding {item_id}: {status}"
+            + (
+                f" — {public_text(disposition.get('reason'), maximum=200)}"
+                if disposition.get("reason")
+                else ""
+            )
+        )
         item["status"] = status
         item["last_checked_sha"] = head
         if status == "resolved":
@@ -1723,18 +1918,45 @@ def compile_review(
             and manifest["findings"][prior_finding_id].get("status") == "open"
         ):
             manifest["findings"][prior_finding_id]["last_checked_sha"] = head
+            trace.append(
+                f"finding {index} suppressed: restates open prior finding "
+                f"{prior_finding_id} ({finding['path']}:{line})"
+            )
             continue
         finding["finding_id"] = finding_id(finding)
         existing = manifest["findings"].get(finding["finding_id"])
         if isinstance(existing, dict) and existing.get("status") == "open":
             existing["last_checked_sha"] = head
+            trace.append(
+                f"finding {index} suppressed: same fingerprint as open "
+                f"finding {finding['finding_id']} ({finding['path']}:{line})"
+            )
             continue
         finding["inline"] = line in commentable.get(path, set())
+        anchor = (
+            "inline"
+            if finding["inline"]
+            else "review body — line is not commentable in the PR diff"
+        )
+        trace.append(
+            f"finding {index} accepted: [{severity}] "
+            f"{finding['path']}:{line} ({anchor}) — {finding['title']}"
+        )
         findings.append(finding)
 
-    high = [f for f in findings if f["severity"] in {"critical", "major"}][:5]
-    low = [f for f in findings if f["severity"] in {"minor", "nit"}][:5]
+
+    high_all = [f for f in findings if f["severity"] in {"critical", "major"}]
+    low_all = [f for f in findings if f["severity"] in {"minor", "nit"}]
+    high = high_all[:5]
+    low = low_all[:5]
+    for dropped in high_all[5:] + low_all[5:]:
+        trace.append(
+            f"finding dropped by per-severity cap of 5: "
+            f"[{dropped['severity']}] {dropped['path']}:{dropped['line']} — "
+            f"{dropped['title']}"
+        )
     findings = high + low
+
 
     question_state = manifest.setdefault("questions", {})
     open_question_ids = {
@@ -1775,6 +1997,14 @@ def compile_review(
             )
         item["status"] = status
         item["last_checked_sha"] = head
+        trace.append(
+            f"prior question {item_id}: {status}"
+            + (
+                f" — {public_text(disposition.get('reason'), maximum=200)}"
+                if disposition.get("reason")
+                else ""
+            )
+        )
         if status != "open":
             item["closed_sha"] = head
             item["disposition_reason"] = public_text(
@@ -1787,6 +2017,11 @@ def compile_review(
                 item["annotation"] = "pending"
 
     questions: list[dict[str, Any]] = []
+    if len(model_output["open_questions"]) > 3:
+        trace.append(
+            f"open questions truncated to 3 of "
+            f"{len(model_output['open_questions'])} returned"
+        )
     for index, raw in enumerate(model_output["open_questions"][:3]):
         if not isinstance(raw, dict):
             raise PipelineError(
@@ -1823,8 +2058,16 @@ def compile_review(
             # Already asked and still unanswered. Re-asking would orphan the
             # original, which is the copy the author is expected to answer.
             existing["last_checked_sha"] = head
+            trace.append(
+                f"question {index} suppressed: already open as "
+                f"{question['question_id']}"
+            )
             continue
+        trace.append(
+            f"question {index} accepted: [{confidence}] {question['question']}"
+        )
         questions.append(question)
+
 
     for question in questions:
         question_state[question["question_id"]] = {
@@ -2023,10 +2266,26 @@ def compile_review(
         f"{STATE_MARKER_PREFIX}{encode_state(review_manifest)} -->"
     )
 
+    trace.append(
+        f"verdict: {round_value['result']}"
+        f" · new findings: {len(findings)}"
+        f" ({len(inline_comments)} inline, {len(body_only)} in review body)"
+        f" · new questions: {len(questions)}"
+        f" · prior findings resolved this round: {resolved_count}"
+        f" · open findings after this round: {len(open_findings)}"
+    )
+    trace.append(
+        f"submits a review: {str(bool(findings or questions)).lower()}"
+        f" · threads to resolve: {len(set(resolution_ids))}"
+        f" · question annotations queued: {len(question_annotations)}"
+    )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "repository": review_input["repository"],
         "pull_request": review_input["pull_request"],
+        "trace": trace,
+
         "publisher_login": review_input.get("publisher_login"),
         "frozen_head": head,
         "base_sha": review_input["pull_request_data"]["base_sha"],
@@ -2058,6 +2317,11 @@ def compile_command(args: argparse.Namespace) -> None:
     )
     if review_input["review_scope"]["mode"] == "skip":
         model_output = None
+        emit_trace(
+            state_dir,
+            "Model output",
+            ["skip mode: no analysis ran, so there is nothing to compile"],
+        )
     else:
         raw = os.environ.get("REVIEW_STRUCTURED_OUTPUT", "")
         if not raw:
@@ -2072,16 +2336,36 @@ def compile_command(args: argparse.Namespace) -> None:
         try:
             model_output = json.loads(raw)
         except json.JSONDecodeError as error:
+            # Keep the unparsable bytes: without them the only evidence of
+            # what the model actually said dies with the runner.
+            (state_dir / "model-output.raw").write_text(raw, encoding="utf-8")
             raise PipelineError(
                 "Claude returned malformed structured review JSON",
                 code="MODEL_OUTPUT_INVALID",
             ) from error
+        # The model's own result, before the compiler dedupes, caps, and
+        # reroutes it. Comparing this against the published review is how you
+        # tell a model miss from a pipeline drop.
+        (state_dir / MODEL_OUTPUT_FILENAME).write_text(
+            json.dumps(model_output, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        emit_trace(
+            # Printed to the job log and kept as model-output.json; leaving it
+            # out of trace.log keeps that file a readable decision log.
+            None,
+            "Model output (raw, before compilation)",
+            json.dumps(model_output, indent=2, sort_keys=True).splitlines(),
+        )
+
     payload = compile_review(review_input, model_output)
     (state_dir / "review-payload.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    emit_trace(state_dir, "Compilation decisions", payload.get("trace") or [])
     write_github_output({"verdict": payload["verdict"]})
+
 
 
 def existing_round_review(
@@ -2724,7 +3008,40 @@ def write_job_summary(body: str) -> None:
         summary.write(body.rstrip() + "\n")
 
 
+SUMMARY_EMBED_LIMIT = 60_000
+
+
+def details_block(title: str, body: str, *, language: str = "") -> str:
+    """Fold a long diagnostic into the step summary without flooding it."""
+    text = (body or "").rstrip()
+    if not text.strip():
+        return ""
+    if len(text) > SUMMARY_EMBED_LIMIT:
+        text = (
+            text[:SUMMARY_EMBED_LIMIT]
+            + "\n… truncated. The complete copy is in the review-state "
+            "artifact attached to this run."
+        )
+    return (
+        f"\n\n<details>\n<summary>{title}</summary>\n\n"
+        f"```{language}\n{text}\n```\n\n</details>"
+    )
+
+
+def analysis_settings() -> list[str]:
+    """Report the knobs the analysis actually ran with, not the defaults."""
+    rows = [
+        ("Model", os.environ.get("ANALYSIS_MODEL", "")),
+        ("Turn budget", os.environ.get("ANALYSIS_MAX_TURNS", "")),
+        ("Retry turn budget", os.environ.get("ANALYSIS_RETRY_MAX_TURNS", "")),
+        ("Review depth", os.environ.get("ANALYSIS_REVIEW_DEPTH", "")),
+        ("Allowed tools", os.environ.get("ANALYSIS_ALLOWED_TOOLS", "")),
+    ]
+    return [f"- **{label}:** `{value}`" for label, value in rows if value]
+
+
 def step_outcomes() -> dict[str, str]:
+
     return {
         phase: os.environ.get(f"{phase.upper()}_OUTCOME", "")
         for phase in (
@@ -2857,6 +3174,7 @@ def report(args: argparse.Namespace) -> None:
             if outcomes_text
             else ""
         )
+        settings = analysis_settings()
         body = (
             "## Claude PR review failed\n\n"
             f"**`{diagnostic['code']}` · phase "
@@ -2864,7 +3182,11 @@ def report(args: argparse.Namespace) -> None:
             f"- **Cause:** {diagnostic['message']}\n"
             f"- **Next action:** {diagnostic['remediation']}\n"
             + ("\n".join(context_lines) + "\n" if context_lines else "")
+            + ("\n".join(settings) + "\n" if settings else "")
             + details
+            # A failure is exactly when the trace matters most: it shows how
+            # far the round got before it stopped.
+            + details_block("Pipeline trace", read_trace(state_dir))
         )
         write_job_summary(body)
         close_out_sticky(
@@ -2911,17 +3233,54 @@ def report(args: argparse.Namespace) -> None:
         status = "✅ Review completed and publication succeeded."
     else:
         status = "✅ Review completed."
+    scope_reason = scope.get("reason") or "unknown"
+    status_summary = payload.get("status_summary") or {}
+    rows = [
+        f"- **Verdict:** `{verdict}`",
+        f"- **Mode:** `{mode}` — {scope_reason}",
+        f"- **Head:** `{head}`",
+        f"- **Previous reviewed head:** "
+        f"`{scope.get('previous_reviewed_head') or 'none'}`",
+        f"- **Files in scope:** `{len(scope.get('changed_paths') or [])}`",
+        f"- **Model tier:** `{scope.get('model_tier') or 'unknown'}`"
+        f" · **high risk:** `{str(bool(scope.get('high_risk'))).lower()}`"
+        f" · **pre-mortem:** `{str(bool(scope.get('run_premortem'))).lower()}`",
+        "- **Thread resolution:** "
+        f"`{'enabled' if review_input.get('thread_resolution_enabled') else 'disabled'}`",
+        f"- **Model retry used:** `{'yes' if retry_used else 'no'}`",
+    ]
+    rows.extend(analysis_settings())
+    if payload:
+        rows.append(
+            f"- **New findings:** `{status_summary.get('new_findings', 0)}`"
+            f" ({len(payload.get('inline_comments') or [])} inline, "
+            f"{len(payload.get('body_only_findings') or [])} in the review "
+            "body)"
+        )
+        rows.append(
+            "- **New questions:** "
+            f"`{status_summary.get('new_questions', 0)}`"
+            f" · **prior findings resolved:** "
+            f"`{status_summary.get('resolved_findings', 0)}`"
+        )
     body = (
         "## Claude PR review\n\n"
-        f"{status}\n\n"
-        f"- **Verdict:** `{verdict}`\n"
-        f"- **Mode:** `{mode}`\n"
-        f"- **Head:** `{head}`\n"
-        "- **Thread resolution:** "
-        f"`{'enabled' if review_input.get('thread_resolution_enabled') else 'disabled'}`\n"
-        f"- **Model retry used:** `{'yes' if retry_used else 'no'}`\n"
+        f"{status}\n\n" + "\n".join(rows) + "\n"
+        + details_block("Pipeline trace", read_trace(state_dir))
+        + details_block(
+            "Model output (before compilation)",
+            json.dumps(
+                read_json_file(state_dir / MODEL_OUTPUT_FILENAME) or {},
+                indent=2,
+                sort_keys=True,
+            )
+            if (state_dir / MODEL_OUTPUT_FILENAME).exists()
+            else "",
+            language="json",
+        )
     )
     write_job_summary(body)
+
     print(
         f"Claude PR review: OK verdict={verdict} mode={mode} head={head}"
     )
@@ -2932,6 +3291,11 @@ def publish(args: argparse.Namespace) -> None:
     payload_path = state_dir / "review-payload.json"
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     if payload["mode"] == "skip":
+        emit_trace(
+            state_dir,
+            "Publication",
+            ["skip mode: nothing to publish"],
+        )
         write_github_output({"published": "false", "stale": "false"})
         return
 
@@ -2953,6 +3317,14 @@ def publish(args: argparse.Namespace) -> None:
     try:
         require_frozen_pull()
     except StaleReviewError:
+        emit_trace(
+            state_dir,
+            "Publication",
+            [
+                "discarded before writing: the PR head moved away from "
+                f"{payload['frozen_head']}"
+            ],
+        )
         write_github_output({"published": "false", "stale": "true"})
         return
 
@@ -3028,14 +3400,43 @@ def publish(args: argparse.Namespace) -> None:
             before_write=require_frozen_pull,
         )
     except StaleReviewError:
+        emit_trace(
+            state_dir,
+            "Publication",
+            [
+                "discarded mid-publication: the PR head moved away from "
+                f"{payload['frozen_head']}"
+            ],
+        )
         write_github_output({"published": "false", "stale": "true"})
         return
+
+    emit_trace(
+        state_dir,
+        "Publication",
+        [
+            f"review id: {review_id if review_id is not None else '(none)'}",
+            f"inline comments requested: {len(payload['inline_comments'])}"
+            f" · posted: {len(posted_comments)}"
+            f" · inline publication: "
+            f"{'succeeded' if inline_published else 'fell back to the review body'}",
+            f"body-only findings: {len(payload['body_only_findings'])}",
+            f"threads requested for resolution: "
+            f"{len(payload['resolve_thread_ids'])}"
+            f" · resolved: {len(resolved_threads)}",
+            f"question annotations attempted: "
+            f"{len(payload['question_annotations'])}",
+
+            f"sticky comment id: {sticky_id}",
+        ],
+    )
 
     result = {
         "review_id": review_id,
         "sticky_comment_id": sticky_id,
         "manifest": manifest,
     }
+
     (state_dir / "publish-result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
