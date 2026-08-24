@@ -107,11 +107,10 @@ class ReviewPipelineTests(unittest.TestCase):
         self.assertIn("Read,Glob,Grep,StructuredOutput,", action)
         self.assertIn("id: review_retry", action)
         self.assertIn("MUST call the\n          StructuredOutput tool", action)
-        self.assertEqual(
-            action.count("show_full_output: ${{ inputs.debug_logs == 'true' }}"),
-            2,
-        )
+        self.assertEqual(action.count("show_full_output: true"), 2)
         self.assertIn("\n  debug_logs:\n", action)
+        self.assertIn("Deprecated and ignored", action)
+
         self.assertEqual(action.count("display_report: false"), 2)
         self.assertIn("- name: Report concise review outcome", action)
         self.assertIn("if: always()", action)
@@ -2063,5 +2062,293 @@ class ReviewPipelineTests(unittest.TestCase):
         self.assertEqual(payload["question_annotations"], [])
 
 
+class ObservabilityTests(unittest.TestCase):
+    """A review that cannot be inspected cannot be improved.
+
+    These cover the diagnostic surface: the routing explanation, the record of
+    every model result the compiler dropped or rerouted, and the step summary
+    that carries both once the runner is gone.
+    """
+
+    def test_emit_trace_prints_a_group_and_persists_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with mock.patch("builtins.print") as printed:
+                pipeline.emit_trace(state_dir, "Routing", ["mode: full"])
+
+            printed.assert_any_call("::group::Routing", flush=True)
+            printed.assert_any_call("mode: full", flush=True)
+            printed.assert_any_call("::endgroup::", flush=True)
+            self.assertIn("mode: full", pipeline.read_trace(state_dir))
+
+    def test_emit_trace_appends_rather_than_replacing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            pipeline.emit_trace(state_dir, "Routing", ["first"])
+            pipeline.emit_trace(state_dir, "Publication", ["second"])
+
+            trace = pipeline.read_trace(state_dir)
+            self.assertIn("first", trace)
+            self.assertIn("second", trace)
+
+    def test_emit_trace_ignores_empty_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            pipeline.emit_trace(state_dir, "Routing", [])
+            self.assertEqual(pipeline.read_trace(state_dir), "")
+
+    def test_trace_list_marks_truncation(self):
+        items = [f"path/{index}.py" for index in range(pipeline.TRACE_LIST_LIMIT + 5)]
+        lines = pipeline.trace_list("changed paths", items)
+
+        self.assertIn(f"changed paths ({len(items)}):", lines[0])
+        self.assertIn("… 5 more", lines[-1])
+
+    def test_trace_list_reports_an_empty_list(self):
+        self.assertEqual(
+            pipeline.trace_list("changed paths", []),
+            ["changed paths: (none)"],
+        )
+
+    def test_prepare_trace_explains_the_routing_decision(self):
+        value = review_input(mode="incremental")
+        value["manifest"]["findings"]["F-open"] = {
+            "status": "open",
+            "severity": "major",
+            "path": "src/example.py",
+            "line": 11,
+            "title": "Retry state survives a failed attempt",
+        }
+        value["manifest"]["questions"] = {
+            "Q-open": {
+                "status": "open",
+                "confidence": "medium",
+                "question": "Can the upstream return duplicates?",
+            }
+        }
+
+        lines = pipeline.prepare_trace(
+            value,
+            prior_state_source="sticky status comment",
+            version_matches=True,
+            comparison_status="ahead",
+            comparison_files=3,
+            full_diff_bytes=4096,
+            review_diff_bytes=512,
+        )
+        text = "\n".join(lines)
+
+        self.assertIn("MODE: incremental — test", text)
+        self.assertIn("prior state: sticky status comment", text)
+        self.assertIn("status=ahead files=3", text)
+        self.assertIn("review.diff: 512 bytes", text)
+        self.assertIn("src/example.py", text)
+        self.assertIn("F-open", text)
+        self.assertIn("Q-open", text)
+
+    def test_prepare_trace_reports_a_truncated_conversation(self):
+        value = review_input()
+        value["conversation"].update(
+            {
+                "total_entries": 200,
+                "included_entries": 120,
+                "included_body_chars": 90_000,
+                "truncated": True,
+            }
+        )
+
+        text = "\n".join(
+            pipeline.prepare_trace(
+                value,
+                prior_state_source="none (first review of this PR)",
+                version_matches=False,
+                comparison_status=None,
+                comparison_files=0,
+                full_diff_bytes=10,
+                review_diff_bytes=10,
+            )
+        )
+
+        self.assertIn("120 of 200 timeline entries", text)
+        self.assertIn("truncated=true", text)
+
+    def test_compile_trace_records_accepted_and_rerouted_findings(self):
+        value = review_input()
+        output = clean_output()
+        output["findings"] = [
+            sample_finding(),
+            sample_finding(
+                title="Stale companion config",
+                # Not a commentable line, so this one cannot be anchored.
+                line=900,
+            ),
+        ]
+
+        payload = pipeline.compile_review(value, output)
+        trace = "\n".join(payload["trace"])
+
+        self.assertIn("finding 0 accepted", trace)
+        self.assertIn("(inline)", trace)
+        self.assertIn("line is not commentable", trace)
+        self.assertIn("new findings: 2", trace)
+
+    def test_compile_trace_records_the_per_severity_cap(self):
+        value = review_input()
+        output = clean_output()
+        output["findings"] = [
+            sample_finding(title=f"Major defect {index}", line=11)
+            for index in range(7)
+        ]
+
+        payload = pipeline.compile_review(value, output)
+        trace = "\n".join(payload["trace"])
+
+        self.assertEqual(len(payload["inline_comments"]), 5)
+        self.assertIn("dropped by per-severity cap of 5", trace)
+        self.assertIn("Major defect 6", trace)
+
+    def test_compile_trace_records_a_suppressed_duplicate_finding(self):
+        value = review_input()
+        first = pipeline.compile_review(value, {**clean_output(), "findings": [sample_finding()]})
+        second_input = review_input()
+        second_input["manifest"] = first["manifest"]
+
+        payload = pipeline.compile_review(
+            second_input,
+            {**clean_output(), "findings": [sample_finding()]},
+        )
+        trace = "\n".join(payload["trace"])
+
+        self.assertIn("same fingerprint as open finding", trace)
+        self.assertEqual(payload["inline_comments"], [])
+
+    def test_compile_trace_records_question_truncation(self):
+        value = review_input()
+        output = clean_output()
+        output["open_questions"] = [
+            {
+                "question": f"Question {index}?",
+                "confidence": "medium",
+                "why_it_matters": "It changes the verdict.",
+                "verification": "Check the upstream contract.",
+            }
+            for index in range(5)
+        ]
+
+        payload = pipeline.compile_review(value, output)
+        trace = "\n".join(payload["trace"])
+
+        self.assertIn("open questions truncated to 3 of 5", trace)
+        self.assertIn("question 0 accepted", trace)
+
+    def test_details_block_truncates_and_points_at_the_artifact(self):
+        block = pipeline.details_block(
+            "Pipeline trace",
+            "x" * (pipeline.SUMMARY_EMBED_LIMIT + 100),
+        )
+
+        self.assertIn("<summary>Pipeline trace</summary>", block)
+        self.assertIn("review-state artifact", block)
+
+    def test_details_block_omits_empty_content(self):
+        self.assertEqual(pipeline.details_block("Pipeline trace", ""), "")
+
+    def test_analysis_settings_reports_only_what_was_set(self):
+        with mock.patch.dict(
+            pipeline.os.environ,
+            {
+                "ANALYSIS_MODEL": "claude-opus-4-7",
+                "ANALYSIS_MAX_TURNS": "44",
+                "ANALYSIS_RETRY_MAX_TURNS": "",
+                "ANALYSIS_REVIEW_DEPTH": "standard",
+                "ANALYSIS_ALLOWED_TOOLS": "",
+            },
+            clear=False,
+        ):
+            rows = pipeline.analysis_settings()
+
+        text = "\n".join(rows)
+        self.assertIn("**Model:** `claude-opus-4-7`", text)
+        self.assertIn("**Turn budget:** `44`", text)
+        self.assertNotIn("Retry turn budget", text)
+        self.assertNotIn("Allowed tools", text)
+
+    @mock.patch("builtins.print")
+    def test_success_report_embeds_the_trace_and_model_output(self, _print):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            summary_path = state_dir / "summary.md"
+            state_dir.joinpath("review-input.json").write_text(
+                json.dumps(review_input(mode="incremental")),
+                encoding="utf-8",
+            )
+            state_dir.joinpath("review-payload.json").write_text(
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "mode": "incremental",
+                        "frozen_head": "b" * 40,
+                        "inline_comments": [{"finding_id": "F-1"}],
+                        "body_only_findings": ["- `src/example.py:900` — …"],
+                        "status_summary": {
+                            "new_findings": 2,
+                            "new_questions": 1,
+                            "resolved_findings": 3,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_dir.joinpath(pipeline.MODEL_OUTPUT_FILENAME).write_text(
+                json.dumps({"scope_summary": "Reviewed the delta."}),
+                encoding="utf-8",
+            )
+            pipeline.emit_trace(
+                state_dir,
+                "Review routing",
+                ["MODE: incremental — valid prior manifest"],
+            )
+            environment = {
+                "GITHUB_STEP_SUMMARY": str(summary_path),
+                "PREPARE_OUTCOME": "success",
+                "COMPILE_OUTCOME": "success",
+                "PUBLISH_OUTCOME": "success",
+                "PUBLISH_PUBLISHED": "true",
+                "PUBLISH_STALE": "false",
+                "ANALYSIS_MODEL": "claude-opus-4-7",
+                "ANALYSIS_MAX_TURNS": "44",
+            }
+            with mock.patch.dict("os.environ", environment, clear=True):
+                pipeline.report(SimpleNamespace(state_dir=directory))
+            summary = summary_path.read_text(encoding="utf-8")
+
+        self.assertIn("**Mode:** `incremental` — test", summary)
+        self.assertIn("**Files in scope:** `1`", summary)
+        self.assertIn("**Model:** `claude-opus-4-7`", summary)
+        self.assertIn("**Turn budget:** `44`", summary)
+        self.assertIn(
+            "**New findings:** `2` (1 inline, 1 in the review body)",
+            summary,
+        )
+        self.assertIn("**prior findings resolved:** `3`", summary)
+        self.assertIn("<summary>Pipeline trace</summary>", summary)
+        self.assertIn("MODE: incremental — valid prior manifest", summary)
+        self.assertIn("<summary>Model output (before compilation)</summary>", summary)
+        self.assertIn("Reviewed the delta.", summary)
+
+    def test_action_uploads_the_review_state_artifact(self):
+
+        action = Path(pipeline.__file__).with_name("action.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("- name: Upload review state for inspection", action)
+        self.assertIn("actions/upload-artifact@", action)
+        self.assertIn("- name: Capture analysis session transcript", action)
+        self.assertIn("analysis-transcript.json", action)
+        self.assertIn("ANALYSIS_MAX_TURNS:", action)
+
+
 if __name__ == "__main__":
     unittest.main()
+

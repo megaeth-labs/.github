@@ -79,6 +79,13 @@ The `pr-review` action additionally accepts:
   Automatic mode runs the independent production-failure analysis for initial and high-risk
   reviews, but skips it for ordinary incremental updates.
   `on` always enables it and `off` disables it.
+- `state_artifact` - optional, defaults to `true`.
+  Uploads the run's `.pr-review` state directory as an artifact. Set it to `false` only if the
+  repository forbids artifacts.
+- `state_artifact_retention_days` - optional, defaults to `14`.
+- `debug_logs` - deprecated and ignored. The analysis session's full output is now always
+  printed. Consumers still passing it are unaffected; drop it at your convenience.
+
 
 The semantic-analysis stage runs under a turn budget: 12 for a low-risk incremental review,
 44 for a strong-tier one, and 56 for `deep`. Set `max_turns` to override any of these.
@@ -155,7 +162,45 @@ Questions published before the `<details>` shape existed fall back to a single-l
 A question that is already open is never re-asked; the original stays the copy the author
 answers.
 
+### Inspecting a review run
+
+The published review says what the reviewer concluded. These say how it got there, and they
+are the starting point for tuning the rubric, the prompt, or the turn budget.
+
+**Step summary** (the run's front page) carries the routing decision and its reason, the head
+range, the model and turn budget the analysis actually ran with, the model tier, high-risk and
+pre-mortem flags, and this round's counts — new findings split into inline and review-body,
+new questions, prior findings resolved. It then folds in two blocks: the **pipeline trace** and
+the **raw model output before compilation**. A failed run gets the same trace, which shows how
+far the round got before it stopped.
+
+**Job log** groups, in step order:
+
+- `Review routing` (prepare) — mode and why, prior state source and whether its version still
+  matches, previous and current head, the compare status and file count, both diff sizes, how
+  much of the PR conversation was included versus truncated, the paths in scope, and every open
+  prior finding and question the model was handed.
+- `Analysis settings` (compose) — model, tier, depth, pre-mortem, turn budgets, allowed tools.
+- The analysis step itself prints the session's full output, always: every tool call, which
+  files it opened, and which it never read. The step is collapsed until you expand it.
+- `Model output (raw, before compilation)` and `Compilation decisions` (compile) — one line per
+  model result the compiler accepted, suppressed as a duplicate of an open finding, dropped at
+  the per-severity cap of five, or rerouted to the review body because its line is not
+  commentable, plus each prior finding and question disposition.
+- `Publication` (publish) — review ID, inline comments requested versus posted, whether inline
+  publication fell back to the review body, threads resolved, and the sticky comment ID.
+
+**Run artifact** `pr-review-state-<pr>-<run>-<attempt>` holds the bytes themselves, for 14 days
+by default: `review-input.json` (everything the model was given), `review.diff` and `full.diff`,
+`analysis-transcript.json` (the session's turn-by-turn record, plus a `-retry-` twin when the
+retry ran), `structured-output.json`, `model-output.json`, `review-payload.json` (the compiled
+review, including its decision trace), `publish-result.json`, and `trace.log`.
+
+"The model missed it" and "the pipeline dropped it" look identical in the published review and
+different in these. Compare `model-output.json` against the `Compilation decisions` group first.
+
 ### Comment-triggered reconciliation (opt-in)
+
 
 By default the review only runs on `pull_request` events, so an author who answers an open
 question in a PR comment sees nothing happen until the next push. A consumer can also let a

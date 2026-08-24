@@ -53,10 +53,24 @@ inputs:
     required: false
     default: "false"
     description: >
-      `true` prints the analysis session's full output, including its tool
-      calls, into the job log. Off by default because the log is long and the
-      review itself is the product; turn it on to answer why a review reached
-      the verdict it did — which files it opened, and which it never read.
+      Deprecated and ignored. The analysis session's full output — its tool
+      calls, the files it opened, and the ones it never read — is now always
+      printed, and the whole `.pr-review` state directory plus the session
+      transcript are uploaded as a run artifact. Kept only so consumers that
+      still pass it do not break.
+  state_artifact:
+    required: false
+    default: "true"
+    description: >
+      `true` uploads the `.pr-review` state directory — routing input, both
+      diffs, the raw model output, the compiled payload, the pipeline trace,
+      and the analysis session transcript — as a run artifact. This is the
+      only copy that outlives the runner, so leave it on unless the repository
+      forbids artifacts.
+  state_artifact_retention_days:
+    required: false
+    default: "14"
+    description: Retention in days for the review state artifact.
   premortem:
     required: false
     default: auto
@@ -172,6 +186,21 @@ runs:
         echo "allowed_tools=${allowed_tools}" >> "$GITHUB_OUTPUT"
         echo "runtime_flags=${runtime_flags}" >> "$GITHUB_OUTPUT"
         echo "retry_runtime_flags=${retry_runtime_flags}" >> "$GITHUB_OUTPUT"
+        # Surfaced so the run report can state the settings the analysis
+        # actually used. Reading them back out of the flag string later would
+        # be guesswork.
+        echo "selected_model=${selected_model:-default}" >> "$GITHUB_OUTPUT"
+        echo "max_turns=${max_turns}" >> "$GITHUB_OUTPUT"
+        echo "retry_max_turns=${retry_turns}" >> "$GITHUB_OUTPUT"
+
+        echo "::group::Analysis settings"
+        echo "model: ${selected_model:-Claude Code default}"
+        echo "model tier: ${MODEL_TIER}"
+        echo "review depth: ${REVIEW_DEPTH}"
+        echo "pre-mortem: ${RUN_PREMORTEM}"
+        echo "max turns: ${max_turns} (retry ${retry_turns})"
+        echo "allowed tools: ${allowed_tools}"
+        echo "::endgroup::"
 
     - name: Analyze and verify findings
       id: review
@@ -182,7 +211,10 @@ runs:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         allowed_bots: ${{ inputs.allowed_bots }}
         display_report: false
-        show_full_output: ${{ inputs.debug_logs == 'true' }}
+        # Always on. The review body says what the model concluded; only this
+        # says how it got there — which files it opened, and which it never
+        # read. The step is collapsed in the job log until you expand it.
+        show_full_output: true
         additional_permissions: |
           actions: read
         claude_args: |
@@ -323,7 +355,7 @@ runs:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         allowed_bots: ${{ inputs.allowed_bots }}
         display_report: false
-        show_full_output: ${{ inputs.debug_logs == 'true' }}
+        show_full_output: true
         additional_permissions: |
           actions: read
         claude_args: |
@@ -358,6 +390,46 @@ runs:
           with an object matching the supplied JSON schema. Do not return prose,
           Markdown, or a fenced JSON block. Empty arrays are correct for a clean
           change.
+
+    - name: Capture analysis session transcript
+      if: always()
+      continue-on-error: true
+      shell: bash
+      env:
+        EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        RETRY_EXECUTION_FILE: ${{ steps.review_retry.outputs.execution_file }}
+        SESSION_ID: ${{ steps.review.outputs.session_id }}
+        RETRY_SESSION_ID: ${{ steps.review_retry.outputs.session_id }}
+        STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output }}
+        RETRY_STRUCTURED_OUTPUT: ${{ steps.review_retry.outputs.structured_output }}
+        STATE_DIR: ${{ github.workspace }}/.pr-review
+      run: |
+        set -uo pipefail
+        # The execution file is the model's own turn-by-turn record: every
+        # tool call, its arguments, and its result. It lives in a temp path
+        # that dies with the runner, so copy it into the state directory the
+        # artifact step uploads.
+        mkdir -p "$STATE_DIR"
+        copy_transcript() {
+          local source="$1" name="$2" session="$3"
+          if [[ -n "$source" && -f "$source" ]]; then
+            cp "$source" "$STATE_DIR/$name"
+            echo "captured $name from $source (session ${session:-unknown})"
+          else
+            echo "no transcript available for $name"
+          fi
+        }
+        copy_transcript "$EXECUTION_FILE" "analysis-transcript.json" "$SESSION_ID"
+        copy_transcript "$RETRY_EXECUTION_FILE" "analysis-retry-transcript.json" "$RETRY_SESSION_ID"
+        # Keep the raw structured output beside the transcript. `compile` also
+        # writes a parsed copy, but it never runs when compilation is what
+        # failed, and this is exactly the case you want the bytes for.
+        if [[ -n "$STRUCTURED_OUTPUT" ]]; then
+          printf '%s' "$STRUCTURED_OUTPUT" > "$STATE_DIR/structured-output.json"
+        fi
+        if [[ -n "$RETRY_STRUCTURED_OUTPUT" ]]; then
+          printf '%s' "$RETRY_STRUCTURED_OUTPUT" > "$STATE_DIR/structured-output-retry.json"
+        fi
 
     - name: Compile and validate review
       id: compile
@@ -399,7 +471,25 @@ runs:
         PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
         PUBLISH_PUBLISHED: ${{ steps.publish.outputs.published }}
         PUBLISH_STALE: ${{ steps.publish.outputs.stale }}
+        ANALYSIS_MODEL: ${{ steps.compose.outputs.selected_model }}
+        ANALYSIS_MAX_TURNS: ${{ steps.compose.outputs.max_turns }}
+        ANALYSIS_RETRY_MAX_TURNS: ${{ steps.compose.outputs.retry_max_turns }}
+        ANALYSIS_REVIEW_DEPTH: ${{ inputs.review_depth }}
+        ANALYSIS_ALLOWED_TOOLS: ${{ steps.compose.outputs.allowed_tools }}
       run: |
         set -euo pipefail
         python3 "$GITHUB_ACTION_PATH/review_pipeline.py" report \
           --state-dir "$STATE_DIR"
+
+    - name: Upload review state for inspection
+      if: always() && inputs.state_artifact == 'true'
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        # Run ID and attempt keep reruns from colliding; the PR number keeps
+        # concurrent reviews in one run distinguishable.
+        name: pr-review-state-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ github.workspace }}/.pr-review
+        if-no-files-found: warn
+        retention-days: ${{ inputs.state_artifact_retention_days }}
+        include-hidden-files: true
