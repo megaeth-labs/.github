@@ -4,9 +4,6 @@ name: Release Candidate
 # the version file on the default branch and opens a candidate PR. When that
 # PR merges, the `cut` job creates `release-vX.Y.Z` at the merge commit. No
 # tag is created here — see release-settle / release-publish.
-#
-# Pin the shared actions to a commit SHA of megaeth-labs/.github before
-# relying on this in a real release.
 
 on:
   workflow_dispatch:
