@@ -360,7 +360,7 @@ a SHA once you rely on them.
 
 Requirements in the consumer repo:
 
-- Org variable `CI_APP_ID` / secret `MEGA_CI_APP_PK` (the Maxwell app). PRs
+- Org variable `CI_APP_ID` / secret `CI_APP_PK` (the Maxwell app). PRs
   and tag pushes must come from an App token: `GITHUB_TOKEN` does not trigger
   downstream workflows.
 - An environment `release` with required reviewers on the publish job — this
