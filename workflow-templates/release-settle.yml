@@ -5,9 +5,6 @@ name: Release Settle
 # verifies it, generates release notes from the commits since the previous
 # tag, writes them to the changelog, and opens a settle PR onto the release
 # branch. Merging that PR is the settlement decision (release-publish tags it).
-#
-# Pin the shared actions to a commit SHA of megaeth-labs/.github before
-# relying on this in a real release.
 
 on:
   workflow_dispatch:

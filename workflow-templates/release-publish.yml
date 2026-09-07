@@ -8,8 +8,7 @@ name: Release Publish
 # and add the CI app as a bypass actor on the `v*` tag ruleset.
 #
 # This file must exist on the release branch (it does, when the branch is cut
-# from a default branch that has it). Pin the shared actions to a commit SHA
-# of megaeth-labs/.github before relying on this in a real release.
+# from a default branch that has it).
 
 on:
   pull_request:

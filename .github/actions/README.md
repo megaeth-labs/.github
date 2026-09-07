@@ -355,8 +355,10 @@ own `push: tags` workflow, which the tag created by `release-publish` fires.
 | `release-publish` | the settle PR merging | annotated tag at the merge commit (refuses if it exists), GitHub Release, back-merge PR of the changelog |
 
 `workflow-templates/release-*.yml` are the reference callers; they show up
-under "New workflow → By megaeth-labs" in every org repo. Pin the actions to
-a SHA once you rely on them.
+under "New workflow → By megaeth-labs" in every org repo. Consumers track the
+actions at `@main`, like every other action here: a merge to this repo reaches
+all product release flows at once, which is what `actions-test.yml` and the
+`main` ruleset are for.
 
 Requirements in the consumer repo:
 
