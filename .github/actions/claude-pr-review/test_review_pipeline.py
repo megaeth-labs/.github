@@ -1778,6 +1778,66 @@ class ReviewPipelineTests(unittest.TestCase):
         self.assertIn("Open questions awaiting an answer:", body)
         self.assertIn("carried over from earlier rounds", body)
 
+    def test_self_authored_pull_is_the_reviewer_identity(self):
+        pull = {"user": {"login": "mega-maxwell[bot]"}}
+        self.assertEqual(
+            pipeline.self_authored_pull(pull, publisher_login="mega-maxwell[bot]"),
+            "mega-maxwell[bot]",
+        )
+        self.assertEqual(
+            pipeline.self_authored_pull(pull, publisher_login="mega-maxwell"),
+            "mega-maxwell[bot]",
+        )
+        self.assertIsNone(
+            pipeline.self_authored_pull(
+                {"user": {"login": "someone"}}, publisher_login="mega-maxwell[bot]"
+            )
+        )
+        self.assertIsNone(
+            pipeline.self_authored_pull({}, publisher_login="mega-maxwell[bot]")
+        )
+
+    def test_skipped_status_explains_the_self_authored_pull(self):
+        payload = {
+            "repository": "megaeth-labs/example",
+            "pull_request": 7,
+            "status_summary": {
+                "scope_text": "head `bbbbbbbb`",
+                "phase": "skipped",
+                "reason": "opened by mega-maxwell[bot], the reviewer's own identity",
+            },
+        }
+
+        body = pipeline.render_status_body(payload, {"findings": {}})
+
+        self.assertIn("⏭️ Review skipped", body)
+        self.assertIn("Not reviewing head `bbbbbbbb`", body)
+        self.assertIn("opened by mega-maxwell[bot], the reviewer's own identity", body)
+        self.assertNotIn("did not finish", body)
+        self.assertNotIn("Re-run the workflow", body)
+
+    def test_report_status_line_distinguishes_self_authored_skips(self):
+        self.assertIn(
+            "opened by mega-maxwell[bot], the reviewer's own identity",
+            pipeline.report_status_line(
+                stale=False,
+                mode="skip",
+                published=False,
+                scope={"self_authored_by": "mega-maxwell[bot]"},
+            ),
+        )
+        self.assertEqual(
+            pipeline.report_status_line(
+                stale=False, mode="skip", published=False, scope={}
+            ),
+            "⏭️ The current PR head was already reviewed.",
+        )
+        self.assertTrue(
+            pipeline.report_status_line(
+                stale=True, mode="full", published=True, scope={}
+            ).startswith("⚠️")
+        )
+
     def test_failed_status_retires_the_in_progress_phase(self):
         payload = {
             "repository": "megaeth-labs/example",
