@@ -75,8 +75,11 @@ runs:
         # behind first: git sends every configured extraheader, and two
         # Authorization headers get a 400.
         git config --unset-all "http.https://github.com/.extraheader" || true
-        git config "http.https://github.com/.extraheader" \
-          "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+        auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+        # The token itself is masked by create-github-app-token; its base64
+        # form is not, so mask it too before it can reach a log.
+        echo "::add-mask::$auth"
+        git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $auth"
 
     - name: Guard
       id: guard
