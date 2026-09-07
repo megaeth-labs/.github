@@ -166,21 +166,27 @@ def _section_span(text: str, version: str) -> tuple[int, int] | None:
     return None
 
 
+def _tidy(text: str) -> str:
+    """Exactly one blank line between blocks and one newline at EOF, so the
+    result is stable under formatters like dprint/prettier."""
+    return re.sub(r"\n{3,}", "\n\n", text).rstrip("\n") + "\n"
+
+
 def insert_changelog_section(text: str, version: str, section: str) -> tuple[str, str]:
     """Insert `section` as the newest entry (or replace an existing entry for
     the same version). Returns (new_text, "inserted"|"replaced"). An empty or
     missing changelog gets the standard header."""
     section = section.rstrip("\n") + "\n\n"
     if not text.strip():
-        return CHANGELOG_HEADER + "\n" + section, "inserted"
+        return _tidy(CHANGELOG_HEADER + "\n" + section), "inserted"
     span = _section_span(text, version)
     if span:
         s, e = span
-        return text[:s] + section + text[e:].lstrip("\n"), "replaced"
+        return _tidy(text[:s] + section + text[e:].lstrip("\n")), "replaced"
     first = re.search(r"^## ", text, re.M)
     if first:
-        return text[: first.start()] + section + text[first.start():], "inserted"
-    return text.rstrip("\n") + "\n\n" + section, "inserted"
+        return _tidy(text[: first.start()] + section + text[first.start():]), "inserted"
+    return _tidy(text.rstrip("\n") + "\n\n" + section), "inserted"
 
 
 def extract_changelog_section(text: str, version: str) -> str | None:

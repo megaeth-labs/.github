@@ -3,9 +3,9 @@ name: Release Publish
 # Publishes a settled release when its settle PR merges into the release
 # branch: annotated tag at the merge commit (once), GitHub Release with the
 # changelog section as notes, and a back-merge PR of the changelog to the
-# default branch. The job runs under the `release` environment so an admin
-# approves every publish; create that environment with required reviewers,
-# and add the CI app as a bypass actor on the `v*` tag ruleset.
+# default branch. Merging the settle PR is the release approval (the
+# `release-*` branch ruleset requires a reviewed PR), so no environment gate
+# is needed; add the CI app as a bypass actor on the `v*` tag ruleset.
 #
 # This file must exist on the release branch (it does, when the branch is cut
 # from a default branch that has it).
@@ -25,7 +25,6 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'chore/release-settle-') &&
       github.event.pull_request.user.login == 'mega-maxwell[bot]'
     runs-on: ubuntu-latest
-    environment: release
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: app-token

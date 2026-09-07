@@ -95,6 +95,18 @@ class Changelog(unittest.TestCase):
         self.assertNotIn("- b (", twice)
         self.assertIn("## v0.1.0", twice)
 
+    def test_spacing_is_formatter_stable(self):
+        # One blank line between blocks, one newline at EOF — whether the
+        # section lands at the end (no prior entries), at the top, or replaces.
+        for text in ("", "# Changelog\n\nIntro line.\n", self.OLD):
+            new, _ = rt.insert_changelog_section(text, "0.2.0", self.SEC)
+            self.assertFalse(new.endswith("\n\n"), repr(new[-10:]))
+            self.assertTrue(new.endswith("\n"))
+            self.assertNotIn("\n\n\n", new)
+        twice, _ = rt.insert_changelog_section(new, "0.2.0", self.SEC)
+        self.assertNotIn("\n\n\n", twice)
+        self.assertFalse(twice.endswith("\n\n"))
+
     def test_extract_missing(self):
         self.assertIsNone(rt.extract_changelog_section(self.OLD, "9.9.9"))
 
