@@ -337,3 +337,41 @@ pr-review:
     group: claude-pr-review-${{ github.event.pull_request.number }}
     cancel-in-progress: true
 ```
+
+## Release actions
+
+Three composite actions implement the org release flow — trunk-first
+candidate, settle-by-PR, publish-once. They are language-agnostic: the only
+repo-specific inputs are where the version lives (`version_file` +
+`version_pattern`: `plain`, `toml`, `json`) and the changelog path. Builds and
+artifact uploads are not part of them; a repo that ships binaries adds its
+own `push: tags` workflow, which the tag created by `release-publish` fires.
+
+| Action | Trigger in the consumer | Does |
+|---|---|---|
+| `release-candidate` `stage: propose` | `workflow_dispatch` on the default branch | bumps `version_file`, opens `chore/release-candidate-vX.Y.Z` PR |
+| `release-candidate` `stage: cut` | that PR merging | creates `release-vX.Y.Z` at the merge commit |
+| `release-settle` | `workflow_dispatch` with version + tip SHA | guards, generates notes since the previous tag, writes `CHANGELOG.md`, opens `chore/release-settle-vX.Y.Z` PR onto the release branch |
+| `release-publish` | the settle PR merging | annotated tag at the merge commit (refuses if it exists), GitHub Release, back-merge PR of the changelog |
+
+`workflow-templates/release-*.yml` are the reference callers; they show up
+under "New workflow → By megaeth-labs" in every org repo. Pin the actions to
+a SHA once you rely on them.
+
+Requirements in the consumer repo:
+
+- Org variable `CI_APP_ID` / secret `CI_APP_PK` (the Maxwell app). PRs
+  and tag pushes must come from an App token: `GITHUB_TOKEN` does not trigger
+  downstream workflows.
+- An environment `release` with required reviewers on the publish job — this
+  is the human gate for creating a tag.
+- A tag ruleset for `v*` (no creation/deletion/force-push) with the app as a
+  bypass actor, so `release-publish` is the only tag creator.
+- A branch ruleset for `release-*` requiring PRs and up-to-date branches, so
+  a settle PR goes stale if the candidate drifts after it was opened.
+- `gh` and `python3` on the runner (any GitHub-hosted image).
+
+Release notes are generated from commit subjects between the previous `v*`
+tag and the settled commit, grouped by Conventional Commit type with PR links
+from `(#N)` suffixes. The pure text logic lives in
+`release-tools/release_tools.py` and is unit-tested by `actions-test.yml`.

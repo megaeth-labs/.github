@@ -28,3 +28,12 @@ jobs:
             -s .github/actions/claude-pr-review \
             -p 'test_*.py' \
             -v
+
+      - name: Test release tools
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover \
+            -s .github/actions/release-tools \
+            -p 'test_*.py' \
+            -v

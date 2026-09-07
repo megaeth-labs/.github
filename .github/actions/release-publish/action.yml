@@ -1,0 +1,169 @@
+name: Release Publish
+description: >-
+  Publish a settled release. Runs when a `chore/release-settle-vX.Y.Z` PR
+  merges into its release branch: creates the annotated tag `vX.Y.Z` at the
+  merge commit (exactly once — refuses if it exists), publishes the GitHub
+  Release with the changelog section as notes, and opens a back-merge PR
+  carrying the changelog to the default branch. This is the only place in the
+  release flow that creates a tag. Put the calling job behind a protected
+  environment so an admin approves every publish. The consumer checks the
+  repository out first (`fetch-depth: 0`, `persist-credentials: false`).
+
+inputs:
+  token:
+    description: >-
+      GitHub App installation token (e.g. the Maxwell app). The tag push must
+      come from it so `push: tags` workflows (artifact builds) fire; the job's
+      GITHUB_TOKEN would not trigger them. Also needs to be a bypass actor on
+      the repository's tag ruleset.
+    required: true
+  version_file:
+    required: true
+  version_pattern:
+    required: false
+    default: plain
+  changelog_file:
+    required: false
+    default: CHANGELOG.md
+  release_branch_prefix:
+    required: false
+    default: release-v
+  backmerge:
+    description: "Open a PR carrying the changelog back to the default branch."
+    required: false
+    default: "true"
+  git_user_name:
+    required: false
+    default: "mega-maxwell[bot]"
+  git_user_email:
+    required: false
+    default: "290560214+mega-maxwell[bot]@users.noreply.github.com"
+
+outputs:
+  version:
+    value: ${{ steps.guard.outputs.version }}
+  tag:
+    value: ${{ steps.tag.outputs.tag }}
+  release_url:
+    value: ${{ steps.release.outputs.url }}
+  backmerge_pr_url:
+    value: ${{ steps.backmerge.outputs.pr_url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Guard
+      id: guard
+      shell: bash
+      env:
+        MERGED: ${{ github.event.pull_request.merged }}
+        HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        PREFIX: ${{ inputs.release_branch_prefix }}
+        FILE: ${{ inputs.version_file }}
+        PATTERN: ${{ inputs.version_pattern }}
+        CHANGELOG: ${{ inputs.changelog_file }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        set -euo pipefail
+        if [[ "$MERGED" != "true" || -z "$MERGE_SHA" ]]; then
+          echo "::error::publish runs on a merged settle PR (pull_request closed, merged == true)"; exit 1
+        fi
+        if [[ "$HEAD_REF" != chore/release-settle-v* ]]; then
+          echo "::error::head branch '$HEAD_REF' is not a settle PR"; exit 1
+        fi
+        version="$(python3 "$TOOLS" normalize "${HEAD_REF#chore/release-settle-}")"
+        if [[ "$BASE_REF" != "${PREFIX}${version}" ]]; then
+          echo "::error::settle PR for v$version merged into '$BASE_REF', expected ${PREFIX}${version}"; exit 1
+        fi
+        git fetch --quiet --tags origin "$MERGE_SHA"
+        if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+          echo "::error::tag v$version already exists; a release is published once"; exit 1
+        fi
+        actual="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
+        if [[ "$actual" != "$version" ]]; then
+          echo "::error::$FILE at $MERGE_SHA says $actual, expected $version"; exit 1
+        fi
+        notes="$RUNNER_TEMP/release-notes-v$version.md"
+        git show "$MERGE_SHA:$CHANGELOG" > "$RUNNER_TEMP/changelog-at-merge.md"
+        python3 "$TOOLS" changelog-extract "$RUNNER_TEMP/changelog-at-merge.md" "$version" > "$notes"
+        {
+          echo "version=$version"
+          echo "merge_sha=$MERGE_SHA"
+          echo "notes_file=$notes"
+        } >> "$GITHUB_OUTPUT"
+        echo "publishing v$version at $MERGE_SHA"; echo "--- notes ---"; cat "$notes"
+
+    - name: Configure git auth
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        NAME: ${{ inputs.git_user_name }}
+        EMAIL: ${{ inputs.git_user_email }}
+      run: |
+        set -euo pipefail
+        git config user.name "$NAME"
+        git config user.email "$EMAIL"
+        git config "http.https://github.com/.extraheader" \
+          "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+
+    - name: Create and push tag
+      id: tag
+      shell: bash
+      env:
+        VERSION: ${{ steps.guard.outputs.version }}
+        MERGE_SHA: ${{ steps.guard.outputs.merge_sha }}
+      run: |
+        set -euo pipefail
+        tag="v$VERSION"
+        git tag -a "$tag" "$MERGE_SHA" -m "Release $tag"
+        git push --quiet origin "refs/tags/$tag"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "tagged $MERGE_SHA as $tag"
+
+    - name: Publish GitHub Release
+      id: release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ steps.tag.outputs.tag }}
+        NOTES: ${{ steps.guard.outputs.notes_file }}
+      run: |
+        set -euo pipefail
+        url="$(gh release create "$TAG" --verify-tag --latest --title "$TAG" --notes-file "$NOTES")"
+        echo "url=$url" >> "$GITHUB_OUTPUT"
+        echo "release: $url"
+
+    - name: Back-merge changelog to default branch
+      if: inputs.backmerge == 'true'
+      id: backmerge
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.guard.outputs.version }}
+        TAG: ${{ steps.tag.outputs.tag }}
+        CHANGELOG: ${{ inputs.changelog_file }}
+      run: |
+        set -euo pipefail
+        default="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)"
+        git fetch --quiet origin "$default"
+        head="chore/changelog-v$VERSION"
+        git checkout --quiet -B "$head" "origin/$default"
+        git checkout --quiet "$TAG" -- "$CHANGELOG"
+        if git diff --cached --quiet; then
+          echo "default branch $default already has the v$VERSION changelog; nothing to back-merge"
+          exit 0
+        fi
+        git commit --quiet -m "chore(release): changelog for v$VERSION"
+        git push --quiet --force-with-lease origin "$head"
+        url="$(gh pr create --base "$default" --head "$head" \
+          --title "chore(release): changelog for v$VERSION" \
+          --body "Back-merge of \`$CHANGELOG\` from \`$TAG\` into \`$default\`, opened by release-publish.")"
+        echo "pr_url=$url" >> "$GITHUB_OUTPUT"
+        echo "back-merge PR: $url"
+
+    - name: Remove git auth
+      if: always()
+      shell: bash
+      run: git config --unset-all "http.https://github.com/.extraheader" || true

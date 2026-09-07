@@ -1,0 +1,178 @@
+name: Release Settle
+description: >-
+  Propose settling a release candidate: verify `commit` is the tip of the
+  release branch and carries the expected version, generate release notes from
+  the commits since the previous tag, write them into the changelog, and open a
+  `chore/release-settle-vX.Y.Z` PR onto the release branch. Merging that PR is
+  the settlement decision; release-publish then tags the merge commit once.
+  Nothing here creates a tag. Run as a step in a job the consumer owns; the
+  consumer checks the repository out first (`fetch-depth: 0`,
+  `persist-credentials: false`). Needs `gh` and `python3` on the runner.
+
+inputs:
+  token:
+    description: >-
+      GitHub App installation token (e.g. the Maxwell app). Pushes the settle
+      branch and opens the PR so that it triggers CI.
+    required: true
+  version:
+    description: "Version being settled, X.Y.Z or vX.Y.Z."
+    required: true
+  commit:
+    description: >-
+      Full SHA to settle. Must be the current tip of the release branch: the
+      settlement is a statement about a specific commit, and the tip is the
+      only commit a later merge can build on.
+    required: true
+  version_file:
+    required: true
+  version_pattern:
+    required: false
+    default: plain
+  release_branch:
+    description: "Defaults to `<release_branch_prefix>X.Y.Z`."
+    required: false
+    default: ""
+  release_branch_prefix:
+    required: false
+    default: release-v
+  changelog_file:
+    required: false
+    default: CHANGELOG.md
+  git_user_name:
+    required: false
+    default: "mega-maxwell[bot]"
+  git_user_email:
+    required: false
+    default: "290560214+mega-maxwell[bot]@users.noreply.github.com"
+
+outputs:
+  version:
+    value: ${{ steps.guard.outputs.version }}
+  pr_url:
+    description: URL of the settle PR.
+    value: ${{ steps.pr.outputs.pr_url }}
+  notes_file:
+    description: Path of the generated release-notes markdown.
+    value: ${{ steps.notes.outputs.notes_file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Guard
+      id: guard
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        COMMIT: ${{ inputs.commit }}
+        BRANCH_IN: ${{ inputs.release_branch }}
+        PREFIX: ${{ inputs.release_branch_prefix }}
+        FILE: ${{ inputs.version_file }}
+        PATTERN: ${{ inputs.version_pattern }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        set -euo pipefail
+        version="$(python3 "$TOOLS" normalize "$INPUT_VERSION")"
+        branch="${BRANCH_IN:-${PREFIX}${version}}"
+        if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::commit must be a full 40-hex SHA, got '$COMMIT'"; exit 1
+        fi
+        git fetch --quiet --tags origin "+refs/heads/$branch:refs/remotes/origin/$branch" \
+          || { echo "::error::release branch $branch does not exist"; exit 1; }
+        if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+          echo "::error::tag v$version already exists — this release is settled"; exit 1
+        fi
+        tip="$(git rev-parse "origin/$branch")"
+        if [[ "$tip" != "$COMMIT" ]]; then
+          echo "::error::$COMMIT is not the tip of $branch (tip is $tip). Settle the tip, or move the branch first."; exit 1
+        fi
+        actual="$(git show "$COMMIT:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
+        if [[ "$actual" != "$version" ]]; then
+          echo "::error::$FILE at $COMMIT says $actual, expected $version"; exit 1
+        fi
+        latest="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+        if ! python3 "$TOOLS" is-greater "$version" "$latest"; then
+          echo "::error::$version is not newer than the latest tag ${latest:-<none>}"; exit 1
+        fi
+        {
+          echo "version=$version"
+          echo "branch=$branch"
+          echo "previous_tag=$latest"
+        } >> "$GITHUB_OUTPUT"
+        echo "settling v$version at $COMMIT on $branch (previous tag: ${latest:-<none>})"
+
+    - name: Generate release notes
+      id: notes
+      shell: bash
+      env:
+        VERSION: ${{ steps.guard.outputs.version }}
+        PREVIOUS: ${{ steps.guard.outputs.previous_tag }}
+        COMMIT: ${{ inputs.commit }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        set -euo pipefail
+        notes="$RUNNER_TEMP/release-notes-v$VERSION.md"
+        range="$COMMIT"
+        [[ -n "$PREVIOUS" ]] && range="$PREVIOUS..$COMMIT"
+        git log --no-merges --format='%H%x09%s' "$range" \
+          | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$VERSION" "$(date -u +%F)" > "$notes"
+        echo "notes_file=$notes" >> "$GITHUB_OUTPUT"
+        echo "--- release notes ---"; cat "$notes"
+
+    - name: Configure git auth
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        NAME: ${{ inputs.git_user_name }}
+        EMAIL: ${{ inputs.git_user_email }}
+      run: |
+        set -euo pipefail
+        git config user.name "$NAME"
+        git config user.email "$EMAIL"
+        # Same mechanism actions/checkout uses; scoped to this clone, removed below.
+        git config "http.https://github.com/.extraheader" \
+          "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+
+    - name: Write changelog and open settle PR
+      id: pr
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.guard.outputs.version }}
+        BRANCH: ${{ steps.guard.outputs.branch }}
+        COMMIT: ${{ inputs.commit }}
+        CHANGELOG: ${{ inputs.changelog_file }}
+        NOTES: ${{ steps.notes.outputs.notes_file }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        set -euo pipefail
+        head="chore/release-settle-v$VERSION"
+        git checkout --quiet -B "$head" "$COMMIT"
+        what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
+        git add "$CHANGELOG"
+        git commit --quiet -m "chore(release): settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
+        git push --quiet --force-with-lease origin "$head"
+        body="$RUNNER_TEMP/settle-pr-body.md"
+        {
+          echo "Settle **v$VERSION** at \`$COMMIT\` (tip of \`$BRANCH\`)."
+          echo
+          echo "Merging this PR is the settlement decision: \`release-publish\` will tag the merge commit as \`v$VERSION\`, publish the GitHub Release with the notes below, and open a back-merge of \`$CHANGELOG\` to the default branch. If more commits land on \`$BRANCH\` first, this PR goes stale and must be regenerated."
+          echo
+          echo "<!-- release-settle: v$VERSION $COMMIT -->"
+          echo
+          cat "$NOTES"
+        } > "$body"
+        existing="$(gh pr list --head "$head" --base "$BRANCH" --state open --json url -q '.[0].url')"
+        if [[ -n "$existing" ]]; then
+          gh pr edit "$existing" --body-file "$body" >/dev/null
+          url="$existing"
+        else
+          url="$(gh pr create --base "$BRANCH" --head "$head" --title "chore(release): settle v$VERSION" --body-file "$body")"
+        fi
+        echo "pr_url=$url" >> "$GITHUB_OUTPUT"
+        echo "settle PR: $url"
+
+    - name: Remove git auth
+      if: always()
+      shell: bash
+      run: git config --unset-all "http.https://github.com/.extraheader" || true
