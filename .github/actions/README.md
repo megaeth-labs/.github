@@ -367,8 +367,10 @@ Requirements in the consumer repo:
   is the human gate for creating a tag.
 - A tag ruleset for `v*` (no creation/deletion/force-push) with the app as a
   bypass actor, so `release-publish` is the only tag creator.
-- A branch ruleset for `release-*` requiring PRs and up-to-date branches, so
-  a settle PR goes stale if the candidate drifts after it was opened.
+- A branch ruleset for `release-*` requiring PRs, so settlement is always a
+  reviewed merge. Drift after a settle PR is opened is caught by
+  `release-publish` itself (it refuses if the branch tip at merge is not the
+  settled SHA), so no "up to date" status check is needed.
 - `gh` and `python3` on the runner (any GitHub-hosted image).
 
 Release notes are generated from commit subjects between the previous `v*`
