@@ -374,6 +374,10 @@ Requirements in the consumer repo:
   `release-publish` itself (it refuses if the branch tip at merge is not the
   settled SHA), so no "up to date" status check is needed.
 - `gh` and `python3` on the runner (any GitHub-hosted image).
+- The cut and publish stages only accept PRs opened by the app identity
+  (`pr_author`, default `mega-maxwell[bot]`); the templates also gate the
+  jobs' `if:` on it, so a hand-made `chore/release-*` branch merged by a
+  collaborator never reaches the app-token steps.
 
 Release notes are generated from commit subjects between the previous `v*`
 tag and the settled commit, grouped by Conventional Commit type with PR links

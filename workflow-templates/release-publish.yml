@@ -22,7 +22,8 @@ jobs:
   publish:
     if: >-
       github.event.pull_request.merged == true &&
-      startsWith(github.event.pull_request.head.ref, 'chore/release-settle-')
+      startsWith(github.event.pull_request.head.ref, 'chore/release-settle-') &&
+      github.event.pull_request.user.login == 'mega-maxwell[bot]'
     runs-on: ubuntu-latest
     environment: release
     steps:

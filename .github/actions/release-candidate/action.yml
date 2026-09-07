@@ -36,6 +36,14 @@ inputs:
     description: "Comma-separated labels for the candidate PR."
     required: false
     default: ""
+  pr_author:
+    description: >-
+      Login the candidate PR must have been opened by for `cut` to proceed —
+      the app identity `propose` runs under. Stops a hand-made
+      `chore/release-candidate-*` branch from driving the cut. Empty disables
+      the check.
+    required: false
+    default: "mega-maxwell[bot]"
   git_user_name:
     description: "Committer identity for the bump commit."
     required: false
@@ -156,11 +164,17 @@ runs:
         PATTERN: ${{ inputs.version_pattern }}
         MERGED: ${{ github.event.pull_request.merged }}
         MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        EXPECTED_AUTHOR: ${{ inputs.pr_author }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
         if [[ "$MERGED" != "true" || -z "$MERGE_SHA" ]]; then
           echo "::error::cut runs on a merged candidate PR (pull_request closed, merged == true)"; exit 1
+        fi
+        if [[ -n "$EXPECTED_AUTHOR" && "$PR_AUTHOR" != "$EXPECTED_AUTHOR" ]]; then
+          echo "::error::candidate PR #$PR_NUMBER was opened by '$PR_AUTHOR', not by '$EXPECTED_AUTHOR' (the identity propose runs under); refusing to cut a release branch from it"; exit 1
         fi
         git fetch --quiet origin "$MERGE_SHA"
         actual="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
