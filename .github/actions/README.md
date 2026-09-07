@@ -378,7 +378,7 @@ all product release flows at once, which is what `actions-test.yml` and the
 
 Requirements in the consumer repo:
 
-- Org variable `CI_APP_ID` / secret `MEGA_MAXWELL_PK` (the Maxwell app). PRs
+- Org variable `MEGA_MAXWELL_CLIENT_ID` (the Maxwell app's client id) / secret `MEGA_MAXWELL_PK`. PRs
   and tag pushes must come from an App token: `GITHUB_TOKEN` does not trigger
   downstream workflows.
 - A reviewed settle PR is the human gate for creating a tag: the
