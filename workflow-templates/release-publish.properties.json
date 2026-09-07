@@ -1,6 +1,6 @@
 {
   "name": "Release Publish",
-  "description": "Tag and publish a settled release when its settle PR merges; back-merge the changelog.",
+  "description": "Tag and publish a settled release when its settle PR merges.",
   "iconName": "octicon tag",
   "categories": [
     "Automation"

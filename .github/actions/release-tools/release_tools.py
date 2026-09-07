@@ -12,6 +12,8 @@ Subcommands (see `main`):
   notes       REPO VERSION DATE             -> stdin: "<sha>\t<subject>" lines; stdout: markdown
   changelog-insert PATH VERSION SECTION_MD  -> insert/replace the section, print "inserted"/"replaced"
   changelog-extract PATH VERSION            -> the section body on stdout, exit 1 if absent
+  changelog-copy   SRC DST VERSION          -> copy VERSION's section (with heading) from SRC into DST;
+                                               prints inserted/replaced/unchanged/absent
 """
 
 from __future__ import annotations
@@ -41,6 +43,9 @@ NOTE_GROUPS: list[tuple[str, str]] = [
 ]
 SUBJECT = re.compile(r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?:\s*(?P<desc>.+)$")
 PR_SUFFIX = re.compile(r"\s*\(#(?P<num>\d+)\)\s*$")
+# Commits the release flow itself makes (candidate bump, settle, changelog
+# sync). They are bookkeeping, not changes, so they never appear in notes.
+RELEASE_COMMIT = re.compile(r"^chore\(release\):")
 
 CHANGELOG_HEADER = "# Changelog\n"
 
@@ -131,6 +136,8 @@ def generate_notes(repo: str, version: str, date: str, lines: list[str]) -> str:
         if not line.strip():
             continue
         sha, _, subject = line.partition("\t")
+        if RELEASE_COMMIT.match(subject.strip()):
+            continue
         ctype, scope, bang, desc, pr = parse_subject(subject)
         ref = f"[#{pr}](https://github.com/{repo}/pull/{pr})" if pr else f"`{sha[:10]}`"
         text = f"{scope}: {desc}" if scope else desc
@@ -189,6 +196,15 @@ def insert_changelog_section(text: str, version: str, section: str) -> tuple[str
     return _tidy(text.rstrip("\n") + "\n\n" + section), "inserted"
 
 
+def changelog_section_text(text: str, version: str) -> str | None:
+    """The `## vX.Y.Z` section including its heading, or None."""
+    span = _section_span(text, version)
+    if not span:
+        return None
+    s, e = span
+    return text[s:e].rstrip("\n") + "\n"
+
+
 def extract_changelog_section(text: str, version: str) -> str | None:
     """Body of the section (without its `## ` heading), or None."""
     span = _section_span(text, version)
@@ -236,6 +252,11 @@ def main(argv: list[str]) -> int:
     s.add_argument("path")
     s.add_argument("version")
 
+    s = sub.add_parser("changelog-copy")
+    s.add_argument("src")
+    s.add_argument("dst")
+    s.add_argument("version")
+
     a = p.parse_args(argv)
     try:
         if a.cmd == "normalize":
@@ -257,6 +278,19 @@ def main(argv: list[str]) -> int:
             new, what = insert_changelog_section(text, a.version, Path(a.section_file).read_text())
             path.write_text(new)
             print(what)
+        elif a.cmd == "changelog-copy":
+            section = changelog_section_text(Path(a.src).read_text(), a.version)
+            if section is None:
+                print("absent")
+                return 0
+            dst = Path(a.dst)
+            text = dst.read_text() if dst.exists() else ""
+            new, what = insert_changelog_section(text, a.version, section)
+            if new == text:
+                print("unchanged")
+            else:
+                dst.write_text(new)
+                print(what)
         elif a.cmd == "changelog-extract":
             body = extract_changelog_section(Path(a.path).read_text(), a.version)
             if body is None:
