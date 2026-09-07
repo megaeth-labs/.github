@@ -85,6 +85,27 @@ runs:
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "release version: $version"
 
+    - name: Configure git auth
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        NAME: ${{ inputs.git_user_name }}
+        EMAIL: ${{ inputs.git_user_email }}
+      run: |
+        set -euo pipefail
+        git config user.name "$NAME"
+        git config user.email "$EMAIL"
+        # Same mechanism actions/checkout uses, scoped to this clone and
+        # removed in the last step. Drop any header a persisted checkout left
+        # behind first: git sends every configured extraheader, and two
+        # Authorization headers get a 400.
+        git config --unset-all "http.https://github.com/.extraheader" || true
+        auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+        # The token itself is masked by create-github-app-token; its base64
+        # form is not, so mask it too before it can reach a log.
+        echo "::add-mask::$auth"
+        git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $auth"
+
     # ---------------------------------------------------------------- propose
     - name: Guard (propose)
       if: inputs.stage == 'propose'
@@ -129,6 +150,13 @@ runs:
         echo "old=$old" >> "$GITHUB_OUTPUT"
         echo "$FILE: $old -> $VERSION"
         git diff --stat
+
+    # create-pull-request authenticates its own push with the token input;
+    # hand it a clone without our header so the two never overlap.
+    - name: Remove git auth before opening the PR
+      if: inputs.stage == 'propose'
+      shell: bash
+      run: git config --unset-all "http.https://github.com/.extraheader" || true
 
     - name: Open candidate PR
       if: inputs.stage == 'propose'
@@ -188,3 +216,8 @@ runs:
         gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$MERGE_SHA" >/dev/null
         echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
         echo "created $branch at $MERGE_SHA"
+
+    - name: Remove git auth
+      if: always()
+      shell: bash
+      run: git config --unset-all "http.https://github.com/.extraheader" || true
