@@ -374,8 +374,10 @@ Requirements in the consumer repo:
 - Org variable `CI_APP_ID` / secret `MEGA_MAXWELL_PK` (the Maxwell app). PRs
   and tag pushes must come from an App token: `GITHUB_TOKEN` does not trigger
   downstream workflows.
-- An environment `release` with required reviewers on the publish job — this
-  is the human gate for creating a tag.
+- A reviewed settle PR is the human gate for creating a tag: the
+  `release-*` branch ruleset below requires it. No environment approval is
+  needed on the publish job (an `environment:` with required reviewers can
+  be added by repos that want a second, separate approver).
 - A tag ruleset for `v*` (no creation/deletion/force-push) with the app as a
   bypass actor, so `release-publish` is the only tag creator.
 - A branch ruleset for `release-*` requiring PRs, so settlement is always a
