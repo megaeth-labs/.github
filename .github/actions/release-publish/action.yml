@@ -33,6 +33,13 @@ inputs:
     description: "Open a PR carrying the changelog back to the default branch."
     required: false
     default: "true"
+  pr_author:
+    description: >-
+      Login the settle PR must have been opened by — the app identity
+      `release-settle` runs under. Stops a hand-made `chore/release-settle-*`
+      branch from reaching the tag step. Empty disables the check.
+    required: false
+    default: "mega-maxwell[bot]"
   git_user_name:
     required: false
     default: "mega-maxwell[bot]"
@@ -62,6 +69,9 @@ runs:
         BASE_REF: ${{ github.event.pull_request.base.ref }}
         MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         PR_BODY: ${{ github.event.pull_request.body }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        EXPECTED_AUTHOR: ${{ inputs.pr_author }}
         PREFIX: ${{ inputs.release_branch_prefix }}
         FILE: ${{ inputs.version_file }}
         PATTERN: ${{ inputs.version_pattern }}
@@ -74,6 +84,9 @@ runs:
         fi
         if [[ "$HEAD_REF" != chore/release-settle-v* ]]; then
           echo "::error::head branch '$HEAD_REF' is not a settle PR"; exit 1
+        fi
+        if [[ -n "$EXPECTED_AUTHOR" && "$PR_AUTHOR" != "$EXPECTED_AUTHOR" ]]; then
+          echo "::error::settle PR #$PR_NUMBER was opened by '$PR_AUTHOR', not by '$EXPECTED_AUTHOR' (the identity release-settle runs under); refusing to publish from it"; exit 1
         fi
         version="$(python3 "$TOOLS" normalize "${HEAD_REF#chore/release-settle-}")"
         if [[ "$BASE_REF" != "${PREFIX}${version}" ]]; then
