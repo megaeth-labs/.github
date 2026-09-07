@@ -44,6 +44,9 @@ jobs:
           version_file: VERSION
           version_pattern: plain
           changelog_file: CHANGELOG.md
+          # Anything else that must move with the version, e.g. a lockfile:
+          #   bump_command: cargo update --workspace
+          # (install the toolchain it needs in this job, before this step)
 
   cut:
     if: >-
