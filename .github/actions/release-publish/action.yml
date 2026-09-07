@@ -3,12 +3,12 @@ description: >-
   Publish a settled release. Runs when a `chore/release-settle-vX.Y.Z` PR
   merges into its release branch: creates the annotated tag `vX.Y.Z` at the
   merge commit (exactly once — refuses if it exists, or if the branch moved
-  after the settle PR was opened), publishes the GitHub
-  Release with the changelog section as notes, and opens a back-merge PR
-  carrying the changelog to the default branch. This is the only place in the
-  release flow that creates a tag. Put the calling job behind a protected
-  environment so an admin approves every publish. The consumer checks the
-  repository out first (`fetch-depth: 0`, `persist-credentials: false`).
+  after the settle PR was opened) and publishes the GitHub Release with the
+  changelog section as notes. This is the only place in the release flow that
+  creates a tag; merging the settle PR is the approval. The default branch's
+  changelog catches up in the next release candidate PR — nothing is
+  back-merged. The consumer checks the repository out first
+  (`fetch-depth: 0`, `persist-credentials: false`).
 
 inputs:
   token:
@@ -29,10 +29,6 @@ inputs:
   release_branch_prefix:
     required: false
     default: release-v
-  backmerge:
-    description: "Open a PR carrying the changelog back to the default branch."
-    required: false
-    default: "true"
   pr_author:
     description: >-
       Login the settle PR must have been opened by — the app identity
@@ -54,8 +50,6 @@ outputs:
     value: ${{ steps.tag.outputs.tag }}
   release_url:
     value: ${{ steps.release.outputs.url }}
-  backmerge_pr_url:
-    value: ${{ steps.backmerge.outputs.pr_url }}
 
 runs:
   using: composite
@@ -169,34 +163,6 @@ runs:
         url="$(gh release create "$TAG" --verify-tag --latest --title "$TAG" --notes-file "$NOTES")"
         echo "url=$url" >> "$GITHUB_OUTPUT"
         echo "release: $url"
-
-    - name: Back-merge changelog to default branch
-      if: inputs.backmerge == 'true'
-      id: backmerge
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.token }}
-        VERSION: ${{ steps.guard.outputs.version }}
-        TAG: ${{ steps.tag.outputs.tag }}
-        CHANGELOG: ${{ inputs.changelog_file }}
-      run: |
-        set -euo pipefail
-        default="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)"
-        git fetch --quiet origin "$default"
-        head="chore/changelog-v$VERSION"
-        git checkout --quiet -B "$head" "origin/$default"
-        git checkout --quiet "$TAG" -- "$CHANGELOG"
-        if git diff --cached --quiet; then
-          echo "default branch $default already has the v$VERSION changelog; nothing to back-merge"
-          exit 0
-        fi
-        git commit --quiet -m "chore(release): changelog for v$VERSION"
-        git push --quiet --force origin "$head"
-        url="$(gh pr create --base "$default" --head "$head" \
-          --title "chore(release): changelog for v$VERSION" \
-          --body "Back-merge of \`$CHANGELOG\` from \`$TAG\` into \`$default\`, opened by release-publish.")"
-        echo "pr_url=$url" >> "$GITHUB_OUTPUT"
-        echo "back-merge PR: $url"
 
     - name: Remove git auth
       if: always()

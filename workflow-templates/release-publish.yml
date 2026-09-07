@@ -1,9 +1,8 @@
 name: Release Publish
 
 # Publishes a settled release when its settle PR merges into the release
-# branch: annotated tag at the merge commit (once), GitHub Release with the
-# changelog section as notes, and a back-merge PR of the changelog to the
-# default branch. Merging the settle PR is the release approval (the
+# branch: annotated tag at the merge commit (once) and a GitHub Release with
+# the changelog section as notes. Merging the settle PR is the release approval (the
 # `release-*` branch ruleset requires a reviewed PR), so no environment gate
 # is needed; add the CI app as a bypass actor on the `v*` tag ruleset.
 #

@@ -1,7 +1,8 @@
 name: Release Candidate
 
 # Trunk-first release start. Dispatch with a version: the shared action bumps
-# the version file on the default branch and opens a candidate PR. When that
+# the version file on the default branch, drafts the changelog entry, and
+# opens a candidate PR. When that
 # PR merges, the `cut` job creates `release-vX.Y.Z` at the merge commit. No
 # tag is created here — see release-settle / release-publish.
 
@@ -42,6 +43,7 @@ jobs:
           version: ${{ inputs.version }}
           version_file: VERSION
           version_pattern: plain
+          changelog_file: CHANGELOG.md
 
   cut:
     if: >-

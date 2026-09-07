@@ -2,7 +2,8 @@ name: Release Settle
 description: >-
   Propose settling a release candidate: verify `commit` is the tip of the
   release branch and carries the expected version, generate release notes from
-  the commits since the previous tag, write them into the changelog, and open a
+  the commits since the previous tag, write them into the changelog (stamping
+  the date over the candidate's "unreleased" entry), and open a
   `chore/release-settle-vX.Y.Z` PR onto the release branch. Merging that PR is
   the settlement decision; release-publish then tags the merge commit once.
   Nothing here creates a tag. Run as a step in a job the consumer owns; the
@@ -156,6 +157,9 @@ runs:
         head="chore/release-settle-v$VERSION"
         git checkout --quiet -B "$head" "$COMMIT"
         what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
+        if git diff --quiet -- "$CHANGELOG"; then
+          echo "::error::$CHANGELOG already carries exactly this v$VERSION entry; nothing to settle"; exit 1
+        fi
         git add "$CHANGELOG"
         git commit --quiet -m "chore(release): settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
         git push --quiet --force origin "$head"
@@ -163,7 +167,7 @@ runs:
         {
           echo "Settle **v$VERSION** at \`$COMMIT\` (tip of \`$BRANCH\`)."
           echo
-          echo "Merging this PR is the settlement decision: \`release-publish\` will tag the merge commit as \`v$VERSION\`, publish the GitHub Release with the notes below, and open a back-merge of \`$CHANGELOG\` to the default branch. If more commits land on \`$BRANCH\` first, this PR goes stale and must be regenerated."
+          echo "Merging this PR is the settlement decision: \`release-publish\` will tag the merge commit as \`v$VERSION\` and publish the GitHub Release with the notes below. The default branch picks this entry up in the next release candidate PR. If more commits land on \`$BRANCH\` first, this PR goes stale and must be regenerated."
           echo
           echo "<!-- release-settle: v$VERSION $COMMIT -->"
           echo

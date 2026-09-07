@@ -1,7 +1,9 @@
 name: Release Candidate
 description: >-
   Start a release (trunk-first). `stage: propose` bumps the version file on the
-  default branch and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`,
+  default branch, drafts this release's changelog entry ("unreleased") from the
+  commits since the previous tag, syncs the previous release's entry from its
+  tag, and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`,
   run when that PR merges, creates `release-vX.Y.Z` at the merge commit. No tag
   is created at either stage — tags come from release-publish, once, at
   settlement. Run as a step in a job the consumer owns; the consumer checks the
@@ -32,6 +34,12 @@ inputs:
     description: "Release branch name prefix; the branch is `<prefix>X.Y.Z`."
     required: false
     default: release-v
+  changelog_file:
+    description: >-
+      Changelog to draft into (Keep-a-Changelog style, newest first). Empty
+      disables changelog handling.
+    required: false
+    default: CHANGELOG.md
   pr_labels:
     description: "Comma-separated labels for the candidate PR."
     required: false
@@ -151,6 +159,39 @@ runs:
         echo "$FILE: $old -> $VERSION"
         git diff --stat
 
+    - name: Draft changelog
+      if: inputs.stage == 'propose' && inputs.changelog_file != ''
+      id: changelog
+      shell: bash
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+        CHANGELOG: ${{ inputs.changelog_file }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        set -euo pipefail
+        latest="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+        # 1. Sync the previous release's entry from its tag. Settle stamped
+        #    the date (and any drift) on the release branch and nothing
+        #    back-merges it: this PR is where the default branch catches up.
+        synced="none"
+        if [[ -n "$latest" ]] && git show "$latest:$CHANGELOG" > "$RUNNER_TEMP/changelog-$latest.md" 2>/dev/null; then
+          synced="$(python3 "$TOOLS" changelog-copy "$RUNNER_TEMP/changelog-$latest.md" "$CHANGELOG" "$latest")"
+        fi
+        # 2. Draft this release's entry from the commits since that tag. The
+        #    date is stamped by settle, on the release branch.
+        range="HEAD"
+        [[ -n "$latest" ]] && range="$latest..HEAD"
+        notes="$RUNNER_TEMP/release-notes-v$VERSION.md"
+        git log --no-merges --format='%H%x09%s' "$range" \
+          | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$VERSION" unreleased > "$notes"
+        drafted="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$notes")"
+        {
+          echo "synced=$synced"
+          echo "drafted=$drafted"
+        } >> "$GITHUB_OUTPUT"
+        echo "changelog: previous entry ${latest:-<none>} $synced; v$VERSION entry $drafted"
+        git diff --stat
+
     # create-pull-request authenticates its own push with the token input;
     # hand it a clone without our header so the two never overlap.
     - name: Remove git auth before opening the PR
@@ -176,6 +217,9 @@ runs:
 
           Merging this PR creates the release branch `${{ inputs.release_branch_prefix }}${{ steps.version.outputs.version }}`
           at the merge commit. It creates **no tag**; the tag is cut once, at settlement, by `release-settle` → `release-publish`.
+
+          Changelog: this release's entry drafted as "unreleased" (settle stamps the date on the release branch);
+          previous release's entry synced from its tag: ${{ steps.changelog.outputs.synced || 'n/a' }}.
 
           <!-- release-candidate: v${{ steps.version.outputs.version }} -->
 

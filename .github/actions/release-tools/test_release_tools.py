@@ -50,7 +50,7 @@ class Notes(unittest.TestCase):
     LINES = [
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tfeat(replay): windowed witness pipeline (#2320)",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tfix: validate receipt fallback ranges (#2301)",
-        "cccccccccccccccccccccccccccccccccccccccc\tchore(release): candidate v0.1.0 (#5)",
+        "cccccccccccccccccccccccccccccccccccccccc\tchore(deps): bump alloy (#5)",
         "dddddddddddddddddddddddddddddddddddddddd\tfeat!: drop legacy RPC (#2299)",
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\tMerge branch 'x' into y",
     ]
@@ -65,6 +65,20 @@ class Notes(unittest.TestCase):
         self.assertIn("- Merge branch 'x' into y (`eeeeeeeeee`)", md)
         # the breaking item is listed under Breaking *and* under its type
         self.assertEqual(md.count("drop legacy RPC"), 2)
+
+    def test_release_bookkeeping_commits_are_dropped(self):
+        lines = [
+            "1111111111111111111111111111111111111111\tchore(release): candidate v0.1.0 (#291)",
+            "2222222222222222222222222222222222222222\tchore(release): settle v0.1.0",
+            "3333333333333333333333333333333333333333\tchore(release): changelog for v0.1.0 (#293)",
+            "4444444444444444444444444444444444444444\tchore(deps): bump foo (#5)",
+        ]
+        md = rt.generate_notes("o/r", "0.2.0", "unreleased", lines)
+        self.assertTrue(md.startswith("## v0.2.0 (unreleased)\n"))
+        self.assertNotIn("candidate v0.1.0", md)
+        self.assertNotIn("settle v0.1.0", md)
+        self.assertNotIn("changelog for v0.1.0", md)
+        self.assertIn("deps: bump foo", md)
 
     def test_empty(self):
         md = rt.generate_notes("o/r", "1.0.0", "2026-01-01", [])
@@ -106,6 +120,24 @@ class Changelog(unittest.TestCase):
         twice, _ = rt.insert_changelog_section(new, "0.2.0", self.SEC)
         self.assertNotIn("\n\n\n", twice)
         self.assertFalse(twice.endswith("\n\n"))
+
+    def test_section_text_and_copy_between_files(self):
+        # main has the candidate's "(unreleased)" entry; the tag has the settled
+        # one with a date and a drift line. Copying the tag's section over
+        # main's replaces it in place and keeps everything else.
+        main = "# Changelog\n\n## v0.2.0 (unreleased)\n\n### Fixes\n\n- b (`bbbbbbbbbb`)\n\n## v0.1.0 (2026-08-01)\n\n- a\n"
+        tagged = "# Changelog\n\n## v0.2.0 (2026-09-07)\n\n### Fixes\n\n- b (`bbbbbbbbbb`)\n- drift fix (`dddddddddd`)\n\n## v0.1.0 (2026-08-01)\n\n- a\n"
+        section = rt.changelog_section_text(tagged, "v0.2.0")
+        self.assertTrue(section.startswith("## v0.2.0 (2026-09-07)\n"))
+        self.assertIn("- drift fix", section)
+        self.assertNotIn("## v0.1.0", section)
+        new, what = rt.insert_changelog_section(main, "0.2.0", section)
+        self.assertEqual(what, "replaced")
+        self.assertNotIn("(unreleased)", new)
+        self.assertIn("- drift fix", new)
+        self.assertIn("## v0.1.0 (2026-08-01)\n\n- a\n", new)
+        self.assertEqual(new.count("## v0.2.0"), 1)
+        self.assertIsNone(rt.changelog_section_text(main, "9.9.9"))
 
     def test_extract_missing(self):
         self.assertIsNone(rt.extract_changelog_section(self.OLD, "9.9.9"))
