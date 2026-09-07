@@ -1,0 +1,8 @@
+{
+  "name": "Release Candidate",
+  "description": "Start a release: bump the version on the default branch via PR, then cut release-vX.Y.Z on merge.",
+  "iconName": "octicon tag",
+  "categories": [
+    "Automation"
+  ]
+}

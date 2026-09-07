@@ -1,0 +1,8 @@
+{
+  "name": "Release Settle",
+  "description": "Propose settling a release candidate: generate notes, update the changelog, open the settle PR.",
+  "iconName": "octicon tag",
+  "categories": [
+    "Automation"
+  ]
+}

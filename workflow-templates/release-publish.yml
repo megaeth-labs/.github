@@ -1,0 +1,46 @@
+name: Release Publish
+
+# Publishes a settled release when its settle PR merges into the release
+# branch: annotated tag at the merge commit (once), GitHub Release with the
+# changelog section as notes, and a back-merge PR of the changelog to the
+# default branch. The job runs under the `release` environment so an admin
+# approves every publish; create that environment with required reviewers,
+# and add the CI app as a bypass actor on the `v*` tag ruleset.
+#
+# This file must exist on the release branch (it does, when the branch is cut
+# from a default branch that has it). Pin the shared actions to a commit SHA
+# of megaeth-labs/.github before relying on this in a real release.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: ["release-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'chore/release-settle-')
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          app-id: ${{ vars.CI_APP_ID }}
+          private-key: ${{ secrets.MEGA_CI_APP_PK }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-publish@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          version_file: VERSION
+          version_pattern: plain
+          changelog_file: CHANGELOG.md
