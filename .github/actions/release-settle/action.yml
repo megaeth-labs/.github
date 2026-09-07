@@ -59,6 +59,24 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Configure git auth
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        NAME: ${{ inputs.git_user_name }}
+        EMAIL: ${{ inputs.git_user_email }}
+      run: |
+        set -euo pipefail
+        git config user.name "$NAME"
+        git config user.email "$EMAIL"
+        # Same mechanism actions/checkout uses, scoped to this clone and
+        # removed in the last step. Drop any header a persisted checkout left
+        # behind first: git sends every configured extraheader, and two
+        # Authorization headers get a 400.
+        git config --unset-all "http.https://github.com/.extraheader" || true
+        git config "http.https://github.com/.extraheader" \
+          "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+
     - name: Guard
       id: guard
       shell: bash
@@ -119,20 +137,6 @@ runs:
         echo "notes_file=$notes" >> "$GITHUB_OUTPUT"
         echo "--- release notes ---"; cat "$notes"
 
-    - name: Configure git auth
-      shell: bash
-      env:
-        TOKEN: ${{ inputs.token }}
-        NAME: ${{ inputs.git_user_name }}
-        EMAIL: ${{ inputs.git_user_email }}
-      run: |
-        set -euo pipefail
-        git config user.name "$NAME"
-        git config user.email "$EMAIL"
-        # Same mechanism actions/checkout uses; scoped to this clone, removed below.
-        git config "http.https://github.com/.extraheader" \
-          "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
-
     - name: Write changelog and open settle PR
       id: pr
       shell: bash
@@ -151,7 +155,7 @@ runs:
         what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
         git add "$CHANGELOG"
         git commit --quiet -m "chore(release): settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
-        git push --quiet --force-with-lease origin "$head"
+        git push --quiet --force origin "$head"
         body="$RUNNER_TEMP/settle-pr-body.md"
         {
           echo "Settle **v$VERSION** at \`$COMMIT\` (tip of \`$BRANCH\`)."

@@ -60,6 +60,24 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Configure git auth
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        NAME: ${{ inputs.git_user_name }}
+        EMAIL: ${{ inputs.git_user_email }}
+      run: |
+        set -euo pipefail
+        git config user.name "$NAME"
+        git config user.email "$EMAIL"
+        # Same mechanism actions/checkout uses, scoped to this clone and
+        # removed in the last step. Drop any header a persisted checkout left
+        # behind first: git sends every configured extraheader, and two
+        # Authorization headers get a 400.
+        git config --unset-all "http.https://github.com/.extraheader" || true
+        git config "http.https://github.com/.extraheader" \
+          "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+
     - name: Guard
       id: guard
       shell: bash
@@ -122,19 +140,6 @@ runs:
         } >> "$GITHUB_OUTPUT"
         echo "publishing v$version at $MERGE_SHA"; echo "--- notes ---"; cat "$notes"
 
-    - name: Configure git auth
-      shell: bash
-      env:
-        TOKEN: ${{ inputs.token }}
-        NAME: ${{ inputs.git_user_name }}
-        EMAIL: ${{ inputs.git_user_email }}
-      run: |
-        set -euo pipefail
-        git config user.name "$NAME"
-        git config user.email "$EMAIL"
-        git config "http.https://github.com/.extraheader" \
-          "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
-
     - name: Create and push tag
       id: tag
       shell: bash
@@ -183,7 +188,7 @@ runs:
           exit 0
         fi
         git commit --quiet -m "chore(release): changelog for v$VERSION"
-        git push --quiet --force-with-lease origin "$head"
+        git push --quiet --force origin "$head"
         url="$(gh pr create --base "$default" --head "$head" \
           --title "chore(release): changelog for v$VERSION" \
           --body "Back-merge of \`$CHANGELOG\` from \`$TAG\` into \`$default\`, opened by release-publish.")"
