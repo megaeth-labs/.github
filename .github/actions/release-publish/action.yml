@@ -2,7 +2,8 @@ name: Release Publish
 description: >-
   Publish a settled release. Runs when a `chore/release-settle-vX.Y.Z` PR
   merges into its release branch: creates the annotated tag `vX.Y.Z` at the
-  merge commit (exactly once — refuses if it exists), publishes the GitHub
+  merge commit (exactly once — refuses if it exists, or if the branch moved
+  after the settle PR was opened), publishes the GitHub
   Release with the changelog section as notes, and opens a back-merge PR
   carrying the changelog to the default branch. This is the only place in the
   release flow that creates a tag. Put the calling job behind a protected
@@ -60,6 +61,7 @@ runs:
         HEAD_REF: ${{ github.event.pull_request.head.ref }}
         BASE_REF: ${{ github.event.pull_request.base.ref }}
         MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        PR_BODY: ${{ github.event.pull_request.body }}
         PREFIX: ${{ inputs.release_branch_prefix }}
         FILE: ${{ inputs.version_file }}
         PATTERN: ${{ inputs.version_pattern }}
@@ -80,6 +82,18 @@ runs:
         git fetch --quiet --tags origin "$MERGE_SHA"
         if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
           echo "::error::tag v$version already exists; a release is published once"; exit 1
+        fi
+        # Drift guard: the settle PR recorded which commit was settled. The
+        # merge commit's parent is the release-branch tip at merge time; if
+        # anything landed after the settle PR was opened they differ, and the
+        # changelog no longer describes what is being tagged.
+        settled="$(grep -oE '<!-- release-settle: v[0-9.]+ [0-9a-f]{40} -->' <<<"$PR_BODY" | head -n1 | grep -oE '[0-9a-f]{40}' || true)"
+        if [[ -z "$settled" ]]; then
+          echo "::error::settle PR body has no '<!-- release-settle: ... -->' marker; refusing to publish an unverifiable settlement"; exit 1
+        fi
+        parent="$(git rev-parse "$MERGE_SHA^")"
+        if [[ "$parent" != "$settled" ]]; then
+          echo "::error::release branch drifted: settle PR settled $settled but the branch tip at merge was $parent. Re-run release-settle on the current tip."; exit 1
         fi
         actual="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
         if [[ "$actual" != "$version" ]]; then
