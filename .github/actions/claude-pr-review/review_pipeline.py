@@ -565,6 +565,25 @@ def is_bot_login(
     return canonical_login(login) in reviewer_logins(publisher_login)
 
 
+def self_authored_pull(
+    pull: dict[str, Any],
+    *,
+    publisher_login: str | None,
+) -> str | None:
+    """The PR author's login when it is the reviewer's own identity, else None.
+
+    A pull request the reviewer opened itself — release candidates, settle
+    PRs, dependency bumps — is not a review target: the app would be reviewing
+    its own work, and claude-code-action refuses bot-initiated events anyway.
+    Deciding it here, before any model step, turns that refusal into an
+    announced skip instead of a failed round.
+    """
+    login = str((pull.get("user") or {}).get("login") or "")
+    if login and is_bot_login(login, publisher_login=publisher_login):
+        return login
+    return None
+
+
 def is_stateful_review(
     login: str | None,
     body: str | None,
@@ -1372,7 +1391,14 @@ def prepare(args: argparse.Namespace) -> None:
         and comparison.get("status") in {"ahead", "identical"}
         and comparison_complete
     )
-    if args.event_name == "issue_comment":
+    self_author = self_authored_pull(pull, publisher_login=publisher_login)
+    if self_author:
+        mode = "skip"
+        mode_reason = (
+            "pull request opened by the reviewer's own identity "
+            f"({self_author})"
+        )
+    elif args.event_name == "issue_comment":
         # A comment never adds code to review — it can only answer an open
         # question or justify/invalidate an open finding. Run a reconcile-only
         # incremental round when the reviewer is still waiting on something and
@@ -1492,6 +1518,7 @@ def prepare(args: argparse.Namespace) -> None:
         "review_scope": {
             "mode": mode,
             "reason": mode_reason,
+            "self_authored_by": self_author,
             "previous_reviewed_head": previous_head,
             "current_head": current_head,
             "changed_paths": scope_paths,
@@ -1522,6 +1549,18 @@ def prepare(args: argparse.Namespace) -> None:
             sticky_comment_id=sticky_comment_id,
             scope_text=scope_label(input_value),
             phase="in_progress",
+        )
+    elif self_author:
+        # A self-authored skip is final for the PR, so announcing it strands
+        # nothing: the comment says why no round will ever run here.
+        input_value["sticky_comment_id"] = set_sticky_phase(
+            repository=args.repository,
+            pull_request=args.pull_request,
+            manifest=manifest,
+            sticky_comment_id=sticky_comment_id,
+            scope_text=scope_label(input_value),
+            phase="skipped",
+            reason=f"opened by {self_author}, the reviewer's own identity",
         )
     (state_dir / "review-input.json").write_text(
         json.dumps(input_value, indent=2, sort_keys=True) + "\n",
@@ -2743,6 +2782,15 @@ def render_status_body(
             " review below, once the round finishes. Anything listed below is"
             " carried over from earlier rounds."
         )
+    elif phase == "skipped":
+        status_title = "⏭️ Review skipped"
+        reason = public_text(summary.get("reason"), maximum=200)
+        progress_line = f"Not reviewing {scope_text} · updated {utc_now()}"
+        detail_line = (
+            "This pull request is not a review target"
+            f"{': ' + reason if reason else ''}. No review round runs for it."
+            " Anything listed below is from an earlier round."
+        )
     elif phase == "failed":
         status_title = "🛠️ Review did not finish"
         reason = public_text(summary.get("reason"), maximum=200)
@@ -3122,6 +3170,28 @@ def render_outcomes(outcomes: dict[str, str]) -> str:
     return "\n".join(rows)
 
 
+def report_status_line(
+    *,
+    stale: bool,
+    mode: str,
+    published: bool,
+    scope: dict[str, Any],
+) -> str:
+    """One-line outcome for the job summary and the log."""
+    if stale:
+        return "⚠️ Review output was discarded because the PR head changed."
+    if mode == "skip" and scope.get("self_authored_by"):
+        return (
+            "⏭️ Review skipped: the pull request was opened by "
+            f"{scope['self_authored_by']}, the reviewer's own identity."
+        )
+    if mode == "skip":
+        return "⏭️ The current PR head was already reviewed."
+    if published:
+        return "✅ Review completed and publication succeeded."
+    return "✅ Review completed."
+
+
 def close_out_sticky(state_dir: Path, *, reason: str | None = None) -> None:
     """Move an announced-but-unpublished round out of the in-progress phase.
 
@@ -3225,14 +3295,9 @@ def report(args: argparse.Namespace) -> None:
                 else None
             ),
         )
-    if stale:
-        status = "⚠️ Review output was discarded because the PR head changed."
-    elif mode == "skip":
-        status = "⏭️ The current PR head was already reviewed."
-    elif published:
-        status = "✅ Review completed and publication succeeded."
-    else:
-        status = "✅ Review completed."
+    status = report_status_line(
+        stale=stale, mode=mode, published=published, scope=scope
+    )
     scope_reason = scope.get("reason") or "unknown"
     status_summary = payload.get("status_summary") or {}
     rows = [

@@ -162,6 +162,15 @@ Questions published before the `<details>` shape existed fall back to a single-l
 A question that is already open is never re-asked; the original stays the copy the author
 answers.
 
+**Self-authored pull requests are skipped, not reviewed.** When the PR was
+opened by the reviewer's own identity (the app behind `github_identity_token`,
+e.g. `mega-maxwell[bot]` — release candidates, settle PRs, dependency bumps),
+`prepare` routes the round to `skip` before any model step and the status
+comment says so ("⏭️ Review skipped … opened by mega-maxwell[bot], the
+reviewer's own identity"). This is decided from the PR author, independently
+of `allowed_bots`, which still governs which bots may *trigger* a review of
+someone else's PR.
+
 ### Inspecting a review run
 
 The published review says what the reviewer concluded. These say how it got there, and they
