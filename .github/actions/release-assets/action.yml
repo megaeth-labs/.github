@@ -1,0 +1,65 @@
+name: Release · Assets
+description: >-
+  Attach files, plus a generated `SHA256SUMS`, to the GitHub Release for a
+  tag. Re-runs replace assets of the same name (`--clobber`), so the step is
+  idempotent. `dry_run` writes and prints `SHA256SUMS` but attaches nothing.
+  Needs a token with `contents: write` on the repository (the job token is
+  enough).
+
+inputs:
+  tag:
+    description: "Tag of the Release to attach to."
+    required: true
+  files:
+    description: "Newline-separated paths to attach."
+    required: true
+  token:
+    required: false
+    default: ${{ github.token }}
+  dry_run:
+    required: false
+    default: "false"
+
+outputs:
+  sha256sums:
+    description: Path of the generated SHA256SUMS file.
+    value: ${{ steps.sums.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checksums
+      id: sums
+      shell: bash
+      env:
+        FILES: ${{ inputs.files }}
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/release-assets"; mkdir -p "$dir"; : > "$dir/SHA256SUMS"
+        mapfile -t files < <(printf '%s\n' "$FILES" | sed '/^[[:space:]]*$/d')
+        [[ ${#files[@]} -gt 0 ]] || { echo "::error::no files listed"; exit 1; }
+        for f in "${files[@]}"; do
+          [[ -f "$f" ]] || { echo "::error::file not found: $f"; exit 1; }
+          # Names only in the sums file, so it verifies from a download directory.
+          (cd "$(dirname "$f")" && sha256sum "$(basename "$f")") >> "$dir/SHA256SUMS"
+        done
+        printf '%s\n' "${files[@]}" > "$dir/files.txt"
+        echo "path=$dir/SHA256SUMS" >> "$GITHUB_OUTPUT"
+        echo "--- SHA256SUMS ---"; cat "$dir/SHA256SUMS"
+
+    - name: Attach to the Release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ inputs.tag }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        SUMS: ${{ steps.sums.outputs.path }}
+      run: |
+        set -euo pipefail
+        mapfile -t files < "$RUNNER_TEMP/release-assets/files.txt"
+        if [[ "$DRY_RUN" == "true" ]]; then
+          echo "::notice::dry run — would attach to Release $TAG: ${files[*]} SHA256SUMS"; exit 0
+        fi
+        gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+        gh release upload "$TAG" "${files[@]}" "$SUMS" --repo "$GITHUB_REPOSITORY" --clobber
+        echo "attached to $TAG: ${files[*]} SHA256SUMS"

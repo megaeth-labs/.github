@@ -1,0 +1,100 @@
+name: On Release
+
+# Publish targets for a release. Runs when the release pipeline publishes the
+# GitHub Release (release-publish creates it after the tag), and on demand
+# for a rehearsal: `workflow_dispatch` with an existing tag and dry_run=true
+# runs every job with nothing uploaded, published or attached.
+#
+# Each target is its own job so a hiccup in one never blocks another. Delete
+# the jobs this repository does not need; keep the shared actions at @main.
+# Every destination below is a placeholder — there are no defaults.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to run against (rehearsal)"
+        required: true
+        type: string
+      dry_run:
+        description: "Verify and build everything; publish, upload and attach nothing"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  # A release event is never a dry run; a dispatch defaults to one.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+
+jobs:
+  # ---- language package index: crates.io ------------------------------------
+  crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-publish-rust-crates@main
+        with:
+          # Explicit allowlist, dependency order is worked out by Cargo.
+          crates: |
+            my-crate-core
+            my-crate
+          version: ${{ env.TAG }}
+          token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          dry_run: ${{ env.DRY_RUN }}
+
+  # ---- binary: build → MegaETH registry → Release asset ----------------------
+  binary:
+    runs-on: ubuntu-latest
+    # Recommended: keep the registry credential in a deployment environment
+    # restricted to refs/tags/v*, and declare it here:
+    # environment: publish
+    permissions:
+      contents: write # release-assets
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+
+      - name: Build
+        run: cargo build --release --locked -p my-binary
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          credentials_json: ${{ secrets.GCP_AUTH_KEY }}
+
+      - uses: megaeth-labs/.github/.github/actions/release-upload-artifact@main
+        with:
+          file: target/release/my-binary
+          kind: artifact-registry
+          project: my-gcp-project
+          location: my-region
+          repository: my-generic-repository
+          package: my-binary
+          version: ${{ env.TAG }}
+          dry_run: ${{ env.DRY_RUN }}
+
+      - uses: megaeth-labs/.github/.github/actions/release-assets@main
+        with:
+          tag: ${{ env.TAG }}
+          files: |
+            target/release/my-binary
+          dry_run: ${{ env.DRY_RUN }}

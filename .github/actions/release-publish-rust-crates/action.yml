@@ -1,0 +1,152 @@
+name: Release · Publish Rust Crates
+description: >-
+  Publish an explicit list of workspace crates to crates.io at the release
+  version. Verifies every listed crate's manifest version first, skips crates
+  already published at that version (so a re-run after a partial failure
+  finishes the rest), publishes the remainder in one `cargo publish -p … -p …`
+  invocation — Cargo orders by dependency and waits for the index between
+  crates (requires Cargo ≥ 1.90) — then polls crates.io until every crate
+  reports the version. `dry_run` runs `cargo publish --dry-run`: full
+  packaging and build verification, nothing uploaded. Run inside a job that
+  has checked out the release tag and installed the toolchain the crates
+  need. Never use `--workspace`: a crate without `publish = false` that was
+  never meant to be published would go out with it.
+
+inputs:
+  crates:
+    description: "Newline- or comma-separated crate names, in any order. Only these are published."
+    required: true
+  version:
+    description: "Release version every listed crate must be at; X.Y.Z or vX.Y.Z (the tag)."
+    required: true
+  token:
+    description: "crates.io API token (CARGO_REGISTRY_TOKEN). Unused in dry_run."
+    required: false
+    default: ""
+  dry_run:
+    description: "`true`: verify and package everything with `cargo publish --dry-run`, publish nothing."
+    required: false
+    default: "false"
+  index_timeout_seconds:
+    description: "How long to wait for crates.io to report every published version."
+    required: false
+    default: "600"
+  extra_args:
+    description: "Extra arguments appended to `cargo publish` (e.g. `--no-verify`)."
+    required: false
+    default: ""
+
+outputs:
+  published:
+    description: Crates published by this run (comma-separated; empty in dry_run).
+    value: ${{ steps.publish.outputs.published }}
+  skipped:
+    description: Crates already at this version on crates.io, skipped.
+    value: ${{ steps.plan.outputs.skipped }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify crate versions
+      id: verify
+      shell: bash
+      env:
+        CRATES: ${{ inputs.crates }}
+        VERSION: ${{ inputs.version }}
+        TOOLS: ${{ github.action_path }}/../release-tools/crates_tools.py
+      run: |
+        set -euo pipefail
+        VERSION="${VERSION#v}"
+        mapfile -t crates < <(python3 "$TOOLS" parse "$CRATES")
+        if [[ ${#crates[@]} -eq 0 ]]; then
+          echo "::error::no crates listed"; exit 1
+        fi
+        cargo metadata --format-version 1 --no-deps > "$RUNNER_TEMP/cargo-metadata.json"
+        python3 "$TOOLS" check "$RUNNER_TEMP/cargo-metadata.json" "$VERSION" "${crates[@]}"
+        printf '%s\n' "${crates[@]}" > "$RUNNER_TEMP/crates.txt"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "crates at $VERSION: ${crates[*]}"
+
+    - name: Skip crates already published
+      id: plan
+      shell: bash
+      env:
+        VERSION: ${{ steps.verify.outputs.version }}
+        TOOLS: ${{ github.action_path }}/../release-tools/crates_tools.py
+      run: |
+        set -euo pipefail
+        mapfile -t crates < "$RUNNER_TEMP/crates.txt"
+        : > "$RUNNER_TEMP/published.txt"
+        for c in "${crates[@]}"; do
+          # crates.io requires a User-Agent; 200 = that version exists, 404 = not yet.
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: megaeth-release-actions (https://github.com/megaeth-labs/.github)' \
+            "https://crates.io/api/v1/crates/$c/$VERSION")"
+          case "$code" in
+            200) echo "$c" >> "$RUNNER_TEMP/published.txt"; echo "$c@$VERSION already on crates.io — skipping" ;;
+            404) ;;
+            *) echo "::error::crates.io returned $code for $c@$VERSION"; exit 1 ;;
+          esac
+        done
+        plan="$(python3 "$TOOLS" partition "$RUNNER_TEMP/published.txt" "${crates[@]}")"
+        publish="$(jq -r '.publish|join(" ")' <<<"$plan")"
+        skipped="$(jq -r '.skip|join(",")' <<<"$plan")"
+        {
+          echo "publish=$publish"
+          echo "skipped=$skipped"
+        } >> "$GITHUB_OUTPUT"
+        echo "to publish: ${publish:-<none>}; skipped: ${skipped:-<none>}"
+
+    - name: Publish
+      id: publish
+      shell: bash
+      env:
+        PUBLISH: ${{ steps.plan.outputs.publish }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        EXTRA_ARGS: ${{ inputs.extra_args }}
+        CARGO_REGISTRY_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$PUBLISH" ]]; then
+          echo "nothing to publish"; echo "published=" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        args=(publish --locked)
+        for c in $PUBLISH; do args+=(-p "$c"); done
+        if [[ "$DRY_RUN" == "true" ]]; then
+          args+=(--dry-run)
+        elif [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+          echo "::error::token is required to publish (or set dry_run: true)"; exit 1
+        fi
+        # shellcheck disable=SC2206
+        [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
+        echo "cargo ${args[*]}"
+        cargo "${args[@]}"
+        if [[ "$DRY_RUN" == "true" ]]; then
+          echo "::notice::dry run — cargo publish --dry-run passed for: $PUBLISH (nothing uploaded)"
+          echo "published=" >> "$GITHUB_OUTPUT"
+        else
+          echo "published=${PUBLISH// /,}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Wait for crates.io to index
+      if: inputs.dry_run != 'true' && steps.publish.outputs.published != ''
+      shell: bash
+      env:
+        PUBLISHED: ${{ steps.publish.outputs.published }}
+        VERSION: ${{ steps.verify.outputs.version }}
+        TIMEOUT: ${{ inputs.index_timeout_seconds }}
+      run: |
+        set -euo pipefail
+        deadline=$(( $(date +%s) + TIMEOUT ))
+        IFS=',' read -ra crates <<<"$PUBLISHED"
+        for c in "${crates[@]}"; do
+          until [[ "$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H 'User-Agent: megaeth-release-actions (https://github.com/megaeth-labs/.github)' \
+                "https://crates.io/api/v1/crates/$c/$VERSION")" == "200" ]]; do
+            if (( $(date +%s) >= deadline )); then
+              echo "::error::crates.io has not indexed $c@$VERSION after ${TIMEOUT}s"; exit 1
+            fi
+            sleep 10
+          done
+          echo "$c@$VERSION visible on crates.io"
+        done
