@@ -13,6 +13,14 @@ inputs:
     required: false
     default: ""
     description: Additional Claude tools to append to the canonical allowedTools list.
+  self_authored_logins:
+    description: >-
+      Comma-separated logins whose pull requests are skipped rather than
+      label-checked: the CI app's own PRs (release candidates, settle PRs,
+      dependency bumps). claude-code-action refuses bot-initiated events, so
+      without this the check fails instead of saying it does not apply.
+    required: false
+    default: "mega-maxwell[bot]"
   extra_prompt:
     required: false
     default: ""
@@ -21,7 +29,26 @@ inputs:
 runs:
   using: composite
   steps:
+    - id: gate
+      shell: bash
+      env:
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        SELF_LOGINS: ${{ inputs.self_authored_logins }}
+      run: |
+        set -euo pipefail
+        skip=false
+        IFS=',' read -ra logins <<<"$SELF_LOGINS"
+        for l in "${logins[@]}"; do
+          l="${l// /}"
+          [[ -n "$l" && "$l" == "$PR_AUTHOR" ]] && skip=true
+        done
+        echo "skip=$skip" >> "$GITHUB_OUTPUT"
+        if [[ "$skip" == true ]]; then
+          echo "::notice::Label check skipped: this pull request was opened by $PR_AUTHOR, the CI app's own identity."
+        fi
+
     - id: compose
+      if: steps.gate.outputs.skip != 'true'
       shell: bash
       env:
         EXTRA_ALLOWED_TOOLS: ${{ inputs.extra_allowed_tools }}
@@ -36,6 +63,7 @@ runs:
         echo "allowed_tools=${allowed_tools}" >> "$GITHUB_OUTPUT"
 
     - uses: anthropics/claude-code-action@5ef2e550a465a721f4f45e4a7d3c340c873e1dcc # v1
+      if: steps.gate.outputs.skip != 'true'
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
         allowed_bots: ${{ inputs.allowed_bots }}

@@ -10,7 +10,7 @@ Reusable Tier-1 Claude CI actions for MegaETH repositories.
 
 - `.github/actions/claude-interactive` - interactive `@claude` handling.
 - `.github/actions/claude-pr-review` - pull request review.
-- `.github/actions/claude-label-check` - pull request label validation.
+- `.github/actions/claude-label-check` - pull request label validation (skips PRs opened by the CI app itself — `self_authored_logins`).
 - `.github/actions/claude-issue-triage` - newly opened issue triage.
 
 - `.github/actions/pr-lint` - lint the PR (currently: PR title against Conventional Commits, with a sticky comment on failure).
