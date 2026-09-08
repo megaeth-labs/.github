@@ -24,7 +24,7 @@ inputs:
     required: false
     default: ""
   dry_run:
-    description: "`true`: verify and package everything with `cargo publish --dry-run`, publish nothing."
+    description: "`true`: `cargo publish --dry-run` for every listed crate (even ones already on crates.io), publish nothing."
     required: false
     default: "false"
   index_timeout_seconds:
@@ -102,12 +102,21 @@ runs:
       shell: bash
       env:
         PUBLISH: ${{ steps.plan.outputs.publish }}
+        SKIPPED: ${{ steps.plan.outputs.skipped }}
         DRY_RUN: ${{ inputs.dry_run }}
         EXTRA_ARGS: ${{ inputs.extra_args }}
         CARGO_REGISTRY_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
-        if [[ -z "$PUBLISH" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+          # A rehearsal must exercise packaging and verification for every
+          # listed crate, including ones the registry already has at this
+          # version (typical when rehearsing on an existing tag). --dry-run
+          # never uploads, so "already exists" cannot fail it.
+          PUBLISH="$(tr '\n' ' ' < "$RUNNER_TEMP/crates.txt")"
+          [[ -n "$SKIPPED" ]] && echo "::notice::a real run would skip (already on crates.io): $SKIPPED"
+        fi
+        if [[ -z "${PUBLISH// /}" ]]; then
           echo "nothing to publish"; echo "published=" >> "$GITHUB_OUTPUT"; exit 0
         fi
         args=(publish --locked)
