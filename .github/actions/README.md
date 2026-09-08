@@ -396,6 +396,12 @@ Requirements in the consumer repo:
   `release-publish` itself (it refuses if the branch tip at merge is not the
   settled SHA), so no "up to date" status check is needed.
 - `gh` and `python3` on the runner (any GitHub-hosted image).
+- Handing an existing release branch to the pipeline: dispatch the candidate
+  with `existing_branch: adopt`. It is accepted only if the branch contains
+  nothing the default branch lacks; `cut` then fast-forwards it to the
+  candidate merge commit. A branch ruleset requiring PRs blocks that
+  fast-forward unless the app is a bypass actor on it (or an admin
+  fast-forwards by hand after the merge).
 - The cut and publish stages only accept PRs opened by the app identity
   (`pr_author`, default `mega-maxwell[bot]`); the templates also gate the
   jobs' `if:` on it, so a hand-made `chore/release-*` branch merged by a

@@ -51,6 +51,16 @@ inputs:
       disables changelog handling.
     required: false
     default: CHANGELOG.md
+  existing_branch:
+    description: >-
+      What to do when `<prefix>X.Y.Z` already exists. `refuse` (default)
+      fails. `adopt` hands an existing branch over to the pipeline: allowed
+      only when the branch contains nothing the default branch lacks (it is
+      an ancestor of the candidate), and `cut` then fast-forwards it to the
+      candidate merge commit instead of creating it. A branch that has
+      diverged is never adopted — that would drop its commits.
+    required: false
+    default: refuse
   pr_labels:
     description: "Comma-separated labels for the candidate PR."
     required: false
@@ -129,10 +139,12 @@ runs:
     - name: Guard (propose)
       if: inputs.stage == 'propose'
       shell: bash
+      id: guard
       env:
         GH_TOKEN: ${{ inputs.token }}
         VERSION: ${{ steps.version.outputs.version }}
         PREFIX: ${{ inputs.release_branch_prefix }}
+        EXISTING: ${{ inputs.existing_branch }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
@@ -150,9 +162,21 @@ runs:
         if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
           echo "::error::tag v$VERSION already exists"; exit 1
         fi
-        if git ls-remote --exit-code --heads origin "refs/heads/${PREFIX}${VERSION}" >/dev/null; then
-          echo "::error::branch ${PREFIX}${VERSION} already exists"; exit 1
+        branch="${PREFIX}${VERSION}"
+        adopt=false
+        if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
+          if [[ "$EXISTING" != "adopt" ]]; then
+            echo "::error::branch $branch already exists (set existing_branch: adopt to hand it over to the pipeline)"; exit 1
+          fi
+          git fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+          if ! git merge-base --is-ancestor "origin/$branch" HEAD; then
+            n="$(git rev-list --count "HEAD..origin/$branch")"
+            echo "::error::cannot adopt $branch: it has $n commit(s) that $GITHUB_REF_NAME does not; merge or cherry-pick them first"; exit 1
+          fi
+          adopt=true
+          echo "adopting existing branch $branch (ancestor of $GITHUB_REF_NAME; cut will fast-forward it)"
         fi
+        echo "adopt=$adopt" >> "$GITHUB_OUTPUT"
 
     - name: Bump version file
       if: inputs.stage == 'propose'
@@ -253,7 +277,7 @@ runs:
           Changelog: this release's entry drafted as "unreleased" (settle stamps the date on the release branch);
           previous release's entry synced from its tag: ${{ steps.changelog.outputs.synced || 'n/a' }}.
 
-          <!-- release-candidate: v${{ steps.version.outputs.version }} -->
+          <!-- release-candidate: v${{ steps.version.outputs.version }} existing_branch=${{ steps.guard.outputs.adopt == 'true' && 'adopt' || 'refuse' }} -->
 
     # -------------------------------------------------------------------- cut
     - name: Cut release branch
@@ -270,6 +294,7 @@ runs:
         MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        PR_BODY: ${{ github.event.pull_request.body }}
         EXPECTED_AUTHOR: ${{ inputs.pr_author }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
@@ -287,7 +312,20 @@ runs:
         fi
         branch="${PREFIX}${VERSION}"
         if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
-          echo "::error::branch $branch already exists"; exit 1
+          # propose recorded whether this candidate was allowed to adopt the branch.
+          if ! grep -qE "<!-- release-candidate: v$VERSION existing_branch=adopt -->" <<<"$PR_BODY"; then
+            echo "::error::branch $branch already exists and candidate PR #$PR_NUMBER did not adopt it"; exit 1
+          fi
+          git fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+          if ! git merge-base --is-ancestor "origin/$branch" "$MERGE_SHA"; then
+            n="$(git rev-list --count "$MERGE_SHA..origin/$branch")"
+            echo "::error::cannot fast-forward $branch: it gained $n commit(s) since the candidate was proposed"; exit 1
+          fi
+          # Fast-forward only (force=false): GitHub rejects anything else.
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$branch" -f sha="$MERGE_SHA" -F force=false >/dev/null
+          echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "adopted $branch: fast-forwarded to $MERGE_SHA"
+          exit 0
         fi
         gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$MERGE_SHA" >/dev/null
         echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
