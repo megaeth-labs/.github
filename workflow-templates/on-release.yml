@@ -2,8 +2,16 @@ name: On Release
 
 # Publish targets for a release. Runs when the release pipeline publishes the
 # GitHub Release (release-publish creates it after the tag), and on demand
-# for a rehearsal: `workflow_dispatch` with an existing tag and dry_run=true
-# runs every job with nothing uploaded, published or attached.
+# for a rehearsal: `workflow_dispatch` on a tag ref with dry_run=true runs
+# every job with nothing uploaded, published or attached:
+#   gh workflow run on-release.yml --ref vX.Y.Z -f tag=vX.Y.Z -f dry_run=true
+#
+# Credentials live in the `publish` environment: create it with a deployment
+# policy of "selected tags: v*" and put CARGO_REGISTRY_TOKEN / GCP_AUTH_KEY
+# in it as environment secrets. A job can then use them only when the run's
+# ref is a v* tag — a release event or a tag-ref rehearsal — never from a
+# branch build. Required reviewers are optional: settlement is already a
+# reviewed PR.
 #
 # Each target is its own job so a hiccup in one never blocks another. Delete
 # the jobs this repository does not need; keep the shared actions at @main.
@@ -36,6 +44,7 @@ jobs:
   # ---- language package index: crates.io ------------------------------------
   crates:
     runs-on: ubuntu-latest
+    environment: publish
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -59,9 +68,7 @@ jobs:
   # ---- binary: build → MegaETH registry → Release asset ----------------------
   binary:
     runs-on: ubuntu-latest
-    # Recommended: keep the registry credential in a deployment environment
-    # restricted to refs/tags/v*, and declare it here:
-    # environment: publish
+    environment: publish
     permissions:
       contents: write # release-assets
     steps:

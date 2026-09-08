@@ -423,6 +423,11 @@ rehearsed on an existing tag with nothing published, uploaded or attached.
 
 Credentials are the caller's: `CARGO_REGISTRY_TOKEN` for crates.io;
 `google-github-actions/auth` (service-account key or WIF) before an upload
-step. Keep the registry credential in a deployment environment restricted
-to `refs/tags/v*` where possible. `gcloud` and `gh` are on GitHub-hosted
-runners; the extensions are not meant for the TKE image.
+step. Hold them in a **`publish` environment** whose deployment policy
+allows only `v*` tags, and declare `environment: publish` on the publish
+jobs (the template does): the secrets are then readable only by a run whose
+ref is a release tag — the `release: published` run, or a rehearsal
+dispatched on a tag ref — never by a branch build. Required reviewers on
+that environment are optional; settlement is already a reviewed PR.
+`gcloud` and `gh` are on GitHub-hosted runners; the extensions are not
+meant for the TKE image.
