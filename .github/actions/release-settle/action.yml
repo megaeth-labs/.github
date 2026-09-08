@@ -40,6 +40,10 @@ inputs:
   changelog_file:
     required: false
     default: CHANGELOG.md
+  pr_labels:
+    description: "Comma-separated labels for the settle PR (for repos whose label gates apply to release branches too)."
+    required: false
+    default: ""
   git_user_name:
     required: false
     default: "mega-maxwell[bot]"
@@ -151,10 +155,17 @@ runs:
         COMMIT: ${{ inputs.commit }}
         CHANGELOG: ${{ inputs.changelog_file }}
         NOTES: ${{ steps.notes.outputs.notes_file }}
+        PR_LABELS: ${{ inputs.pr_labels }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
         head="chore/release-settle-v$VERSION"
+        label_args=()
+        IFS=',' read -ra labels <<<"$PR_LABELS"
+        for l in "${labels[@]}"; do
+          l="${l// /}"
+          [[ -n "$l" ]] && label_args+=(--label "$l")
+        done
         git checkout --quiet -B "$head" "$COMMIT"
         what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
         if git diff --quiet -- "$CHANGELOG"; then
@@ -178,7 +189,7 @@ runs:
           gh pr edit "$existing" --body-file "$body" >/dev/null
           url="$existing"
         else
-          url="$(gh pr create --base "$BRANCH" --head "$head" --title "chore(release): settle v$VERSION" --body-file "$body")"
+          url="$(gh pr create --base "$BRANCH" --head "$head" --title "chore(release): settle v$VERSION" --body-file "$body" "${label_args[@]}")"
         fi
         echo "pr_url=$url" >> "$GITHUB_OUTPUT"
         echo "settle PR: $url"
