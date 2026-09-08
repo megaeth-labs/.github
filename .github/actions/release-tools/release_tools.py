@@ -10,6 +10,7 @@ Subcommands (see `main`):
   read-file   PATH PATTERN                  -> version found in the file
   bump-file   PATH PATTERN VERSION          -> rewrite in place, print old version
   notes       REPO VERSION DATE             -> stdin: "<sha>\t<subject>" lines; stdout: markdown
+                                               (DATE may be "" for a heading without a date)
   changelog-insert PATH VERSION SECTION_MD  -> insert/replace the section, print "inserted"/"replaced"
   changelog-extract PATH VERSION            -> the section body on stdout, exit 1 if absent
   changelog-copy   SRC DST VERSION          -> copy VERSION's section (with heading) from SRC into DST;
@@ -147,7 +148,8 @@ def generate_notes(repo: str, version: str, date: str, lines: list[str]) -> str:
         title = type_to_title.get(ctype or "")
         (groups[title] if title else other).append(item)
 
-    out = [f"## v{version} ({date})", ""]
+    heading = f"## v{version}" + (f" ({date})" if date else "")
+    out = [heading, ""]
     if breaking:
         out += ["### Breaking changes", "", *breaking, ""]
     for _, title in NOTE_GROUPS:

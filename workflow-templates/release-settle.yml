@@ -44,3 +44,8 @@ jobs:
           version_file: VERSION
           version_pattern: plain
           changelog_file: CHANGELOG.md
+          # Settle without a PR — the dispatch is the decision, enforced by
+          # `settlers` (logins and/or `admin` = repository admins). The app
+          # must be a bypass actor on the release-branch ruleset.
+          #   settle_mode: direct
+          #   settlers: admin

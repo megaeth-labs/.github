@@ -3,10 +3,14 @@ description: >-
   Propose settling a release candidate: verify `commit` is the tip of the
   release branch and carries the expected version, generate release notes from
   the commits since the previous tag, write them into the changelog (stamping
-  the date over the candidate's "unreleased" entry), and open a
-  `chore/release-settle-vX.Y.Z` PR onto the release branch. Merging that PR is
-  the settlement decision; release-publish then tags the merge commit once.
-  Nothing here creates a tag. Run as a step in a job the consumer owns; the
+  the date onto the candidate's `## vX.Y.Z` entry), and — in the default
+  `pr` mode — open a `chore/release-settle-vX.Y.Z` PR onto the release
+  branch; merging that PR is the settlement decision and release-publish
+  then tags the merge commit once. In `direct` mode the dispatch itself is
+  the decision: the dispatching actor must be authorised by `settlers`, the
+  changelog commit is pushed straight to the release branch (the app must be
+  a bypass actor on that branch's ruleset), and release-publish runs
+  immediately on that commit. Run as a step in a job the consumer owns; the
   consumer checks the repository out first (`fetch-depth: 0`,
   `persist-credentials: false`). Needs `gh` and `python3` on the runner.
 
@@ -40,6 +44,21 @@ inputs:
   changelog_file:
     required: false
     default: CHANGELOG.md
+  settle_mode:
+    description: "`pr` (default): open a settle PR. `direct`: settle and publish now, from this dispatch."
+    required: false
+    default: pr
+  settlers:
+    description: >-
+      Who may settle in `direct` mode: comma-separated GitHub logins, and/or
+      the keyword `admin` (the dispatching actor must have admin permission
+      on the repository, checked with `github_token`). Required for `direct`.
+    required: false
+    default: ""
+  github_token:
+    description: "Job token used for the `admin` permission check in `direct` mode."
+    required: false
+    default: ${{ github.token }}
   pr_labels:
     description: "Comma-separated labels for the settle PR (for repos whose label gates apply to release branches too)."
     required: false
@@ -60,6 +79,15 @@ outputs:
   notes_file:
     description: Path of the generated release-notes markdown.
     value: ${{ steps.notes.outputs.notes_file }}
+  settled_commit:
+    description: "`direct` mode: the changelog commit that was tagged."
+    value: ${{ steps.direct.outputs.commit }}
+  tag:
+    description: "`direct` mode: the tag created."
+    value: ${{ steps.publish.outputs.tag }}
+  release_url:
+    description: "`direct` mode: the GitHub Release created."
+    value: ${{ steps.publish.outputs.release_url }}
 
 runs:
   using: composite
@@ -127,6 +155,36 @@ runs:
         } >> "$GITHUB_OUTPUT"
         echo "settling v$version at $COMMIT on $branch (previous tag: ${latest:-<none>})"
 
+    - name: Authorise the settler (direct mode)
+      if: inputs.settle_mode == 'direct'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        ACTOR: ${{ github.actor }}
+        SETTLERS: ${{ inputs.settlers }}
+        MODE: ${{ inputs.settle_mode }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$SETTLERS" ]]; then
+          echo "::error::settle_mode: direct requires settlers (logins and/or 'admin')"; exit 1
+        fi
+        ok=false
+        IFS=',' read -ra entries <<<"$SETTLERS"
+        for e in "${entries[@]}"; do
+          e="${e// /}"
+          [[ -z "$e" ]] && continue
+          if [[ "$e" == "admin" ]]; then
+            perm="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" -q .permission 2>/dev/null || true)"
+            [[ "$perm" == "admin" ]] && ok=true
+          elif [[ "$e" == "$ACTOR" ]]; then
+            ok=true
+          fi
+        done
+        if [[ "$ok" != true ]]; then
+          echo "::error::$ACTOR is not authorised to settle directly (settlers: $SETTLERS)"; exit 1
+        fi
+        echo "direct settle authorised for $ACTOR"
+
     - name: Generate release notes
       id: notes
       shell: bash
@@ -146,6 +204,7 @@ runs:
         echo "--- release notes ---"; cat "$notes"
 
     - name: Write changelog and open settle PR
+      if: inputs.settle_mode != 'direct'
       id: pr
       shell: bash
       env:
@@ -194,7 +253,50 @@ runs:
         echo "pr_url=$url" >> "$GITHUB_OUTPUT"
         echo "settle PR: $url"
 
+    - name: Write changelog onto the release branch (direct mode)
+      if: inputs.settle_mode == 'direct'
+      id: direct
+      shell: bash
+      env:
+        VERSION: ${{ steps.guard.outputs.version }}
+        BRANCH: ${{ steps.guard.outputs.branch }}
+        COMMIT: ${{ inputs.commit }}
+        CHANGELOG: ${{ inputs.changelog_file }}
+        NOTES: ${{ steps.notes.outputs.notes_file }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        set -euo pipefail
+        git checkout --quiet -B "$BRANCH" "$COMMIT"
+        what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
+        if git diff --quiet -- "$CHANGELOG"; then
+          echo "::error::$CHANGELOG already carries exactly this v$VERSION entry; nothing to settle"; exit 1
+        fi
+        git add "$CHANGELOG"
+        git commit --quiet -m "chore(release): settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT (direct settle)."
+        # Fast-forward the protected branch; the app must be a bypass actor on
+        # its ruleset, and the tip must still be the settled commit.
+        if ! git push --quiet origin "HEAD:refs/heads/$BRANCH"; then
+          echo "::error::could not push the settle commit to $BRANCH — the branch moved since $COMMIT, or the app is not a bypass actor on its ruleset"; exit 1
+        fi
+        echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        echo "settle commit $(git rev-parse --short HEAD) pushed to $BRANCH"
+
     - name: Remove git auth
       if: always()
       shell: bash
       run: git config --unset-all "http.https://github.com/.extraheader" || true
+
+    - name: Tag and publish (direct mode)
+      if: inputs.settle_mode == 'direct'
+      id: publish
+      uses: megaeth-labs/.github/.github/actions/release-publish@main
+      with:
+        token: ${{ inputs.token }}
+        commit: ${{ steps.direct.outputs.commit }}
+        version: ${{ steps.guard.outputs.version }}
+        version_file: ${{ inputs.version_file }}
+        version_pattern: ${{ inputs.version_pattern }}
+        changelog_file: ${{ inputs.changelog_file }}
+        release_branch_prefix: ${{ inputs.release_branch_prefix }}
+        git_user_name: ${{ inputs.git_user_name }}
+        git_user_email: ${{ inputs.git_user_email }}

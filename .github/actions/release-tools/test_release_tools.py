@@ -73,8 +73,8 @@ class Notes(unittest.TestCase):
             "3333333333333333333333333333333333333333\tchore(release): changelog for v0.1.0 (#293)",
             "4444444444444444444444444444444444444444\tchore(deps): bump foo (#5)",
         ]
-        md = rt.generate_notes("o/r", "0.2.0", "unreleased", lines)
-        self.assertTrue(md.startswith("## v0.2.0 (unreleased)\n"))
+        md = rt.generate_notes("o/r", "0.2.0", "", lines)
+        self.assertTrue(md.startswith("## v0.2.0\n\n"))  # no date until settle stamps one
         self.assertNotIn("candidate v0.1.0", md)
         self.assertNotIn("settle v0.1.0", md)
         self.assertNotIn("changelog for v0.1.0", md)
@@ -125,7 +125,7 @@ class Changelog(unittest.TestCase):
         # main has the candidate's "(unreleased)" entry; the tag has the settled
         # one with a date and a drift line. Copying the tag's section over
         # main's replaces it in place and keeps everything else.
-        main = "# Changelog\n\n## v0.2.0 (unreleased)\n\n### Fixes\n\n- b (`bbbbbbbbbb`)\n\n## v0.1.0 (2026-08-01)\n\n- a\n"
+        main = "# Changelog\n\n## v0.2.0\n\n### Fixes\n\n- b (`bbbbbbbbbb`)\n\n## v0.1.0 (2026-08-01)\n\n- a\n"
         tagged = "# Changelog\n\n## v0.2.0 (2026-09-07)\n\n### Fixes\n\n- b (`bbbbbbbbbb`)\n- drift fix (`dddddddddd`)\n\n## v0.1.0 (2026-08-01)\n\n- a\n"
         section = rt.changelog_section_text(tagged, "v0.2.0")
         self.assertTrue(section.startswith("## v0.2.0 (2026-09-07)\n"))
@@ -133,7 +133,7 @@ class Changelog(unittest.TestCase):
         self.assertNotIn("## v0.1.0", section)
         new, what = rt.insert_changelog_section(main, "0.2.0", section)
         self.assertEqual(what, "replaced")
-        self.assertNotIn("(unreleased)", new)
+        self.assertIn("## v0.2.0 (2026-09-07)", new)
         self.assertIn("- drift fix", new)
         self.assertIn("## v0.1.0 (2026-08-01)\n\n- a\n", new)
         self.assertEqual(new.count("## v0.2.0"), 1)
