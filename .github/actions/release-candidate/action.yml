@@ -231,6 +231,29 @@ runs:
       shell: bash
       run: git config --unset-all "http.https://github.com/.extraheader" || true
 
+    - name: Drop a stale candidate branch
+      if: inputs.stage == 'propose'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        set -euo pipefail
+        head="chore/release-candidate-$VERSION"
+        # A previous candidate for this version whose PR is closed/merged may
+        # have left its branch behind (repos without "auto-delete head
+        # branches"). create-pull-request would force-push it, which a
+        # no-force-push ruleset rejects. Remove it unless a PR is still open.
+        if git ls-remote --exit-code --heads origin "refs/heads/$head" >/dev/null; then
+          open="$(gh pr list --head "$head" --state open --json number -q 'length')"
+          if [[ "$open" == "0" ]]; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$head" >/dev/null
+            echo "deleted stale branch $head (no open PR)"
+          else
+            echo "$head has an open PR; it will be updated"
+          fi
+        fi
+
     - name: Open candidate PR
       if: inputs.stage == 'propose'
       id: pr
