@@ -96,10 +96,20 @@ runs:
           *) echo "::error::kind must be artifact-registry or gcs, got '$KIND'"; exit 1 ;;
         esac
         command -v gcloud >/dev/null || { echo "::error::gcloud is not on this runner"; exit 1; }
-        account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null || true)"
-        if [[ -z "$account" ]]; then
+        # google-github-actions/auth exports CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE;
+        # gcloud honours it without an "active account", so test the credential
+        # itself rather than `gcloud auth list`. If the override is present but
+        # not picked up, log in with it explicitly.
+        if ! gcloud auth print-access-token >/dev/null 2>&1; then
+          if [[ -n "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" ]]; then
+            gcloud auth login --brief --cred-file="$CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE" >/dev/null 2>&1 || true
+          fi
+        fi
+        if ! gcloud auth print-access-token >/dev/null 2>&1; then
           echo "::error::gcloud is not authenticated — run google-github-actions/auth before this step"; exit 1
         fi
+        account="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n1)"
+        : "${account:=credential file override}"
         sha="$(sha256sum "$FILE" | cut -d' ' -f1)"
         echo "sha256=$sha" >> "$GITHUB_OUTPUT"
         echo "$(basename "$FILE"): sha256 $sha ($(stat -c %s "$FILE") bytes), gcloud as $account"
