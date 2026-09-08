@@ -1,7 +1,7 @@
 name: Release Candidate
 description: >-
   Start a release (trunk-first). `stage: propose` bumps the version file on the
-  default branch, drafts this release's changelog entry ("unreleased") from the
+  default branch, drafts this release's changelog entry (dated at settle) from the
   commits since the previous tag, syncs the previous release's entry from its
   tag, and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`,
   run when that PR merges, creates `release-vX.Y.Z` at the merge commit. No tag
@@ -210,12 +210,12 @@ runs:
           synced="$(python3 "$TOOLS" changelog-copy "$RUNNER_TEMP/changelog-$latest.md" "$CHANGELOG" "$latest")"
         fi
         # 2. Draft this release's entry from the commits since that tag. The
-        #    date is stamped by settle, on the release branch.
+        #    heading carries the version only; settle stamps the date.
         range="HEAD"
         [[ -n "$latest" ]] && range="$latest..HEAD"
         notes="$RUNNER_TEMP/release-notes-v$VERSION.md"
         git log --no-merges --format='%H%x09%s' "$range" \
-          | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$VERSION" unreleased > "$notes"
+          | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$VERSION" "" > "$notes"
         drafted="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$notes")"
         {
           echo "synced=$synced"
@@ -250,7 +250,7 @@ runs:
           Merging this PR creates the release branch `${{ inputs.release_branch_prefix }}${{ steps.version.outputs.version }}`
           at the merge commit. It creates **no tag**; the tag is cut once, at settlement, by `release-settle` → `release-publish`.
 
-          Changelog: this release's entry drafted as "unreleased" (settle stamps the date on the release branch);
+          Changelog: this release's entry drafted under `## v${{ steps.version.outputs.version }}` (settle stamps the date on the release branch);
           previous release's entry synced from its tag: ${{ steps.changelog.outputs.synced || 'n/a' }}.
 
           <!-- release-candidate: v${{ steps.version.outputs.version }} -->

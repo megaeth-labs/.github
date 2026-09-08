@@ -362,9 +362,9 @@ own `push: tags` workflow, which the tag created by `release-publish` fires.
 
 | Action | Trigger in the consumer | Does |
 |---|---|---|
-| `release-candidate` `stage: propose` | `workflow_dispatch` on the default branch | bumps `version_file`, runs `bump_command` (lockfile, path-dep versions), drafts this release's changelog entry ("unreleased"), syncs the previous release's entry from its tag, opens `chore/release-candidate-vX.Y.Z` PR |
+| `release-candidate` `stage: propose` | `workflow_dispatch` on the default branch | bumps `version_file`, runs `bump_command` (lockfile, path-dep versions), drafts this release's changelog entry under `## vX.Y.Z` (dated at settle), syncs the previous release's entry from its tag, opens `chore/release-candidate-vX.Y.Z` PR |
 | `release-candidate` `stage: cut` | that PR merging | creates `release-vX.Y.Z` at the merge commit |
-| `release-settle` | `workflow_dispatch` with version + tip SHA | guards, regenerates the entry up to the tip and stamps the date, opens `chore/release-settle-vX.Y.Z` PR onto the release branch |
+| `release-settle` | `workflow_dispatch` with version + tip SHA | guards, regenerates the entry up to the tip and stamps the date, opens `chore/release-settle-vX.Y.Z` PR onto the release branch — or, with `settle_mode: direct` and an authorised actor (`settlers`), commits it straight to the branch and publishes at once |
 | `release-publish` | the settle PR merging | annotated tag at the merge commit (refuses if it exists or the branch drifted), GitHub Release with the entry as notes |
 
 The changelog has one owner per phase and is never back-merged: the candidate
@@ -372,7 +372,7 @@ PR drafts the entry on the default branch and syncs the *previous* release's
 final entry from its tag; the settle PR finalises the entry (date, drift) on
 the release branch; the tag and the GitHub Release carry the final text. Between
 a release and the next candidate the default branch's copy of the latest entry
-reads "unreleased" — the GitHub Release is authoritative in that window.
+carries no date — the GitHub Release is authoritative in that window.
 
 `workflow-templates/release-*.yml` are the reference callers; they show up
 under "New workflow → By megaeth-labs" in every org repo. Consumers track the

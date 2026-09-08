@@ -1,7 +1,9 @@
 name: Release Publish
 description: >-
-  Publish a settled release. Runs when a `chore/release-settle-vX.Y.Z` PR
-  merges into its release branch: creates the annotated tag `vX.Y.Z` at the
+  Publish a settled release. Normally runs when a `chore/release-settle-vX.Y.Z`
+  PR merges into its release branch (or, with `commit` + `version` given, on
+  an explicit commit that `release-settle` in `direct` mode just made):
+  creates the annotated tag `vX.Y.Z` at the
   merge commit (exactly once — refuses if it exists, or if the branch moved
   after the settle PR was opened) and publishes the GitHub Release with the
   changelog section as notes. This is the only place in the release flow that
@@ -29,6 +31,18 @@ inputs:
   release_branch_prefix:
     required: false
     default: release-v
+  commit:
+    description: >-
+      Explicit commit to publish (full SHA), with `version`. Set by
+      `release-settle` in `direct` mode; leave empty when triggered by the
+      settle PR merging. The PR-specific guards (head/base names, author,
+      drift marker) do not apply in this mode.
+    required: false
+    default: ""
+  version:
+    description: "Version for the explicit-commit mode, X.Y.Z or vX.Y.Z."
+    required: false
+    default: ""
   pr_author:
     description: >-
       Login the settle PR must have been opened by — the app identity
@@ -87,6 +101,8 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         EXPECTED_AUTHOR: ${{ inputs.pr_author }}
+        EXPLICIT_COMMIT: ${{ inputs.commit }}
+        EXPLICIT_VERSION: ${{ inputs.version }}
         PREFIX: ${{ inputs.release_branch_prefix }}
         FILE: ${{ inputs.version_file }}
         PATTERN: ${{ inputs.version_pattern }}
@@ -94,34 +110,46 @@ runs:
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
-        if [[ "$MERGED" != "true" || -z "$MERGE_SHA" ]]; then
-          echo "::error::publish runs on a merged settle PR (pull_request closed, merged == true)"; exit 1
+        if [[ -n "$EXPLICIT_COMMIT" ]]; then
+          # Explicit-commit mode: release-settle (direct) made this commit a
+          # moment ago and authorised the actor; only the immutability and
+          # content checks below apply.
+          if [[ ! "$EXPLICIT_COMMIT" =~ ^[0-9a-f]{40}$ || -z "$EXPLICIT_VERSION" ]]; then
+            echo "::error::explicit mode needs a full 40-hex commit and a version"; exit 1
+          fi
+          version="$(python3 "$TOOLS" normalize "$EXPLICIT_VERSION")"
+          MERGE_SHA="$EXPLICIT_COMMIT"
+          git fetch --quiet --tags origin "$MERGE_SHA"
+        else
+          if [[ "$MERGED" != "true" || -z "$MERGE_SHA" ]]; then
+            echo "::error::publish runs on a merged settle PR (pull_request closed, merged == true)"; exit 1
+          fi
+          if [[ "$HEAD_REF" != chore/release-settle-v* ]]; then
+            echo "::error::head branch '$HEAD_REF' is not a settle PR"; exit 1
+          fi
+          if [[ -n "$EXPECTED_AUTHOR" && "$PR_AUTHOR" != "$EXPECTED_AUTHOR" ]]; then
+            echo "::error::settle PR #$PR_NUMBER was opened by '$PR_AUTHOR', not by '$EXPECTED_AUTHOR' (the identity release-settle runs under); refusing to publish from it"; exit 1
+          fi
+          version="$(python3 "$TOOLS" normalize "${HEAD_REF#chore/release-settle-}")"
+          if [[ "$BASE_REF" != "${PREFIX}${version}" ]]; then
+            echo "::error::settle PR for v$version merged into '$BASE_REF', expected ${PREFIX}${version}"; exit 1
+          fi
+          git fetch --quiet --tags origin "$MERGE_SHA"
+          # Drift guard: the settle PR recorded which commit was settled. The
+          # merge commit's parent is the release-branch tip at merge time; if
+          # anything landed after the settle PR was opened they differ, and the
+          # changelog no longer describes what is being tagged.
+          settled="$(grep -oE '<!-- release-settle: v[0-9.]+ [0-9a-f]{40} -->' <<<"$PR_BODY" | head -n1 | grep -oE '[0-9a-f]{40}' || true)"
+          if [[ -z "$settled" ]]; then
+            echo "::error::settle PR body has no '<!-- release-settle: ... -->' marker; refusing to publish an unverifiable settlement"; exit 1
+          fi
+          parent="$(git rev-parse "$MERGE_SHA^")"
+          if [[ "$parent" != "$settled" ]]; then
+            echo "::error::release branch drifted: settle PR settled $settled but the branch tip at merge was $parent. Re-run release-settle on the current tip."; exit 1
+          fi
         fi
-        if [[ "$HEAD_REF" != chore/release-settle-v* ]]; then
-          echo "::error::head branch '$HEAD_REF' is not a settle PR"; exit 1
-        fi
-        if [[ -n "$EXPECTED_AUTHOR" && "$PR_AUTHOR" != "$EXPECTED_AUTHOR" ]]; then
-          echo "::error::settle PR #$PR_NUMBER was opened by '$PR_AUTHOR', not by '$EXPECTED_AUTHOR' (the identity release-settle runs under); refusing to publish from it"; exit 1
-        fi
-        version="$(python3 "$TOOLS" normalize "${HEAD_REF#chore/release-settle-}")"
-        if [[ "$BASE_REF" != "${PREFIX}${version}" ]]; then
-          echo "::error::settle PR for v$version merged into '$BASE_REF', expected ${PREFIX}${version}"; exit 1
-        fi
-        git fetch --quiet --tags origin "$MERGE_SHA"
         if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
           echo "::error::tag v$version already exists; a release is published once"; exit 1
-        fi
-        # Drift guard: the settle PR recorded which commit was settled. The
-        # merge commit's parent is the release-branch tip at merge time; if
-        # anything landed after the settle PR was opened they differ, and the
-        # changelog no longer describes what is being tagged.
-        settled="$(grep -oE '<!-- release-settle: v[0-9.]+ [0-9a-f]{40} -->' <<<"$PR_BODY" | head -n1 | grep -oE '[0-9a-f]{40}' || true)"
-        if [[ -z "$settled" ]]; then
-          echo "::error::settle PR body has no '<!-- release-settle: ... -->' marker; refusing to publish an unverifiable settlement"; exit 1
-        fi
-        parent="$(git rev-parse "$MERGE_SHA^")"
-        if [[ "$parent" != "$settled" ]]; then
-          echo "::error::release branch drifted: settle PR settled $settled but the branch tip at merge was $parent. Re-run release-settle on the current tip."; exit 1
         fi
         actual="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
         if [[ "$actual" != "$version" ]]; then
