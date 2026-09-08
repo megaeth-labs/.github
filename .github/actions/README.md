@@ -352,13 +352,17 @@ pr-review:
 Three composite actions implement the org release flow — trunk-first
 candidate, settle-by-PR, publish-once. They are language-agnostic: the only
 repo-specific inputs are where the version lives (`version_file` +
-`version_pattern`: `plain`, `toml`, `json`) and the changelog path. Builds and
+`version_pattern`: `plain`, `toml`, `json`), an optional `bump_command` for
+whatever else must move with the version (`cargo update --workspace` for a
+lockfile; path-dependency versions in a Cargo workspace — it runs with
+`OLD_VERSION`/`NEW_VERSION` set, and the calling job installs the toolchain it
+needs first), and the changelog path. Builds and
 artifact uploads are not part of them; a repo that ships binaries adds its
 own `push: tags` workflow, which the tag created by `release-publish` fires.
 
 | Action | Trigger in the consumer | Does |
 |---|---|---|
-| `release-candidate` `stage: propose` | `workflow_dispatch` on the default branch | bumps `version_file`, drafts this release's changelog entry ("unreleased"), syncs the previous release's entry from its tag, opens `chore/release-candidate-vX.Y.Z` PR |
+| `release-candidate` `stage: propose` | `workflow_dispatch` on the default branch | bumps `version_file`, runs `bump_command` (lockfile, path-dep versions), drafts this release's changelog entry ("unreleased"), syncs the previous release's entry from its tag, opens `chore/release-candidate-vX.Y.Z` PR |
 | `release-candidate` `stage: cut` | that PR merging | creates `release-vX.Y.Z` at the merge commit |
 | `release-settle` | `workflow_dispatch` with version + tip SHA | guards, regenerates the entry up to the tip and stamps the date, opens `chore/release-settle-vX.Y.Z` PR onto the release branch |
 | `release-publish` | the settle PR merging | annotated tag at the merge commit (refuses if it exists or the branch drifted), GitHub Release with the entry as notes |

@@ -30,6 +30,17 @@ inputs:
     description: "How the version is stored in `version_file`: plain, toml or json."
     required: false
     default: plain
+  bump_command:
+    description: >-
+      Optional shell command run after `version_file` is rewritten, for
+      anything else that must move with the version: lockfiles
+      (`cargo update --workspace`), path-dependency versions, generated
+      files. Runs with `OLD_VERSION` and `NEW_VERSION` in the environment,
+      in the repository root, under `bash -euo pipefail`. Whatever it
+      changes is committed with the bump. Install any toolchain it needs in
+      the calling job before this action.
+    required: false
+    default: ""
   release_branch_prefix:
     description: "Release branch name prefix; the branch is `<prefix>X.Y.Z`."
     required: false
@@ -157,6 +168,27 @@ runs:
         old="$(python3 "$TOOLS" bump-file "$FILE" "$PATTERN" "$VERSION")"
         echo "old=$old" >> "$GITHUB_OUTPUT"
         echo "$FILE: $old -> $VERSION"
+        git diff --stat
+
+    - name: Run bump command
+      if: inputs.stage == 'propose' && inputs.bump_command != ''
+      shell: bash
+      env:
+        OLD_VERSION: ${{ steps.bump.outputs.old }}
+        NEW_VERSION: ${{ steps.version.outputs.version }}
+        BUMP_COMMAND: ${{ inputs.bump_command }}
+        FILE: ${{ inputs.version_file }}
+        PATTERN: ${{ inputs.version_pattern }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        set -euo pipefail
+        echo "bump command: $BUMP_COMMAND"
+        bash -euo pipefail -c "$BUMP_COMMAND"
+        # The command must not undo the version-file rewrite.
+        actual="$(python3 "$TOOLS" read-file "$FILE" "$PATTERN")"
+        if [[ "$actual" != "$NEW_VERSION" ]]; then
+          echo "::error::after bump_command, $FILE reads $actual, expected $NEW_VERSION"; exit 1
+        fi
         git diff --stat
 
     - name: Draft changelog
