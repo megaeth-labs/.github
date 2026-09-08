@@ -1,0 +1,8 @@
+{
+  "name": "On Release",
+  "description": "Publish targets when a release is published: crates.io, MegaETH artifact registry, GitHub Release assets. Dispatch with dry_run to rehearse.",
+  "iconName": "octicon package",
+  "categories": [
+    "Automation"
+  ]
+}

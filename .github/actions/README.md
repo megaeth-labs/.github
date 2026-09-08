@@ -405,3 +405,24 @@ Release notes are generated from commit subjects between the previous `v*`
 tag and the settled commit, grouped by Conventional Commit type with PR links
 from `(#N)` suffixes. The pure text logic lives in
 `release-tools/release_tools.py` and is unit-tested by `actions-test.yml`.
+
+## Release extensions (publish targets)
+
+The core above ends with a tag and a GitHub Release. Products that ship
+something run their targets from `on: release: published`, composed in a
+repo-owned workflow stamped from `workflow-templates/on-release.yml`. Every
+target is a step with a `dry_run` input, and the template threads one
+`workflow_dispatch` flag into all of them, so a whole release can be
+rehearsed on an existing tag with nothing published, uploaded or attached.
+
+| Action | Publishes | Idempotency on re-run |
+|---|---|---|
+| `release-publish-rust-crates` | an explicit crate list to crates.io at the release version — one `cargo publish -p … -p …` (Cargo ≥ 1.90 orders and waits); polls the index afterwards | crates already at the version are skipped |
+| `release-upload-artifact` | one file to Artifact Registry (generic) or a GCS bucket; all destinations are inputs | identical file already there → `exists`; different → fails, never overwrites |
+| `release-assets` | files + `SHA256SUMS` on the GitHub Release | `--clobber` |
+
+Credentials are the caller's: `CARGO_REGISTRY_TOKEN` for crates.io;
+`google-github-actions/auth` (service-account key or WIF) before an upload
+step. Keep the registry credential in a deployment environment restricted
+to `refs/tags/v*` where possible. `gcloud` and `gh` are on GitHub-hosted
+runners; the extensions are not meant for the TKE image.
