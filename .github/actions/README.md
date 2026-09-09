@@ -454,8 +454,9 @@ step. Hold them in a **`publish` environment** whose deployment policy
 allows only `v*` tags, and declare `environment: publish` on the publish
 jobs (the template does): the secrets are then readable only by a run whose
 ref is a release tag — the `release: published` run, or a rehearsal
-dispatched on a tag ref — never by a branch build. Required reviewers on
-that environment are optional; settlement is already a reviewed PR.
+dispatched on a tag ref — never by a branch build. Give that environment
+no required reviewers: the human gate is the settle approval (the `release`
+environment), and a second click before the uploads only holds them up.
 `gcloud` and `gh` are on GitHub-hosted runners; the extensions are not
 meant for the TKE image.
 
