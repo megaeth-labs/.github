@@ -7,10 +7,10 @@ description: >-
   `pr` mode — open a `chore/release-settle-vX.Y.Z` PR onto the release
   branch; merging that PR is the settlement decision and release-publish
   then tags the merge commit once. In `direct` mode the dispatch itself is
-  the decision: the dispatching actor must be authorised by `settlers`, the
-  changelog commit is pushed straight to the release branch (the app must be
-  a bypass actor on that branch's ruleset), and release-publish runs
-  immediately on that commit. Run as a step in a job the consumer owns; the
+  the decision, gated by the `release` environment the consumer puts on the
+  settle job (optionally also by `settlers`); the changelog commit is pushed
+  straight to the release branch (the app must be a bypass actor on that
+  branch's ruleset), and release-publish runs immediately on that commit. Run as a step in a job the consumer owns; the
   consumer checks the repository out first (`fetch-depth: 0`,
   `persist-credentials: false`). Needs `gh` and `python3` on the runner.
   Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
@@ -55,11 +55,15 @@ inputs:
     default: pr
   settlers:
     description: >-
-      Who may settle in `direct` mode: comma-separated GitHub logins, and/or
-      the keyword `admin` (the dispatching actor must have admin permission
-      on the repository, checked with `github_token`). Required for `direct`.
+      Who may settle in `direct` mode. `any` (default): no actor check — the
+      settle job's `release` environment and its required reviewers are the
+      gate, so use it only with `environment:` on that job. Otherwise a
+      comma-separated list of GitHub logins and/or the keyword `admin` (the
+      dispatching actor must have admin permission on the repository, checked
+      with `github_token`), as an extra restriction on who may start a
+      settle.
     required: false
-    default: ""
+    default: any
   github_token:
     description: "Job token used for the `admin` permission check in `direct` mode."
     required: false
@@ -198,8 +202,9 @@ runs:
         MODE: ${{ inputs.settle_mode }}
       run: |
         set -euo pipefail
-        if [[ -z "$SETTLERS" ]]; then
-          echo "::error::settle_mode: direct requires settlers (logins and/or 'admin')"; exit 1
+        if [[ -z "$SETTLERS" || "$SETTLERS" == "any" ]]; then
+          echo "settlers: any — no actor check; the settle job's environment reviewers are the gate"
+          exit 0
         fi
         ok=false
         IFS=',' read -ra entries <<<"$SETTLERS"
