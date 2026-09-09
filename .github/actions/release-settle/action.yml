@@ -155,6 +155,31 @@ runs:
         } >> "$GITHUB_OUTPUT"
         echo "settling v$version at $COMMIT on $branch (previous tag: ${latest:-<none>})"
 
+    - name: Compare workflows with the default branch
+      shell: bash
+      env:
+        COMMIT: ${{ inputs.commit }}
+        BRANCH: ${{ steps.guard.outputs.branch }}
+        DEFAULT: ${{ github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+        # A `release: published` workflow runs from the tagged commit's tree,
+        # not from the default branch, and so does release-publish (it runs on
+        # the settle PR's merge into the release branch). A workflow added
+        # after this branch was cut is silently absent from the release
+        # unless it is brought onto the branch first — so say so now, while
+        # there is still time.
+        if [[ -z "$DEFAULT" ]]; then echo "default branch unknown; skipping"; exit 0; fi
+        git fetch --quiet origin "+refs/heads/$DEFAULT:refs/remotes/origin/$DEFAULT"
+        missing="$(comm -23 \
+          <(git ls-tree --name-only "origin/$DEFAULT" -- .github/workflows/ | sort) \
+          <(git ls-tree --name-only "$COMMIT" -- .github/workflows/ | sort) | tr '\n' ' ')"
+        if [[ -n "${missing// /}" ]]; then
+          echo "::warning::$BRANCH at $COMMIT lacks workflows that $DEFAULT has: ${missing}— a release-event workflow runs from the tagged commit's tree, so a publish target among them will not run for this release unless it is added to $BRANCH (through its own PR) before settling"
+        else
+          echo "every workflow on $DEFAULT is present at $COMMIT"
+        fi
+
     - name: Authorise the settler (direct mode)
       if: inputs.settle_mode == 'direct'
       shell: bash

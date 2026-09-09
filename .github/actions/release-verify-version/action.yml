@@ -1,0 +1,78 @@
+name: Release · Verify Version
+description: >-
+  Run a command that prints a built artifact's version (`my-binary --version`)
+  and require the output to match the release version, so a binary built from
+  the wrong tree — or a tag that does not match the manifest — never reaches
+  a publish step. By default the expected output is `<name> <version>` (the
+  clap shape: the command's basename, then the version without its leading
+  `v`); `expected` overrides it. A command that cannot run at all — missing
+  library, crash, no such flag — fails the step even on a dry run: an
+  artifact that does not execute is never publishable, and its exit code is
+  never swallowed. A mismatch is a warning on a dry run, so a rehearsal
+  reports what a real run would refuse and carries on, and a hard stop
+  otherwise.
+
+inputs:
+  command:
+    description: >-
+      Shell command that prints the version, e.g. `target/release/my-binary
+      --version`. Runs under `bash -o pipefail`, so a pipe to `head -n1` is
+      fine for tools that print more.
+    required: true
+  version:
+    description: "The release version, `vX.Y.Z` or `X.Y.Z` (the tag is fine)."
+    required: true
+  expected:
+    description: >-
+      Expected output, trailing whitespace ignored. `{version}` expands to the
+      version without a leading `v`, `{name}` to the basename of the command's
+      first word.
+    required: false
+    default: "{name} {version}"
+  dry_run:
+    required: false
+    default: "false"
+
+outputs:
+  actual:
+    description: What the command printed.
+    value: ${{ steps.check.outputs.actual }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify the version
+      id: check
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        VERSION: ${{ inputs.version }}
+        EXPECTED: ${{ inputs.expected }}
+        DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        set -euo pipefail
+        version="${VERSION#v}"
+        first="${COMMAND%% *}"
+        name="$(basename "$first")"
+        expected="${EXPECTED//\{version\}/$version}"
+        expected="${expected//\{name\}/$name}"
+        # Never swallow the exit code: a probe that cannot run is a failed
+        # build, dry run or not. stderr goes to the log as-is.
+        set +e
+        out="$(bash -o pipefail -c "$COMMAND")"; rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then
+          echo "::error::'$COMMAND' exited $rc — the built artifact does not run; refusing to continue"; exit 1
+        fi
+        actual="$(printf '%s' "$out" | sed -e 's/[[:space:]]*$//')"
+        echo "actual=$actual" >> "$GITHUB_OUTPUT"
+        if [[ "$actual" != "$expected" ]]; then
+          if [[ "$DRY_RUN" == "true" ]]; then
+            # A rehearsal reports what a real run would refuse, and carries on.
+            echo "::warning::'$COMMAND' reports '$actual', expected '$expected' — a real release would stop here"
+          else
+            echo "::error::'$COMMAND' reports '$actual', expected '$expected'; refusing to publish a mislabeled artifact"; exit 1
+          fi
+        else
+          echo "$actual"
+        fi
