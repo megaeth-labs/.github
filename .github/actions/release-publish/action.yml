@@ -11,6 +11,7 @@ description: >-
   changelog catches up in the next release candidate PR — nothing is
   back-merged. The consumer checks the repository out first
   (`fetch-depth: 0`, `persist-credentials: false`).
+  Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
   token:

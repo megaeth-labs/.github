@@ -29,6 +29,8 @@ name: On Release
 # Each target is its own job so a hiccup in one never blocks another. Delete
 # the jobs this repository does not need; keep the shared actions at @main.
 # Every destination below is a placeholder — there are no defaults.
+#
+# Guide: https://github.com/megaeth-labs/.github/blob/main/.github/actions/RELEASE.md
 
 on:
   release:

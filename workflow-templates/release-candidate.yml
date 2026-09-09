@@ -5,6 +5,8 @@ name: Release Candidate
 # opens a candidate PR. When that
 # PR merges, the `cut` job creates `release-vX.Y.Z` at the merge commit. No
 # tag is created here — see release-settle / release-publish.
+#
+# Guide: https://github.com/megaeth-labs/.github/blob/main/.github/actions/RELEASE.md
 
 on:
   workflow_dispatch:
