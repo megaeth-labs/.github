@@ -366,7 +366,7 @@ by the GitHub Release that `release-publish` creates.
 | `release-candidate` `stage: propose` | `workflow_dispatch` on the default branch | bumps `version_file`, runs `bump_command` (lockfile, path-dep versions), drafts this release's changelog entry under `## vX.Y.Z` (dated at settle), syncs the previous release's entry from its tag, opens `chore/release-candidate-vX.Y.Z` PR |
 | `release-candidate` `stage: cut` | that PR merging | creates `release-vX.Y.Z` at the merge commit |
 | `release-settle` | `workflow_dispatch` with version + tip SHA | guards, warns if the tip lacks a workflow the default branch has, regenerates the entry up to the tip and stamps the date, opens `chore/release-settle-vX.Y.Z` PR onto the release branch (a re-run on a new tip closes the previous settle PR and opens a fresh one; nothing is ever force-pushed) — or, with `settle_mode: direct` and an authorised actor (`settlers`), commits it straight to the branch and publishes at once |
-| `release-publish` | the settle PR merging | annotated tag at the merge commit (refuses if it exists or the branch drifted), GitHub Release with the entry as notes |
+| `release-publish` | the settle PR merging (PR mode only; in direct mode `release-settle` runs it in the same job) | annotated tag at the merge commit (refuses if it exists or the branch drifted), GitHub Release with the entry as notes |
 
 The changelog has one owner per phase and is never back-merged: the candidate
 PR drafts the entry on the default branch and syncs the *previous* release's
@@ -422,7 +422,8 @@ Requirements in the consumer repo:
   PR's merge into the release branch, and `on-release.yml` from the tag's
   tree (that is how `release` events resolve a workflow). A release branch
   cut before such a file landed needs it cherry-picked through its own PR
-  before the settle PR merges; `release-settle` warns when the settled
+  before settlement is dispatched (or, in PR mode, before the settle PR
+  merges); `release-settle` warns when the settled
   commit lacks a workflow the default branch has, because the alternative is
   a Release with nothing attached and no failed run.
 
