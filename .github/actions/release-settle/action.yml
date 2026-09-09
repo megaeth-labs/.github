@@ -13,6 +13,7 @@ description: >-
   immediately on that commit. Run as a step in a job the consumer owns; the
   consumer checks the repository out first (`fetch-depth: 0`,
   `persist-credentials: false`). Needs `gh` and `python3` on the runner.
+  Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
   token:

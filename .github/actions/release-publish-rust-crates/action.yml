@@ -11,6 +11,7 @@ description: >-
   has checked out the release tag and installed the toolchain the crates
   need. Never use `--workspace`: a crate without `publish = false` that was
   never meant to be published would go out with it.
+  Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
   crates:

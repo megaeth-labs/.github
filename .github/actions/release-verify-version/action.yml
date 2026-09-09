@@ -11,6 +11,7 @@ description: >-
   never swallowed. A mismatch is a warning on a dry run, so a rehearsal
   reports what a real run would refuse and carries on, and a hard stop
   otherwise.
+  Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
   command:

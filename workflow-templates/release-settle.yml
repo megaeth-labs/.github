@@ -16,6 +16,8 @@ name: Release Settle
 # To settle by PR instead — a reviewed `chore/release-settle-vX.Y.Z` PR onto
 # the release branch, tagged by release-publish.yml when it merges — remove
 # `environment:`, `settle_mode` and `settlers` below.
+#
+# Guide: https://github.com/megaeth-labs/.github/blob/main/.github/actions/RELEASE.md
 
 on:
   workflow_dispatch:

@@ -9,6 +9,7 @@ description: >-
   Workload Identity Federation) before this step so `gcloud` is
   authenticated. `dry_run` computes the checksum and checks the destination
   but uploads nothing.
+  Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
   file:

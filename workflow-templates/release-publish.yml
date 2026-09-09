@@ -13,6 +13,8 @@ name: Release Publish
 # release-settle.yml (the template's default) the settle job publishes
 # itself and nothing here ever fires: the job gate above rejects any settle
 # PR the app did not open.
+#
+# Guide: https://github.com/megaeth-labs/.github/blob/main/.github/actions/RELEASE.md
 
 on:
   pull_request:

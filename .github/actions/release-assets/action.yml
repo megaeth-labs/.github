@@ -5,6 +5,7 @@ description: >-
   idempotent. `dry_run` writes and prints `SHA256SUMS` but attaches nothing.
   Needs a token with `contents: write` on the repository (the job token is
   enough).
+  Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
   tag:
