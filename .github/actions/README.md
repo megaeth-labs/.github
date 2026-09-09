@@ -402,11 +402,16 @@ Requirements in the consumer repo:
   jobs' `if:` on it, so a hand-made `chore/release-*` branch merged by a
   collaborator never reaches the app-token steps.
 - A `concurrency` group on every release workflow, always with
-  `cancel-in-progress: false` (the templates carry them): one candidate at a
-  time, one settle per version, one publish per release branch, one
-  `on-release` run per tag. Each of them ends in a push, a tag or an upload
-  that must never be cancelled half-way, and none of them is atomic with its
-  own guard, so a second run queues rather than overlaps.
+  `cancel-in-progress: false` (the templates carry them): one proposal at a
+  time, one cut at a time, one settle per version, one publish per release
+  branch, one `on-release` run per tag. Each of them ends in a push, a tag or
+  an upload that must never be cancelled half-way, and none of them is
+  atomic with its own guard, so a second run queues rather than overlaps.
+  The groups on the `pull_request`-triggered jobs (`cut`, `publish`) are
+  job-level, not workflow-level: every PR closing on that branch starts the
+  workflow, and GitHub keeps one pending run per group, so a workflow-wide
+  group would let an unrelated closure evict a queued release run. A
+  skipped job holds no slot in a job-level group.
 - Every workflow the release depends on must be on the tagged commit, not
   just on the default branch: `release-publish.yml` runs from the settle
   PR's merge into the release branch, and `on-release.yml` from the tag's
