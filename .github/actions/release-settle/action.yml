@@ -31,8 +31,10 @@ inputs:
       only commit a later merge can build on.
     required: true
   version_file:
+    description: "File holding the version (VERSION, Cargo.toml, pyproject.toml, package.json); the same value as in release-candidate."
     required: true
   version_pattern:
+    description: "How the version is stored in `version_file`: plain, toml or json."
     required: false
     default: plain
   release_branch:
@@ -40,9 +42,11 @@ inputs:
     required: false
     default: ""
   release_branch_prefix:
+    description: "Release branch name prefix; the branch is `<prefix>X.Y.Z`."
     required: false
     default: release-v
   changelog_file:
+    description: "Changelog the entry is written to (Keep-a-Changelog style, newest first)."
     required: false
     default: CHANGELOG.md
   settle_mode:
@@ -65,14 +69,17 @@ inputs:
     required: false
     default: ""
   git_user_name:
+    description: "Committer identity for the commits this action makes."
     required: false
     default: "mega-maxwell[bot]"
   git_user_email:
+    description: "Committer email for the commits this action makes."
     required: false
     default: "290560214+mega-maxwell[bot]@users.noreply.github.com"
 
 outputs:
   version:
+    description: "The normalised version, X.Y.Z."
     value: ${{ steps.guard.outputs.version }}
   pr_url:
     description: URL of the settle PR.
