@@ -69,6 +69,7 @@ inputs:
     required: false
     default: "mega-maxwell[bot]"
   git_user_email:
+    description: "Committer email for the commits this action makes."
     required: false
     default: "290560214+mega-maxwell[bot]@users.noreply.github.com"
 

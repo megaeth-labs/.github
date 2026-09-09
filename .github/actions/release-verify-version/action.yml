@@ -31,6 +31,7 @@ inputs:
     required: false
     default: "{name} {version}"
   dry_run:
+    description: "`true`: do everything except the irreversible step (upload, attach, publish), and report what would have happened."
     required: false
     default: "false"
 

@@ -15,9 +15,11 @@ inputs:
     description: "Newline-separated paths to attach."
     required: true
   token:
+    description: "Token for the GitHub API calls this action makes."
     required: false
     default: ${{ github.token }}
   dry_run:
+    description: "`true`: do everything except the irreversible step (upload, attach, publish), and report what would have happened."
     required: false
     default: "false"
 

@@ -19,6 +19,7 @@ inputs:
     description: "`artifact-registry` (generic repository) or `gcs` (bucket object)."
     required: true
   dry_run:
+    description: "`true`: do everything except the irreversible step (upload, attach, publish), and report what would have happened."
     required: false
     default: "false"
   # --- artifact-registry

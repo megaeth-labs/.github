@@ -109,3 +109,20 @@ jobs:
           [[ "$MISMATCH" == "failure" ]] || { echo "mismatch on a release should fail, got $MISMATCH"; exit 1; }
           [[ "$BROKEN" == "failure" ]] || { echo "a broken probe should fail on a dry run too, got $BROKEN"; exit 1; }
           echo "all outcomes as documented"
+
+  # The generated parts of every action README (inputs, outputs, steps,
+  # errors) and the catalogue come from action.yml; stale docs fail here.
+  docs:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check generated action documentation
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 .github/scripts/action_docs.py --check
