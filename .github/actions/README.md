@@ -357,8 +357,9 @@ whatever else must move with the version (`cargo update --workspace` for a
 lockfile; path-dependency versions in a Cargo workspace — it runs with
 `OLD_VERSION`/`NEW_VERSION` set, and the calling job installs the toolchain it
 needs first), and the changelog path. Builds and
-artifact uploads are not part of them; a repo that ships binaries adds its
-own `push: tags` workflow, which the tag created by `release-publish` fires.
+artifact uploads are not part of them: a repo that ships something composes
+its publish targets in an `on-release.yml` from the extensions below, fired
+by the GitHub Release that `release-publish` creates.
 
 | Action | Trigger in the consumer | Does |
 |---|---|---|
@@ -400,6 +401,20 @@ Requirements in the consumer repo:
   (`pr_author`, default `mega-maxwell[bot]`); the templates also gate the
   jobs' `if:` on it, so a hand-made `chore/release-*` branch merged by a
   collaborator never reaches the app-token steps.
+- A `concurrency` group on every release workflow, always with
+  `cancel-in-progress: false` (the templates carry them): one candidate at a
+  time, one settle per version, one publish per release branch, one
+  `on-release` run per tag. Each of them ends in a push, a tag or an upload
+  that must never be cancelled half-way, and none of them is atomic with its
+  own guard, so a second run queues rather than overlaps.
+- Every workflow the release depends on must be on the tagged commit, not
+  just on the default branch: `release-publish.yml` runs from the settle
+  PR's merge into the release branch, and `on-release.yml` from the tag's
+  tree (that is how `release` events resolve a workflow). A release branch
+  cut before such a file landed needs it cherry-picked through its own PR
+  before the settle PR merges; `release-settle` warns when the settled
+  commit lacks a workflow the default branch has, because the alternative is
+  a Release with nothing attached and no failed run.
 
 Release notes are generated from commit subjects between the previous `v*`
 tag and the settled commit, grouped by Conventional Commit type with PR links
@@ -420,6 +435,7 @@ rehearsed on an existing tag with nothing published, uploaded or attached.
 | `release-publish-rust-crates` | an explicit crate list to crates.io at the release version — one `cargo publish -p … -p …` (Cargo ≥ 1.90 orders and waits); polls the index afterwards | crates already at the version are skipped |
 | `release-upload-artifact` | one file to Artifact Registry (generic) or a GCS bucket; all destinations are inputs | identical file already there → `exists`; different → fails, never overwrites |
 | `release-assets` | files + `SHA256SUMS` on the GitHub Release | `--clobber` |
+| `release-verify-version` | nothing — runs a version probe (`my-binary --version`) between build and publish and requires `<name> <version>` (or a custom `expected`); a mismatch warns on a dry run and stops a release, a probe that cannot run stops both | n/a |
 
 Credentials are the caller's: `CARGO_REGISTRY_TOKEN` for crates.io;
 `google-github-actions/auth` (service-account key or WIF) before an upload
@@ -431,3 +447,19 @@ dispatched on a tag ref — never by a branch build. Required reviewers on
 that environment are optional; settlement is already a reviewed PR.
 `gcloud` and `gh` are on GitHub-hosted runners; the extensions are not
 meant for the TKE image.
+
+What every `on-release.yml` carries, and why (the template has all of it):
+
+- `TAG: ${{ github.ref_name }}` and a `Require a tag ref` first step in each
+  job — never a tag input. The `publish` environment authorises the run's
+  ref, so that ref is the only thing the run may build and publish.
+- `environment: publish` on every job that reads a publish credential.
+- A workflow-level `concurrency` group keyed on `github.ref` with
+  `cancel-in-progress: false`: uploads must not overlap and must not be
+  cancelled mid-flight.
+- `release-verify-version` between the build and the first publish step for
+  each binary. Never wrap a probe of the built artifact in
+  `2>/dev/null || echo …`: that turns a binary that cannot load into a green
+  step and a published download.
+- The file itself on the tagged commit (see the release-branch requirement
+  above).

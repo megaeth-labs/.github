@@ -37,3 +37,75 @@ jobs:
             -s .github/actions/release-tools \
             -p 'test_*.py' \
             -v
+
+  # release-verify-version is bash inside a composite action; drive it with
+  # fake binaries and check each outcome the README promises.
+  verify-version:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fake binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\necho "my-tool 1.2.3"\n' > "$RUNNER_TEMP/bin/my-tool"
+          printf '#!/bin/sh\necho "v1.2.3"\n' > "$RUNNER_TEMP/bin/vee"
+          printf '#!/bin/sh\necho "cannot load shared library" >&2\nexit 127\n' > "$RUNNER_TEMP/bin/broken"
+          chmod +x "$RUNNER_TEMP"/bin/*
+
+      - name: Match (default expected = name + version, v stripped)
+        id: match
+        uses: ./.github/actions/release-verify-version
+        with:
+          command: ${{ runner.temp }}/bin/my-tool --version
+          version: v1.2.3
+
+      - name: Custom expected
+        id: custom
+        uses: ./.github/actions/release-verify-version
+        with:
+          command: ${{ runner.temp }}/bin/vee --version
+          version: "1.2.3"
+          expected: "v{version}"
+
+      - name: Mismatch on a dry run warns and carries on
+        id: mismatch-dry
+        uses: ./.github/actions/release-verify-version
+        with:
+          command: ${{ runner.temp }}/bin/my-tool --version
+          version: v9.9.9
+          dry_run: "true"
+
+      - name: Mismatch on a release stops
+        id: mismatch
+        continue-on-error: true
+        uses: ./.github/actions/release-verify-version
+        with:
+          command: ${{ runner.temp }}/bin/my-tool --version
+          version: v9.9.9
+
+      - name: A probe that cannot run stops even on a dry run
+        id: broken
+        continue-on-error: true
+        uses: ./.github/actions/release-verify-version
+        with:
+          command: ${{ runner.temp }}/bin/broken --version
+          version: v1.2.3
+          dry_run: "true"
+
+      - name: Check outcomes
+        env:
+          MATCH: ${{ steps.match.outputs.actual }}
+          MISMATCH: ${{ steps.mismatch.outcome }}
+          BROKEN: ${{ steps.broken.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$MATCH" == "my-tool 1.2.3" ]] || { echo "actual output not exported: '$MATCH'"; exit 1; }
+          [[ "$MISMATCH" == "failure" ]] || { echo "mismatch on a release should fail, got $MISMATCH"; exit 1; }
+          [[ "$BROKEN" == "failure" ]] || { echo "a broken probe should fail on a dry run too, got $BROKEN"; exit 1; }
+          echo "all outcomes as documented"
