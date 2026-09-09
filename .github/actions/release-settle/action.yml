@@ -257,24 +257,31 @@ runs:
         fi
         git add "$CHANGELOG"
         git commit --quiet -m "chore(release): settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
-        git push --quiet --force origin "$head"
+        # A previous settle branch (the tip moved, or settlement was re-run)
+        # is superseded, never force-pushed: a no-force-push ruleset rejects
+        # the rewrite, and a settle PR is a statement about one commit, so a
+        # new commit gets a new PR. Close its PR first so the reason is on
+        # record, then drop the branch and push this one fresh.
+        if git ls-remote --exit-code --heads origin "refs/heads/$head" >/dev/null; then
+          for n in $(gh pr list --head "$head" --base "$BRANCH" --state open --json number -q '.[].number'); do
+            gh pr close "$n" --comment "Superseded: settlement of v$VERSION was re-run (now at \`$COMMIT\`); a fresh settle PR follows." >/dev/null
+            echo "closed superseded settle PR #$n"
+          done
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$head" >/dev/null
+          echo "dropped previous settle branch $head"
+        fi
+        git push --quiet origin "$head"
         body="$RUNNER_TEMP/settle-pr-body.md"
         {
           echo "Settle **v$VERSION** at \`$COMMIT\` (tip of \`$BRANCH\`)."
           echo
-          echo "Merging this PR is the settlement decision: \`release-publish\` will tag the merge commit as \`v$VERSION\` and publish the GitHub Release with the notes below. The default branch picks this entry up in the next release candidate PR. If more commits land on \`$BRANCH\` first, this PR goes stale and must be regenerated."
+          echo "Merging this PR is the settlement decision: \`release-publish\` will tag the merge commit as \`v$VERSION\` and publish the GitHub Release with the notes below. The default branch picks this entry up in the next release candidate PR. If more commits land on \`$BRANCH\` first, this PR goes stale: re-run settle on the new tip, which closes this PR and opens a fresh one."
           echo
           echo "<!-- release-settle: v$VERSION $COMMIT -->"
           echo
           cat "$NOTES"
         } > "$body"
-        existing="$(gh pr list --head "$head" --base "$BRANCH" --state open --json url -q '.[0].url')"
-        if [[ -n "$existing" ]]; then
-          gh pr edit "$existing" --body-file "$body" >/dev/null
-          url="$existing"
-        else
-          url="$(gh pr create --base "$BRANCH" --head "$head" --title "chore(release): settle v$VERSION" --body-file "$body" "${label_args[@]}")"
-        fi
+        url="$(gh pr create --base "$BRANCH" --head "$head" --title "chore(release): settle v$VERSION" --body-file "$body" "${label_args[@]}")"
         echo "pr_url=$url" >> "$GITHUB_OUTPUT"
         echo "settle PR: $url"
 
