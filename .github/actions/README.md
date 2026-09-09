@@ -350,7 +350,7 @@ pr-review:
 ## Release actions
 
 Three composite actions implement the org release flow — trunk-first
-candidate, settle-by-PR, publish-once. They are language-agnostic: the only
+candidate, environment-gated settle (or settle-by-PR), publish-once. They are language-agnostic: the only
 repo-specific inputs are where the version lives (`version_file` +
 `version_pattern`: `plain`, `toml`, `json`), an optional `bump_command` for
 whatever else must move with the version (`cargo update --workspace` for a
@@ -386,16 +386,21 @@ Requirements in the consumer repo:
 - Org variable `MEGA_MAXWELL_CLIENT_ID` (the Maxwell app's client id) / secret `MEGA_MAXWELL_PK`. PRs
   and tag pushes must come from an App token: `GITHUB_TOKEN` does not trigger
   downstream workflows.
-- A reviewed settle PR is the human gate for creating a tag: the
-  `release-*` branch ruleset below requires it. No environment approval is
-  needed on the publish job (an `environment:` with required reviewers can
-  be added by repos that want a second, separate approver).
+- The human gate for creating a tag is the settle dispatch: the templates
+  put `environment: release` on the settle job, so its required reviewers
+  approve the run before it starts (create the environment with reviewers,
+  `prevent self-review` off if the dispatcher approves, and a deployment
+  branch policy of the default branch only), and the action's
+  `settlers: admin` checks the dispatching actor again. A repo that settles
+  by PR instead (no `settle_mode`) has the reviewed settle PR as its gate:
+  the `release-*` branch ruleset below requires one.
 - A tag ruleset for `v*` (no creation/deletion/force-push) with the app as a
   bypass actor, so `release-publish` is the only tag creator.
-- A branch ruleset for `release-*` requiring PRs, so settlement is always a
-  reviewed merge. Drift after a settle PR is opened is caught by
-  `release-publish` itself (it refuses if the branch tip at merge is not the
-  settled SHA), so no "up to date" status check is needed.
+- A branch ruleset for `release-*` requiring PRs, with the app as a bypass
+  actor: nothing but the app's settle commit reaches a release branch
+  without a reviewed PR. In PR mode, drift after a settle PR is opened is
+  caught by `release-publish` itself (it refuses if the branch tip at merge
+  is not the settled SHA), so no "up to date" status check is needed.
 - `gh` and `python3` on the runner (any GitHub-hosted image).
 - The cut and publish stages only accept PRs opened by the app identity
   (`pr_author`, default `mega-maxwell[bot]`); the templates also gate the
