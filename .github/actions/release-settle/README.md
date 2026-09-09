@@ -86,11 +86,11 @@ reviewers before this step runs:
     version_pattern: toml
     changelog_file: CHANGELOG.md
     settle_mode: direct
-    settlers: admin
+    # settlers: admin   # optional extra restriction on who may start a settle
 ```
 
-Leave out `settle_mode` and `settlers` (and the job's `environment:`) to
-settle by PR instead.
+Leave out `settle_mode` (and the job's `environment:`) to settle by PR
+instead.
 
 ## Notes
 
@@ -99,10 +99,11 @@ settle by PR instead.
   says the version; the version is newer than the latest `v*` tag. Then a
   warning if `commit` lacks a workflow the default branch has (a `release`
   event runs `on-release.yml` from the tag's tree).
-- `direct`: the dispatcher must match `settlers`; the dated entry is
-  committed straight onto the release branch (the app must bypass its
-  ruleset) and `release-publish` runs in the same job with `commit` and
-  `version` set.
+- `direct`: the settle job's `release` environment reviewers are the gate
+  (`settlers: any`, the default); a login list or `admin` in `settlers`
+  additionally checks the dispatcher. The dated entry is committed straight
+  onto the release branch (the app must bypass its ruleset) and
+  `release-publish` runs in the same job with `commit` and `version` set.
 - `pr`: pushes `chore/release-settle-vX.Y.Z` and opens the settle PR. A
   re-run closes the previous settle PR, deletes its branch and pushes a fresh
   one; nothing is force-pushed.

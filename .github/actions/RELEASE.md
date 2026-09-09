@@ -46,8 +46,9 @@ The choices that shape it:
   create them.
 - **One human gate.** The settle dispatch is the release decision. A
   `release` GitHub environment on the settle job makes the run wait for its
-  required reviewers, and the action checks that the dispatching actor is
-  authorised (`settlers`). Everything after the click is mechanical.
+  required reviewers; that click is the approval. An optional `settlers`
+  list can additionally restrict who may start a settle. Everything after
+  the click is mechanical.
 - **The changelog has one owner per phase.** The candidate PR drafts the
   entry (`## vX.Y.Z`, no date) from merged PR titles and syncs the previous
   release's final entry from its tag; settlement finalises it (date, any
@@ -113,8 +114,8 @@ click, the action verifies the commit is a full SHA, the release branch
 exists, `v1.2.3` does not, the commit is the branch tip, the version file at
 that commit says `1.2.3`, and `1.2.3` is newer than the latest tag. It warns
 if the tip lacks a workflow the default branch has (see
-[Operations](#operations-and-recovery)). It checks the dispatcher against
-`settlers`. Then it regenerates the notes up to the tip, writes
+[Operations](#operations-and-recovery)). If `settlers` is set, it checks
+the dispatcher against it. Then it regenerates the notes up to the tip, writes
 `## v1.2.3 (YYYY-MM-DD)` into the changelog, commits that straight onto
 `release-v1.2.3` (the app bypasses the branch ruleset), creates the annotated
 tag `v1.2.3` at that commit, and publishes the GitHub Release, marked latest,
@@ -213,8 +214,10 @@ same values in all three: `version_file` and `version_pattern`, and
 `changelog_file` if not `CHANGELOG.md`. In `release-candidate.yml`, set
 `bump_command` if anything else must move with the version, and install the
 toolchain it needs in the `propose` job before the action step. Keep
-`settle_mode: direct` and `settlers: admin` (or a list of logins) and the
-`environment: release` line in the settle job. Keep `release-publish.yml`
+`settle_mode: direct` and the `environment: release` line in the settle job;
+add `settlers: admin` (or a list of logins) only if starting a settle should
+be restricted beyond what the environment's reviewers approve. Keep
+`release-publish.yml`
 even though direct settlement never triggers it: it is the PR-mode fallback,
 and its job gate rejects anything the app did not open.
 
@@ -260,7 +263,7 @@ toolchain it needs. Examples in use:
 
 | `settle_mode` | Decision | Requirements |
 |---|---|---|
-| `direct` (the templates) | the dispatch, approved through the `release` environment and checked against `settlers` | `settlers`: comma-separated logins and/or `admin` (the dispatcher must have admin permission, checked with the job token); the app bypasses the release-branch ruleset |
+| `direct` (the templates) | the dispatch, approved through the `release` environment | the environment's required reviewers; the app bypasses the release-branch ruleset. `settlers` (default `any`) may additionally name who can start a settle: comma-separated logins and/or `admin` (the dispatcher must have admin permission, checked with the job token) |
 | `pr` (the action default) | merging the settle PR | the release-branch ruleset requires a reviewed PR; `release-publish.yml` present on the release branch |
 
 **Labels** (`pr_labels`, candidate and settle): for repositories whose
