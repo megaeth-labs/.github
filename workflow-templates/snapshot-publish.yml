@@ -1,0 +1,119 @@
+name: Snapshot Publish
+
+# Build one commit and push its binaries to the artifact registry, with no
+# tag and no GitHub Release: the snapshot flow for components that
+# deployments pin by commit (`version: latest`, `profile: <profile>` in the
+# deployment manifest, next to the commit). Dispatch only:
+#   gh workflow run snapshot-publish.yml --ref main                 # head of main
+#   gh workflow run snapshot-publish.yml --ref main -f ref=<sha>    # an older commit on main
+#   … -f dry_run=true                                               # rehearse: build, upload nothing
+#
+# What gets built is `ref` if given, else the run's own commit. The `publish`
+# environment authorises the *dispatch* ref (the branch the workflow ran
+# from), so its deployment branch policy must list that branch; the
+# `allowed_branches` guard below is what stops a dispatch from publishing a
+# commit that never landed on it. A repository that also runs the tagged
+# release pipeline can keep `publish` for tags only and give snapshots their
+# own environment (`snapshot`, same GCP secret, branch policy `main`).
+#
+# The registry layout is what the tagged pipeline produces, with `latest` in
+# place of the tag: `<package>/<commit>/<profile>/latest/<file>`. A rerun on
+# the same commit is a no-op for files already there (hash-checked) and a
+# failure if the file changed, never a silent overwrite.
+#
+# Every destination below is a placeholder — there are no defaults.
+# Guide: https://github.com/megaeth-labs/.github/blob/main/.github/actions/RELEASE.md
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit or branch to build (empty: the commit this workflow runs on)"
+        required: false
+        type: string
+        default: ""
+      profile:
+        description: "Build profile; first segment of the registry path"
+        required: false
+        type: choice
+        options: [release]
+        default: release
+      dry_run:
+        description: "Build and check everything; upload nothing"
+        required: false
+        type: boolean
+        default: true
+
+# One run per commit-to-build; never cancel an upload mid-flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DRY_RUN: ${{ inputs.dry_run }}
+
+jobs:
+  binary:
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      contents: read
+      statuses: write # release-snapshot record_status; drop with it
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-snapshot@main
+        id: snapshot
+        with:
+          stage: resolve
+          ref: ${{ inputs.ref }}
+          allowed_branches: main
+          profile: ${{ inputs.profile }}
+
+      - name: Check out the commit to build
+        if: steps.snapshot.outputs.commit != github.sha
+        run: git checkout --quiet ${{ steps.snapshot.outputs.commit }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+
+      - name: Build
+        run: cargo build --release --locked -p my-binary
+
+      # No version to verify against; just make sure the artifact runs.
+      - name: Smoke-test the binary
+        run: target/release/my-binary --version
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          credentials_json: ${{ secrets.GCP_AUTH_KEY }}
+
+      - uses: megaeth-labs/.github/.github/actions/release-upload-artifact@main
+        id: upload
+        with:
+          file: target/release/my-binary
+          kind: artifact-registry
+          project: my-gcp-project
+          location: my-region
+          repository: my-generic-repository
+          package: my-binary
+          version: ${{ steps.snapshot.outputs.version }}
+          path: ${{ steps.snapshot.outputs.path }}
+          dry_run: ${{ env.DRY_RUN }}
+
+      - uses: megaeth-labs/.github/.github/actions/release-snapshot@main
+        with:
+          stage: summary
+          commit: ${{ steps.snapshot.outputs.commit }}
+          profile: ${{ inputs.profile }}
+          entries: |
+            my-binary ${{ steps.upload.outputs.uri }} ${{ steps.upload.outputs.sha256 }} ${{ steps.upload.outputs.status }}
+          record_status: "true"
+          dry_run: ${{ env.DRY_RUN }}

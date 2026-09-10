@@ -6,7 +6,8 @@ options exist, and what to do when something goes wrong.
 
 The code is next to this file: `release-candidate/`, `release-settle/`,
 `release-publish/` (the core), `release-verify-version/`,
-`release-publish-rust-crates/`, `release-upload-artifact/`, `release-assets/`
+`release-publish-rust-crates/`, `release-upload-artifact/`, `release-assets/`,
+`release-snapshot/` (the snapshot bookends)
 (the publish targets), and `release-tools/` (the text helpers they share, unit
 tested by `actions-test.yml`). The reference callers a repository stamps from
 are in `workflow-templates/` at the repository root. `README.md` beside this
@@ -313,6 +314,35 @@ and uploads `mega-evme` to the registry and the Release page;
 stateless-validator uploads both of its binaries to the registry and the
 Release page; mega-agents and salt ship nothing beyond the Release.
 
+## Snapshots (`snapshot-publish.yml`)
+
+Not every component is versioned. Deployments pin some binaries by commit —
+`version: latest`, `profile: release`, and the commit — and want "build this
+commit and push it", with no tag, no GitHub Release and no changelog. That
+is the snapshot flow: one dispatch-only workflow, `snapshot-publish.yml`,
+bookended by `release-snapshot`:
+
+1. `release-snapshot` `stage: resolve` turns the dispatch input `ref` (or
+   the run's own commit) into the full commit, refuses it unless it is
+   reachable from `allowed_branches`, and hands out the registry
+   coordinates: `version` = the commit, `path` = `<profile>/<label>`
+   (`release/latest`).
+2. The repository's own build steps, then `release-upload-artifact` per
+   file with those coordinates — the layout the tagged pipeline writes,
+   `latest` in place of the tag, so deployment tooling reads both the same
+   way. Re-runs on the same commit are no-ops for files already there.
+3. `release-snapshot` `stage: summary` writes the run summary: every
+   upload with its checksum, and the manifest entry to pin; optionally a
+   `snapshot/<package>` commit status linking back to the run.
+
+Install: copy the template, replace the build steps and destinations, and
+put the GCP secret in an environment whose deployment branch policy allows
+the branch the workflow is dispatched from (the environment authorises the
+dispatch ref; `allowed_branches` guards the commit actually built). A
+repository that also runs the tagged pipeline keeps `publish` for `v*` tags
+and gives snapshots their own environment. Nothing else is needed: no
+version file, no changelog, no rulesets, no app.
+
 ## Operations and recovery
 
 **The release branch moved after settling** (a fix landed): run settle
@@ -374,6 +404,8 @@ What each action does, in one line:
 | `release-candidate` `stage: cut` | that PR merging | creates `release-vX.Y.Z` at the merge commit |
 | `release-settle` | `workflow_dispatch` with version + tip SHA | guards, warns if the tip lacks a workflow the default branch has, regenerates the entry up to the tip and stamps the date; `direct`: commits it to the release branch and publishes at once; `pr`: opens `chore/release-settle-vX.Y.Z` (a re-run closes the previous settle PR and opens a fresh one) |
 | `release-publish` | the settle PR merging, or `release-settle` in direct mode | annotated tag at the commit (refuses if it exists or the branch drifted), GitHub Release with the entry as notes, marked latest |
+| `release-snapshot` `stage: resolve` | `workflow_dispatch` of `snapshot-publish.yml` | resolves `ref` (or the run's commit) to a full SHA, refuses it unless reachable from `allowed_branches`, outputs the registry `version` (the commit) and `path` (`<profile>/<label>`) |
+| `release-snapshot` `stage: summary` | after the uploads in the same job | run summary with every upload, its checksum and the manifest entry to pin; optional `snapshot/<package>` commit statuses |
 
 Release notes are generated from commit subjects between the previous `v*`
 tag and the settled commit, grouped by Conventional Commit type, with PR

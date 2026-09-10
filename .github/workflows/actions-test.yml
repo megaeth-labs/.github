@@ -110,6 +110,84 @@ jobs:
           [[ "$BROKEN" == "failure" ]] || { echo "a broken probe should fail on a dry run too, got $BROKEN"; exit 1; }
           echo "all outcomes as documented"
 
+  # release-snapshot: resolve a ref with and without the branch guard, refuse
+  # a commit that is not on an allowed branch, and write the summary.
+  snapshot:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve main, guarded by main
+        id: main
+        uses: ./.github/actions/release-snapshot
+        with:
+          stage: resolve
+          ref: main
+          allowed_branches: main
+
+      - name: Resolve the run's own commit, no guard, profiling
+        id: own
+        uses: ./.github/actions/release-snapshot
+        with:
+          stage: resolve
+          profile: profiling
+
+      - name: A commit off every allowed branch is refused
+        id: refused
+        continue-on-error: true
+        uses: ./.github/actions/release-snapshot
+        with:
+          stage: resolve
+          allowed_branches: no-such-branch
+
+      - name: Check the coordinates
+        env:
+          MAIN_COMMIT: ${{ steps.main.outputs.commit }}
+          MAIN_BRANCH: ${{ steps.main.outputs.branch }}
+          MAIN_PATH: ${{ steps.main.outputs.path }}
+          OWN_COMMIT: ${{ steps.own.outputs.commit }}
+          OWN_VERSION: ${{ steps.own.outputs.version }}
+          OWN_PATH: ${{ steps.own.outputs.path }}
+          REFUSED: ${{ steps.refused.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$MAIN_COMMIT" == "$(git rev-parse origin/main)" ]] || { echo "main resolved to $MAIN_COMMIT"; exit 1; }
+          [[ "$MAIN_BRANCH" == "main" && "$MAIN_PATH" == "release/latest" ]] || { echo "branch=$MAIN_BRANCH path=$MAIN_PATH"; exit 1; }
+          [[ "$OWN_COMMIT" == "$GITHUB_SHA" && "$OWN_VERSION" == "$GITHUB_SHA" ]] || { echo "own commit=$OWN_COMMIT version=$OWN_VERSION"; exit 1; }
+          [[ "$OWN_PATH" == "profiling/latest" ]] || { echo "own path=$OWN_PATH"; exit 1; }
+          [[ "$REFUSED" == "failure" ]] || { echo "an off-branch commit should be refused, got $REFUSED"; exit 1; }
+          echo "coordinates as documented"
+
+      - name: Summary of a rehearsal
+        id: summary
+        uses: ./.github/actions/release-snapshot
+        with:
+          stage: summary
+          commit: ${{ steps.own.outputs.commit }}
+          profile: profiling
+          entries: |
+            my-binary https://example.invalid/my-binary 0123abcd dry-run
+            my-tool https://example.invalid/my-tool 4567ef01 dry-run
+          dry_run: "true"
+
+      # GITHUB_STEP_SUMMARY is a per-step file, so the summary itself cannot be
+      # read back here; the manifest output carries the same entries.
+      - name: Check the manifest output
+        env:
+          PACKAGES: ${{ steps.summary.outputs.packages }}
+          MANIFEST: ${{ steps.summary.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          [[ "$PACKAGES" == "my-binary,my-tool" ]] || { echo "packages=$PACKAGES"; exit 1; }
+          expected="$(printf 'my-binary:\n  commit: "%s"\n  version: "latest"\n  profile: "profiling"\nmy-tool:\n  commit: "%s"\n  version: "latest"\n  profile: "profiling"\n' "$GITHUB_SHA" "$GITHUB_SHA")"
+          [[ "$MANIFEST" == "$expected" ]] || { echo "manifest differs:"; diff <(echo "$expected") <(echo "$MANIFEST") || true; exit 1; }
+          echo "manifest entries as documented"
+
   # The generated parts of every action README (inputs, outputs, steps,
   # errors) and the catalogue come from action.yml; stale docs fail here.
   docs:

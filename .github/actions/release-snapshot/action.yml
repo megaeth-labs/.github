@@ -1,0 +1,201 @@
+name: Release · Snapshot
+description: >-
+  The two bookends of a snapshot publish — a build of one commit pushed to
+  the artifact registry with no tag and no GitHub Release, for components
+  that deployments pin by commit. `stage: resolve` turns `ref` (a branch,
+  tag or commit; empty means the run's own commit) into the coordinates the
+  upload steps need: the full commit, and the registry `version`
+  (the commit) and `path` (`<profile>/<label>`, e.g. `release/latest`) that
+  match how deployment tooling addresses a snapshot. With `allowed_branches`
+  it refuses a commit that is not reachable from one of those branches, so a
+  dispatch cannot publish an unreviewed commit even though the environment
+  only authorises the branch the workflow ran from. `stage: summary` writes
+  the run summary after the uploads: where each file went, its checksum, and
+  the manifest entry (`commit`, `version`, `profile`) a deployment repository
+  pins; optionally it also records a commit status per package so the
+  commit page shows what was published. Needs a checkout with history for
+  `resolve` (the branch guard uses `merge-base`); nothing here is
+  organisation-specific. Guide: .github/actions/RELEASE.md in
+  megaeth-labs/.github.
+
+inputs:
+  stage:
+    description: "`resolve` (before the build) or `summary` (after the uploads)."
+    required: true
+  # --- resolve
+  ref:
+    description: "Branch, tag or commit to publish. Empty: the run's own commit (`github.sha`)."
+    required: false
+    default: ""
+  allowed_branches:
+    description: >-
+      Comma-separated branches the commit must be reachable from
+      (`origin/<branch>` after a full checkout). Empty: no guard.
+    required: false
+    default: ""
+  profile:
+    description: "Build profile that names the first path segment (`release`, `profiling`, …)."
+    required: false
+    default: release
+  label:
+    description: "Second path segment. Snapshots use `latest`; the deployment manifest pins the commit."
+    required: false
+    default: latest
+  # --- summary
+  commit:
+    description: "(summary) The commit that was published — the `commit` output of the resolve stage."
+    required: false
+    default: ""
+  entries:
+    description: >-
+      (summary) One line per uploaded file: `<package> <uri> <sha256> <status>`,
+      the outputs of `release-upload-artifact` (`status` is `uploaded`,
+      `exists` or `dry-run`).
+    required: false
+    default: ""
+  record_status:
+    description: >-
+      (summary) `true`: create a commit status `snapshot/<package>` on the
+      commit for every entry, linking to this run; needs `token` with
+      `statuses: write`. Dry runs record nothing.
+    required: false
+    default: "false"
+  token:
+    description: "(summary) Token for the commit statuses."
+    required: false
+    default: ${{ github.token }}
+  dry_run:
+    description: "`true`: the summary says so and no status is recorded."
+    required: false
+    default: "false"
+
+outputs:
+  commit:
+    description: (resolve) The full commit SHA that will be built.
+    value: ${{ steps.resolve.outputs.commit }}
+  short:
+    description: (resolve) Its 12-character prefix.
+    value: ${{ steps.resolve.outputs.short }}
+  version:
+    description: (resolve) The registry version to upload under — the commit.
+    value: ${{ steps.resolve.outputs.commit }}
+  path:
+    description: (resolve) The registry path to upload under — `<profile>/<label>`.
+    value: ${{ steps.resolve.outputs.path }}
+  describe:
+    description: (resolve) `git describe --tags --always` of the commit, for logs and binaries.
+    value: ${{ steps.resolve.outputs.describe }}
+  branch:
+    description: (resolve) The first of `allowed_branches` the commit was found on (empty when no guard).
+    value: ${{ steps.resolve.outputs.branch }}
+  packages:
+    description: (summary) Comma-separated package names from `entries`.
+    value: ${{ steps.summary.outputs.packages }}
+  manifest:
+    description: "(summary) The manifest entries as YAML text, `<package>` → `commit`, `version`, `profile` per package, for a follow-up that pins them somewhere."
+    value: ${{ steps.summary.outputs.manifest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the commit
+      id: resolve
+      if: inputs.stage == 'resolve'
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+        ALLOWED: ${{ inputs.allowed_branches }}
+        PROFILE: ${{ inputs.profile }}
+        LABEL: ${{ inputs.label }}
+        RUN_SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        git rev-parse --git-dir >/dev/null 2>&1 || { echo "::error::not a git checkout; check the repository out first (fetch-depth: 0)"; exit 1; }
+        [[ "$PROFILE" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::profile must be a plain word, got '$PROFILE'"; exit 1; }
+        [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::label must be a plain word, got '$LABEL'"; exit 1; }
+        ref="${REF:-$RUN_SHA}"
+        # Prefer the remote branch of that name (a dispatch may name a branch
+        # the shallow checkout never created locally), then anything git can
+        # resolve.
+        if git rev-parse --verify --quiet "refs/remotes/origin/$ref^{commit}" >/dev/null; then
+          commit="$(git rev-parse "refs/remotes/origin/$ref^{commit}")"
+        elif git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+          commit="$(git rev-parse "$ref^{commit}")"
+        else
+          git fetch --quiet origin "$ref" 2>/dev/null && commit="$(git rev-parse FETCH_HEAD)" \
+            || { echo "::error::cannot resolve '$ref' to a commit in this checkout"; exit 1; }
+        fi
+        found=""
+        if [[ -n "$ALLOWED" ]]; then
+          IFS=',' read -ra branches <<<"$ALLOWED"
+          for b in "${branches[@]}"; do
+            b="${b// /}"; [[ -n "$b" ]] || continue
+            git rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null || git fetch --quiet origin "$b:refs/remotes/origin/$b" 2>/dev/null || true
+            git rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null || { echo "::warning::allowed branch '$b' does not exist on origin"; continue; }
+            if git merge-base --is-ancestor "$commit" "refs/remotes/origin/$b"; then found="$b"; break; fi
+          done
+          [[ -n "$found" ]] || { echo "::error::$ref (${commit:0:12}) is not on any allowed branch ($ALLOWED); refusing to publish a commit that has not landed there"; exit 1; }
+        fi
+        describe="$(git describe --tags --always "$commit" 2>/dev/null || echo "${commit:0:12}")"
+        {
+          echo "commit=$commit"; echo "short=${commit:0:12}"; echo "path=${PROFILE}/${LABEL}"
+          echo "describe=$describe"; echo "branch=$found"
+        } >> "$GITHUB_OUTPUT"
+        echo "snapshot of $ref = $commit ($describe)${found:+, on $found}; registry version $commit, path ${PROFILE}/${LABEL}"
+
+    - name: Write the summary
+      id: summary
+      if: inputs.stage == 'summary'
+      shell: bash
+      env:
+        COMMIT: ${{ inputs.commit }}
+        ENTRIES: ${{ inputs.entries }}
+        PROFILE: ${{ inputs.profile }}
+        LABEL: ${{ inputs.label }}
+        RECORD: ${{ inputs.record_status }}
+        GH_TOKEN: ${{ inputs.token }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        REPO: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit must be the full SHA from the resolve stage, got '$COMMIT'"; exit 1; }
+        [[ -n "$ENTRIES" ]] || { echo "::error::entries is empty; pass one '<package> <uri> <sha256> <status>' line per uploaded file"; exit 1; }
+        {
+          if [[ "$DRY_RUN" == "true" ]]; then echo "## Snapshot rehearsal of \`${COMMIT:0:12}\` (nothing uploaded)"; else echo "## Snapshot \`${COMMIT:0:12}\` published"; fi
+          echo
+          echo "| Package | Destination | SHA256 | Status |"
+          echo "|---|---|---|---|"
+        } >> "$GITHUB_STEP_SUMMARY"
+        packages=()
+        while IFS= read -r line; do
+          [[ -n "${line// /}" ]] || continue
+          read -r package uri sha status <<<"$line"
+          [[ -n "$package" && -n "$uri" && -n "$sha" && -n "$status" ]] || { echo "::error::malformed entry: '$line'"; exit 1; }
+          echo "| \`$package\` | $uri | \`$sha\` | $status |" >> "$GITHUB_STEP_SUMMARY"
+          packages+=("$package")
+          if [[ "$RECORD" == "true" && "$DRY_RUN" != "true" ]]; then
+            gh api --method POST "repos/$REPO/statuses/$COMMIT" \
+              -f state=success -f context="snapshot/$package" -f target_url="$RUN_URL" \
+              -f description="${status}: ${uri:0:100}" >/dev/null \
+              && echo "recorded status snapshot/$package on ${COMMIT:0:12}" \
+              || echo "::warning::could not record status snapshot/$package (does the token have statuses: write?)"
+          fi
+        done <<<"$ENTRIES"
+        manifest=""
+        for package in "${packages[@]}"; do
+          manifest+="$package:"$'\n'"  commit: \"$COMMIT\""$'\n'"  version: \"$LABEL\""$'\n'"  profile: \"$PROFILE\""$'\n'
+        done
+        {
+          echo
+          echo "Deployment manifest entry (the registry path is \`${PROFILE}/${LABEL}\` under version \`${COMMIT}\`):"
+          echo
+          echo '```yaml'
+          printf '%s' "$manifest"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        {
+          echo "packages=$(IFS=,; echo "${packages[*]}")"
+          echo "manifest<<megaeth_release_snapshot"; printf '%s' "$manifest"; echo "megaeth_release_snapshot"
+        } >> "$GITHUB_OUTPUT"
+        echo "summary written for ${#packages[@]} package(s)"
