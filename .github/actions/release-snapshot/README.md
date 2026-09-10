@@ -36,6 +36,8 @@ Family: [Release pipeline](../RELEASE.md).
 | `path` | (resolve) The registry path to upload under — `<profile>/<label>`. |
 | `describe` | (resolve) `git describe --tags --always` of the commit, for logs and binaries. |
 | `branch` | (resolve) The first of `allowed_branches` the commit was found on (empty when no guard). |
+| `packages` | (summary) Comma-separated package names from `entries`. |
+| `manifest` | (summary) The manifest entries as YAML text, `<package>` → `commit`, `version`, `profile` per package, for a follow-up that pins them somewhere. |
 <!-- /generated -->
 
 ## What it runs

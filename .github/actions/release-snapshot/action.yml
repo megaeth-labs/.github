@@ -88,6 +88,12 @@ outputs:
   branch:
     description: (resolve) The first of `allowed_branches` the commit was found on (empty when no guard).
     value: ${{ steps.resolve.outputs.branch }}
+  packages:
+    description: (summary) Comma-separated package names from `entries`.
+    value: ${{ steps.summary.outputs.packages }}
+  manifest:
+    description: "(summary) The manifest entries as YAML text, `<package>` → `commit`, `version`, `profile` per package, for a follow-up that pins them somewhere."
+    value: ${{ steps.summary.outputs.manifest }}
 
 runs:
   using: composite
@@ -176,14 +182,20 @@ runs:
               || echo "::warning::could not record status snapshot/$package (does the token have statuses: write?)"
           fi
         done <<<"$ENTRIES"
+        manifest=""
+        for package in "${packages[@]}"; do
+          manifest+="$package:"$'\n'"  commit: \"$COMMIT\""$'\n'"  version: \"$LABEL\""$'\n'"  profile: \"$PROFILE\""$'\n'
+        done
         {
           echo
           echo "Deployment manifest entry (the registry path is \`${PROFILE}/${LABEL}\` under version \`${COMMIT}\`):"
           echo
           echo '```yaml'
-          for package in "${packages[@]}"; do
-            echo "$package:"; echo "  commit: \"$COMMIT\""; echo "  version: \"$LABEL\""; echo "  profile: \"$PROFILE\""
-          done
+          printf '%s' "$manifest"
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
+        {
+          echo "packages=$(IFS=,; echo "${packages[*]}")"
+          echo "manifest<<megaeth_release_snapshot"; printf '%s' "$manifest"; echo "megaeth_release_snapshot"
+        } >> "$GITHUB_OUTPUT"
         echo "summary written for ${#packages[@]} package(s)"

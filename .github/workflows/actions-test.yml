@@ -164,6 +164,7 @@ jobs:
           echo "coordinates as documented"
 
       - name: Summary of a rehearsal
+        id: summary
         uses: ./.github/actions/release-snapshot
         with:
           stage: summary
@@ -174,15 +175,18 @@ jobs:
             my-tool https://example.invalid/my-tool 4567ef01 dry-run
           dry_run: "true"
 
-      - name: Check the summary
+      # GITHUB_STEP_SUMMARY is a per-step file, so the summary itself cannot be
+      # read back here; the manifest output carries the same entries.
+      - name: Check the manifest output
+        env:
+          PACKAGES: ${{ steps.summary.outputs.packages }}
+          MANIFEST: ${{ steps.summary.outputs.manifest }}
         run: |
           set -euo pipefail
-          grep -q 'Snapshot rehearsal of' "$GITHUB_STEP_SUMMARY"
-          grep -q '| `my-tool` | https://example.invalid/my-tool | `4567ef01` | dry-run |' "$GITHUB_STEP_SUMMARY"
-          grep -q '^my-binary:$' "$GITHUB_STEP_SUMMARY"
-          grep -q "  commit: \"$GITHUB_SHA\"" "$GITHUB_STEP_SUMMARY"
-          grep -q '  profile: "profiling"' "$GITHUB_STEP_SUMMARY"
-          echo "summary carries the manifest entry"
+          [[ "$PACKAGES" == "my-binary,my-tool" ]] || { echo "packages=$PACKAGES"; exit 1; }
+          expected="$(printf 'my-binary:\n  commit: "%s"\n  version: "latest"\n  profile: "profiling"\nmy-tool:\n  commit: "%s"\n  version: "latest"\n  profile: "profiling"\n' "$GITHUB_SHA" "$GITHUB_SHA")"
+          [[ "$MANIFEST" == "$expected" ]] || { echo "manifest differs:"; diff <(echo "$expected") <(echo "$MANIFEST") || true; exit 1; }
+          echo "manifest entries as documented"
 
   # The generated parts of every action README (inputs, outputs, steps,
   # errors) and the catalogue come from action.yml; stale docs fail here.
