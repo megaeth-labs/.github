@@ -188,6 +188,259 @@ jobs:
           [[ "$MANIFEST" == "$expected" ]] || { echo "manifest differs:"; diff <(echo "$expected") <(echo "$MANIFEST") || true; exit 1; }
           echo "manifest entries as documented"
 
+  # git-credentials rewrites URLs in the runner's global git config; drive
+  # set, replace, and unset with a fake token and read the config back.
+  git-credentials:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set
+        id: set
+        uses: ./.github/actions/git-credentials
+        with:
+          token: fake-token-1
+          rewrite_ssh: "true"
+          safe_directory: "true"
+
+      - name: Replace with a new token
+        uses: ./.github/actions/git-credentials
+        with:
+          token: fake-token-2
+
+      - name: Check the rewrite (one token, the new one; SSH gone with the replace)
+        env:
+          REWRITE: ${{ steps.set.outputs.rewrite }}
+        run: |
+          set -euo pipefail
+          [[ "$REWRITE" == "url.https://x-access-token:***@github.com/.insteadOf" ]] || { echo "unexpected rewrite output: $REWRITE"; exit 1; }
+          rewrites="$(git config --global --get-regexp '^url\..*\.insteadof$')"
+          echo "$rewrites" | sed 's/fake-token-[0-9]/<token>/'
+          grep -q 'fake-token-2@github.com/.insteadof https://github.com/' <<<"$rewrites" || { echo "new token not set"; exit 1; }
+          grep -q 'fake-token-1' <<<"$rewrites" && { echo "old token still present"; exit 1; }
+          [[ "$(git config --global --get-all safe.directory)" == "*" ]] || { echo "safe.directory not set"; exit 1; }
+          echo "rewrite as documented"
+
+      - name: Unset
+        uses: ./.github/actions/git-credentials
+        with:
+          mode: unset
+
+      - name: Check nothing is left
+        run: |
+          if git config --global --get-regexp '^url\..*\.insteadof$'; then echo "rewrite still present after unset"; exit 1; fi
+          echo "clean"
+
+      - name: A token with URL characters is refused
+        id: bad
+        continue-on-error: true
+        uses: ./.github/actions/git-credentials
+        with:
+          token: "not/a token"
+
+      - name: Check the refusal
+        env:
+          BAD: ${{ steps.bad.outcome }}
+        run: |
+          [[ "$BAD" == "failure" ]] || { echo "a token with URL characters should be refused, got $BAD"; exit 1; }
+
+  # export-env loads a dotenv file into the next steps; check parsing,
+  # prefix handling and that the outputs report what was loaded.
+  export-env:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fixture
+        run: |
+          printf '%s\n' '# a comment' 'FOO=bar' 'export QUOTED="hello world"' "SINGLE='x y'" 'APP_NAME=demo' 'APP_SECRET=supersecretvalue' 'EMPTY=' '  SPACED = padded  ' > "$RUNNER_TEMP/test.env"
+
+      - name: Load everything
+        id: all
+        uses: ./.github/actions/export-env
+        with:
+          file: ${{ runner.temp }}/test.env
+          mask: "true"
+
+      - name: Check the environment
+        env:
+          KEYS: ${{ steps.all.outputs.keys }}
+          COUNT: ${{ steps.all.outputs.count }}
+        run: |
+          set -euo pipefail
+          [[ "$FOO" == "bar" ]] || { echo "FOO=$FOO"; exit 1; }
+          [[ "$QUOTED" == "hello world" ]] || { echo "QUOTED=$QUOTED"; exit 1; }
+          [[ "$SINGLE" == "x y" ]] || { echo "SINGLE=$SINGLE"; exit 1; }
+          [[ "$SPACED" == "padded" ]] || { echo "SPACED=$SPACED"; exit 1; }
+          [[ "${EMPTY+set}" == "set" && -z "$EMPTY" ]] || { echo "EMPTY not exported as empty"; exit 1; }
+          [[ "$COUNT" == "7" ]] || { echo "count=$COUNT"; exit 1; }
+          [[ "$KEYS" == "FOO,QUOTED,SINGLE,APP_NAME,APP_SECRET,EMPTY,SPACED" ]] || { echo "keys=$KEYS"; exit 1; }
+          echo "all seven loaded; APP_SECRET is $APP_SECRET (masked in the log if masking works)"
+
+      - name: Load one namespace as JSON, prefix stripped
+        id: app
+        uses: ./.github/actions/export-env
+        with:
+          file: ${{ runner.temp }}/test.env
+          target: json
+          prefix: APP_
+          strip_prefix: "true"
+
+      - name: Check the JSON output
+        env:
+          NAME: ${{ fromJSON(steps.app.outputs.json).NAME }}
+          COUNT: ${{ steps.app.outputs.count }}
+        run: |
+          [[ "$NAME" == "demo" && "$COUNT" == "2" ]] || { echo "NAME=$NAME count=$COUNT"; exit 1; }
+          echo "prefix handling as documented"
+
+      - name: A missing file is an error by default
+        id: missing
+        continue-on-error: true
+        uses: ./.github/actions/export-env
+        with:
+          file: ${{ runner.temp }}/none.env
+
+      - name: A missing file is fine when not required
+        uses: ./.github/actions/export-env
+        with:
+          file: ${{ runner.temp }}/none.env
+          required: "false"
+
+      - name: Check the missing-file outcomes
+        env:
+          MISSING: ${{ steps.missing.outcome }}
+        run: |
+          [[ "$MISSING" == "failure" ]] || { echo "a missing required file should fail, got $MISSING"; exit 1; }
+
+  # notify-lark posts to a webhook; stand in for Lark with a local server
+  # that records the request and answers like the real bot does.
+  notify-lark:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fake Lark
+        run: |
+          cat > "$RUNNER_TEMP/lark.py" <<'PY'
+          import json, sys, http.server
+          LOG = sys.argv[2]
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                  with open(LOG, 'a') as f: f.write(self.path + ' ' + body.decode() + '\n')
+                  reply = {"code": 0, "msg": "success"} if self.path == '/ok' else {"code": 19001, "msg": "param invalid"}
+                  self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+                  self.wfile.write(json.dumps(reply).encode())
+              def log_message(self, *a): pass
+          http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+          PY
+          nohup python3 "$RUNNER_TEMP/lark.py" 18765 "$RUNNER_TEMP/requests.log" >/dev/null 2>&1 &
+          until curl -s -o /dev/null http://127.0.0.1:18765/ok; do sleep 0.2; done
+
+      - name: Text message
+        id: text
+        uses: ./.github/actions/notify-lark
+        with:
+          webhook_url: http://127.0.0.1:18765/ok
+          message: hello from actions-test
+
+      - name: Rich text with a signature
+        uses: ./.github/actions/notify-lark
+        with:
+          webhook_url: http://127.0.0.1:18765/ok
+          msg_type: post
+          title: Build failed
+          message: |
+            line one
+            line two
+          secret: s3cret
+
+      - name: Raw payload
+        uses: ./.github/actions/notify-lark
+        with:
+          webhook_url: http://127.0.0.1:18765/ok
+          payload: '{"msg_type":"interactive","card":{"header":{"title":{"tag":"plain_text","content":"x"}}}}'
+
+      - name: A Lark error is a warning when fail_on_error is false
+        id: soft
+        uses: ./.github/actions/notify-lark
+        with:
+          webhook_url: http://127.0.0.1:18765/bad
+          message: oops
+          fail_on_error: "false"
+
+      - name: A Lark error fails the step by default
+        id: hard
+        continue-on-error: true
+        uses: ./.github/actions/notify-lark
+        with:
+          webhook_url: http://127.0.0.1:18765/bad
+          message: oops
+
+      - name: Check what Lark received and the outcomes
+        env:
+          TEXT_CODE: ${{ steps.text.outputs.code }}
+          SOFT_CODE: ${{ steps.soft.outputs.code }}
+          HARD: ${{ steps.hard.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$TEXT_CODE" == "0" ]] || { echo "text code=$TEXT_CODE"; exit 1; }
+          [[ "$SOFT_CODE" == "19001" ]] || { echo "soft code=$SOFT_CODE"; exit 1; }
+          [[ "$HARD" == "failure" ]] || { echo "a Lark error should fail by default, got $HARD"; exit 1; }
+          python3 - "$RUNNER_TEMP/requests.log" <<'PY'
+          import json, sys, hmac, hashlib, base64
+          reqs = [json.loads(l.split(' ', 1)[1]) for l in open(sys.argv[1]) if l.split(' ', 1)[1].strip()]
+          assert len(reqs) == 5, len(reqs)
+          assert reqs[0] == {"msg_type": "text", "content": {"text": "hello from actions-test"}}, reqs[0]
+          post = reqs[1]
+          assert post["msg_type"] == "post" and post["content"]["post"]["zh_cn"]["title"] == "Build failed", post
+          assert [p[0]["text"] for p in post["content"]["post"]["zh_cn"]["content"]] == ["line one", "line two"], post
+          key = (post["timestamp"] + "\n" + "s3cret").encode()
+          assert post["sign"] == base64.b64encode(hmac.new(key, b"", hashlib.sha256).digest()).decode(), "bad signature"
+          assert reqs[2]["msg_type"] == "interactive", reqs[2]
+          print("five requests, bodies and signature as documented")
+          PY
+
+  # merge-queue-skipper can only say "true" inside a merge queue; outside one
+  # it must say "false" and expose empty parse outputs.
+  merge-queue-skipper:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Outside a merge queue
+        id: skip
+        uses: ./.github/actions/merge-queue-skipper
+
+      - name: Check
+        env:
+          SKIP: ${{ steps.skip.outputs.skip-check }}
+          PR: ${{ steps.skip.outputs.pr_number }}
+        run: |
+          [[ "$SKIP" == "false" && -z "$PR" ]] || { echo "skip-check=$SKIP pr_number=$PR"; exit 1; }
+          echo "false outside a queue, as documented"
+
   # The generated parts of every action README (inputs, outputs, steps,
   # errors) and the catalogue come from action.yml; stale docs fail here.
   docs:

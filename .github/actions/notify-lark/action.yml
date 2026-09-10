@@ -1,0 +1,115 @@
+name: Notify Lark
+description: >-
+  Post a message to a Lark (Feishu) group through a custom-bot webhook. The
+  default is a plain text message; `msg_type: post` sends rich text with a
+  title, and `payload` sends any JSON you built yourself (interactive cards,
+  mentions), untouched. If the bot has signature verification enabled, pass
+  its signing `secret` and the request is signed with the documented
+  timestamp + HMAC-SHA256 scheme. The webhook URL and secret go through the
+  environment and are masked. A non-2xx response or a Lark error code fails
+  the step unless `fail_on_error` is `false`; the response body is an output
+  either way. Nothing is organisation-specific: the webhook is an input.
+
+inputs:
+  webhook_url:
+    description: "The custom bot's webhook URL (`https://open.larksuite.com/open-apis/bot/v2/hook/…` or the Feishu equivalent)."
+    required: true
+  message:
+    description: "Message text. For `msg_type: post` each line becomes a paragraph. Ignored when `payload` is given."
+    required: false
+    default: ""
+  msg_type:
+    description: "`text` or `post` (rich text with `title`). Ignored when `payload` is given."
+    required: false
+    default: text
+  title:
+    description: "Title for `msg_type: post`."
+    required: false
+    default: ""
+  payload:
+    description: "A complete JSON request body to send as-is (any Lark message type). Overrides `message`, `msg_type` and `title`."
+    required: false
+    default: ""
+  secret:
+    description: "The bot's signature-verification secret, if enabled. Adds `timestamp` and `sign` to the request."
+    required: false
+    default: ""
+  fail_on_error:
+    description: "`true`: fail the step on a non-2xx response or a non-zero Lark `code`."
+    required: false
+    default: "true"
+  timeout:
+    description: "Seconds to wait for the webhook."
+    required: false
+    default: "15"
+
+outputs:
+  code:
+    description: The Lark response `code` (0 means delivered), or the HTTP status when the body was not JSON.
+    value: ${{ steps.send.outputs.code }}
+  response:
+    description: The raw response body.
+    value: ${{ steps.send.outputs.response }}
+
+runs:
+  using: composite
+  steps:
+    - name: Send the message
+      id: send
+      shell: bash
+      env:
+        WEBHOOK_URL: ${{ inputs.webhook_url }}
+        MESSAGE: ${{ inputs.message }}
+        MSG_TYPE: ${{ inputs.msg_type }}
+        TITLE: ${{ inputs.title }}
+        PAYLOAD: ${{ inputs.payload }}
+        SECRET: ${{ inputs.secret }}
+        FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+        [[ -n "$WEBHOOK_URL" ]] || { echo "::error::webhook_url is required"; exit 1; }
+        echo "::add-mask::$WEBHOOK_URL"
+        [[ -n "$SECRET" ]] && echo "::add-mask::$SECRET"
+        command -v jq >/dev/null || { echo "::error::jq is not on this runner"; exit 1; }
+        if [[ -n "$PAYLOAD" ]]; then
+          body="$(jq -c . <<<"$PAYLOAD")" || { echo "::error::payload is not valid JSON"; exit 1; }
+        else
+          [[ -n "$MESSAGE" ]] || { echo "::error::message is required when payload is not given"; exit 1; }
+          case "$MSG_TYPE" in
+            text)
+              body="$(jq -cn --arg text "$MESSAGE" '{msg_type: "text", content: {text: $text}}')" ;;
+            post)
+              # One paragraph per line, plain text only; a block scalar's
+              # trailing newline would otherwise become an empty paragraph.
+              body="$(jq -cn --arg title "$TITLE" --arg text "$MESSAGE" '
+                {msg_type: "post", content: {post: {zh_cn: {
+                  title: $title,
+                  content: ($text | sub("\\n+$"; "") | split("\n") | map([{tag: "text", text: .}]))
+                }}}}')" ;;
+            *) echo "::error::msg_type must be text or post (use payload for other types), got '$MSG_TYPE'"; exit 1 ;;
+          esac
+        fi
+        if [[ -n "$SECRET" ]]; then
+          # Lark custom-bot signing: base64(HMAC-SHA256(key = "<timestamp>\n<secret>", data = "")).
+          ts="$(date +%s)"
+          sign="$(printf '' | openssl dgst -sha256 -hmac "$(printf '%s\n%s' "$ts" "$SECRET")" -binary | base64 | tr -d '\n')"
+          body="$(jq -c --arg ts "$ts" --arg sign "$sign" '. + {timestamp: $ts, sign: $sign}' <<<"$body")"
+        fi
+        tmp="$(mktemp)"
+        status="$(curl -sS -o "$tmp" -w '%{http_code}' --max-time "$TIMEOUT" \
+                  -H 'Content-Type: application/json' -X POST --data-binary "$body" "$WEBHOOK_URL")" || status=000
+        response="$(cat "$tmp")"; rm -f "$tmp"
+        code="$(jq -r 'if type == "object" then (.code // .StatusCode // empty) else empty end' <<<"$response" 2>/dev/null || true)"
+        [[ -n "$code" ]] || code="$status"
+        {
+          echo "code=$code"
+          echo "response<<megaeth_notify_lark"; echo "$response"; echo "megaeth_notify_lark"
+        } >> "$GITHUB_OUTPUT"
+        if [[ "$status" =~ ^2 && "$code" == "0" ]]; then
+          echo "delivered (${body:0:80}…)"
+          exit 0
+        fi
+        msg="Lark webhook returned HTTP $status, code $code: ${response:0:300}"
+        if [[ "$FAIL_ON_ERROR" == "true" ]]; then echo "::error::$msg"; exit 1; fi
+        echo "::warning::$msg"

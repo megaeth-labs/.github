@@ -1,8 +1,10 @@
 # Shared actions
 
 Composite actions every megaeth-labs repository consumes at `@main`. Two
-families and one standalone action; each action directory has a README whose
-input, output, step and error tables are generated from its `action.yml`.
+families plus standalone building blocks (git credentials, dotenv loading,
+Lark notifications, merge-queue skipping, PR lint); each action directory has
+a README whose input, output, step and error tables are generated from its
+`action.yml`.
 
 <!-- generated: catalogue -->
 | Action | Family | Does |
@@ -11,6 +13,10 @@ input, output, step and error tables are generated from its `action.yml`.
 | [`claude-issue-triage`](claude-issue-triage/README.md) | [Claude CI](CLAUDE-CI.md) | Run the centralized MegaETH Claude issue triage. |
 | [`claude-label-check`](claude-label-check/README.md) | [Claude CI](CLAUDE-CI.md) | Run the centralized MegaETH Claude pull request label check. |
 | [`claude-pr-review`](claude-pr-review/README.md) | [Claude CI](CLAUDE-CI.md) | Run the staged, incremental MegaETH Claude pull request review. |
+| [`export-env`](export-env/README.md) | Standalone | Load a dotenv file into the job: every `KEY=value` line (an `export ` prefix, surrounding quotes, blank lines and `#` comments are handled) becomes an environment variable for the following steps, or an entry in the `json` output, or both. Only the keys are logged, never the values — a `.env` that carries a credential stays out of the log — and `mask: true` also registers each value with `::add-mask::`. `prefix` limits the load to one namespace and `strip_prefix` drops it from the exported names. |
+| [`git-credentials`](git-credentials/README.md) | Standalone | Let git — and so cargo, go, pip and anything else that shells out to git — fetch private repositories over HTTPS without prompting, by adding a global `url.<https-with-token>.insteadOf <https>` rewrite for one host. The token never appears in the script: it is passed through the environment and masked in the log. Any token works: a GitHub App installation token (the recommended kind — mint one with `actions/create-github-app-token` for the repositories the build needs), a fine-grained or classic PAT. Optional extras cover the two things the old per-repository copies also did — mark every directory safe for container runners whose workspace belongs to another user, and disable git's low-speed abort for slow mirrors — plus an SSH rewrite for lockfiles that pin `git@host:` URLs. `mode: unset` removes the rewrite again. Nothing is organisation-specific; the host is an input. |
+| [`merge-queue-skipper`](merge-queue-skipper/README.md) | Standalone | Decide whether a merge-queue run may skip checks that already passed on the pull request. GitHub always re-runs required checks on the temporary merge branch; this outputs `skip-check: true` only when that branch's tree is provably the one the PR's own checks covered: the entry was enqueued at the head of the target branch, the PR branch still contains that commit, and the PR branch and the queue branch have no diff. Any other situation — not a merge-queue ref, a queue entry behind another, a PR updated after enqueueing — yields `false`. The caller gates its expensive jobs on the output. Needs the repository history: the action checks it out itself (`fetch-depth: 0`) unless `checkout: false`, in which case the caller must already have a full checkout with `origin` remote. |
+| [`notify-lark`](notify-lark/README.md) | Standalone | Post a message to a Lark (Feishu) group through a custom-bot webhook. The default is a plain text message; `msg_type: post` sends rich text with a title, and `payload` sends any JSON you built yourself (interactive cards, mentions), untouched. If the bot has signature verification enabled, pass its signing `secret` and the request is signed with the documented timestamp + HMAC-SHA256 scheme. The webhook URL and secret go through the environment and are masked. A non-2xx response or a Lark error code fails the step unless `fail_on_error` is `false`; the response body is an output either way. Nothing is organisation-specific: the webhook is an input. |
 | [`pr-lint`](pr-lint/README.md) | Standalone | Lint a pull request. Currently validates that the PR title follows Conventional Commits, posting a sticky comment on failure and removing it once fixed; further PR-level lint steps can be added here over time. Run as a step inside a job the consumer names, so the resulting status-check context is that job name. |
 | [`release-assets`](release-assets/README.md) | [Release pipeline](RELEASE.md) | Attach files, plus a generated `SHA256SUMS`, to the GitHub Release for a tag. Re-runs replace assets of the same name (`--clobber`), so the step is idempotent. `dry_run` writes and prints `SHA256SUMS` but attaches nothing. Needs a token with `contents: write` on the repository (the job token is enough). Guide: .github/actions/RELEASE.md in megaeth-labs/.github. |
 | [`release-candidate`](release-candidate/README.md) | [Release pipeline](RELEASE.md) | Start a release (trunk-first). `stage: propose` bumps the version file on the default branch, drafts this release's changelog entry (dated at settle) from the commits since the previous tag, syncs the previous release's entry from its tag, and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`, run when that PR merges, creates `release-vX.Y.Z` at the merge commit. No tag is created at either stage — tags come from release-publish, once, at settlement. Run as a step in a job the consumer owns; the consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github. |
@@ -48,7 +54,9 @@ actions share ([README](release-tools/README.md)).
 
 - `actions-test.yml` is the only gate: the unit tests of
   `claude-pr-review/review_pipeline.py` and `release-tools/*.py`, the
-  end-to-end drive of `release-verify-version`, and the documentation check.
+  end-to-end drives of `release-verify-version`, `git-credentials`,
+  `export-env`, `notify-lark` (against a local stand-in for the webhook) and
+  `merge-queue-skipper` (outside a queue), and the documentation check.
 - After editing an `action.yml`, run `.github/scripts/action_docs.py`: it
   rewrites the generated blocks in that action's README and the catalogue
   above. CI runs it with `--check` and fails if the docs are stale. Prose
