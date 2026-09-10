@@ -1,0 +1,8 @@
+{
+  "name": "Snapshot Publish",
+  "description": "Build one commit and push it to the MegaETH artifact registry with no tag and no GitHub Release, for components deployments pin by commit. Dispatch with dry_run to rehearse.",
+  "iconName": "octicon package",
+  "categories": [
+    "Automation"
+  ]
+}
