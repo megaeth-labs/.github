@@ -1,0 +1,110 @@
+name: Merge Queue Skipper
+description: >-
+  Decide whether a merge-queue run may skip checks that already passed on the
+  pull request. GitHub always re-runs required checks on the temporary merge
+  branch; this outputs `skip-check: true` only when that branch's tree is
+  provably the one the PR's own checks covered: the entry was enqueued at the
+  head of the target branch, the PR branch still contains that commit, and
+  the PR branch and the queue branch have no diff. Any other situation —
+  not a merge-queue ref, a queue entry behind another, a PR updated after
+  enqueueing — yields `false`. The caller gates its expensive jobs on the
+  output. Needs the repository history: the action checks it out itself
+  (`fetch-depth: 0`) unless `checkout: false`, in which case the caller must
+  already have a full checkout with `origin` remote.
+
+inputs:
+  token:
+    description: "Token for `gh pr view` (reads the PR's head branch). The job token is enough."
+    required: false
+    default: ${{ github.token }}
+  checkout:
+    description: "`true`: check the repository out with full history first. `false` if the job already did."
+    required: false
+    default: "true"
+  target_branch:
+    description: "Override the target branch parsed from the merge-queue ref (rarely needed)."
+    required: false
+    default: ""
+
+outputs:
+  skip-check:
+    description: "`true` when the queue branch equals the already-checked PR tree, else `false`."
+    value: ${{ steps.result.outputs.skip-check }}
+  pr_number:
+    description: The PR number parsed from the merge-queue ref (empty outside a queue).
+    value: ${{ steps.parse.outputs.pr_number }}
+  target_branch:
+    description: The target branch parsed from the merge-queue ref (empty outside a queue).
+    value: ${{ steps.parse.outputs.target_branch }}
+  commit:
+    description: The target-branch commit the queue entry was built on (empty outside a queue).
+    value: ${{ steps.parse.outputs.commit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out the repository with history
+      if: inputs.checkout == 'true'
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        fetch-depth: 0
+
+    - name: Parse the merge-queue ref
+      id: parse
+      shell: bash
+      env:
+        REF: ${{ github.ref }}
+        TARGET_OVERRIDE: ${{ inputs.target_branch }}
+      run: |
+        set -euo pipefail
+        # refs/heads/gh-readonly-queue/<target>/pr-<n>-<sha>
+        if [[ "$REF" =~ ^refs/heads/gh-readonly-queue/(.+)/pr-([0-9]+)-([0-9a-f]{40})$ ]]; then
+          target="${TARGET_OVERRIDE:-${BASH_REMATCH[1]}}"
+          { echo "in_queue=true"; echo "target_branch=$target"; echo "pr_number=${BASH_REMATCH[2]}"; echo "commit=${BASH_REMATCH[3]}"; } >> "$GITHUB_OUTPUT"
+          echo "merge-queue entry: PR #${BASH_REMATCH[2]} onto $target at ${BASH_REMATCH[3]:0:12}"
+        else
+          { echo "in_queue=false"; echo "target_branch="; echo "pr_number="; echo "commit="; } >> "$GITHUB_OUTPUT"
+          echo "not a merge-queue ref ($REF): skip-check=false"
+        fi
+
+    - name: Compare the queue branch with the PR branch
+      id: compare
+      if: steps.parse.outputs.in_queue == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TARGET_BRANCH: ${{ steps.parse.outputs.target_branch }}
+        PR_NUMBER: ${{ steps.parse.outputs.pr_number }}
+        COMMIT: ${{ steps.parse.outputs.commit }}
+      run: |
+        set -euo pipefail
+        reason=""
+        target_head="$(git rev-parse -- "origin/$TARGET_BRANCH")"
+        if [[ "$target_head" != "$COMMIT" ]]; then
+          reason="enqueued behind another entry: origin/$TARGET_BRANCH is ${target_head:0:12}, the entry was built on ${COMMIT:0:12}"
+        else
+          pr_branch="$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName')"
+          if ! git branch -r --contains "$COMMIT" --format='%(refname:short)' | grep -Fqx -- "origin/$pr_branch"; then
+            reason="PR branch origin/$pr_branch does not contain ${COMMIT:0:12}; it is behind $TARGET_BRANCH"
+          elif ! git diff --quiet "origin/$pr_branch" HEAD; then
+            reason="PR branch origin/$pr_branch differs from the queue branch; the PR changed after it was enqueued"
+          fi
+        fi
+        if [[ -n "$reason" ]]; then
+          echo "same_tree=false" >> "$GITHUB_OUTPUT"; echo "$reason: skip-check=false"
+        else
+          echo "same_tree=true" >> "$GITHUB_OUTPUT"; echo "queue branch is the PR's already-checked tree: skip-check=true"
+        fi
+
+    - name: Result
+      id: result
+      shell: bash
+      env:
+        IN_QUEUE: ${{ steps.parse.outputs.in_queue }}
+        SAME_TREE: ${{ steps.compare.outputs.same_tree }}
+      run: |
+        if [[ "$IN_QUEUE" == "true" && "$SAME_TREE" == "true" ]]; then
+          echo "skip-check=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip-check=false" >> "$GITHUB_OUTPUT"
+        fi

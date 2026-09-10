@@ -13,6 +13,11 @@ by every repository, and the workflow templates that show up under
 - `.github/actions/<action>/README.md` — one reference per action; the
   input, output, step and error tables are generated from `action.yml` by
   [`.github/scripts/action_docs.py`](.github/scripts/action_docs.py).
+- Standalone building blocks: [`git-credentials`](.github/actions/git-credentials/README.md),
+  [`export-env`](.github/actions/export-env/README.md),
+  [`notify-lark`](.github/actions/notify-lark/README.md),
+  [`merge-queue-skipper`](.github/actions/merge-queue-skipper/README.md),
+  [`pr-lint`](.github/actions/pr-lint/README.md).
 - [`workflow-templates/`](workflow-templates/) — the reference callers.
 - [`profile/`](profile/) — the organisation profile page.
 

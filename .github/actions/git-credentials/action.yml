@@ -1,0 +1,130 @@
+name: Git Credentials
+description: >-
+  Let git — and so cargo, go, pip and anything else that shells out to git —
+  fetch private repositories over HTTPS without prompting, by adding a global
+  `url.<https-with-token>.insteadOf <https>` rewrite for one host. The token
+  never appears in the script: it is passed through the environment and
+  masked in the log. Any token works: a GitHub App installation token (the
+  recommended kind — mint one with `actions/create-github-app-token` for the
+  repositories the build needs), a fine-grained or classic PAT. Optional
+  extras cover the two things the old per-repository copies also did — mark
+  every directory safe for container runners whose workspace belongs to
+  another user, and disable git's low-speed abort for slow mirrors — plus an
+  SSH rewrite for lockfiles that pin `git@host:` URLs. `mode: unset` removes
+  the rewrite again. Nothing is organisation-specific; the host is an input.
+
+inputs:
+  token:
+    description: "The token to embed in the rewritten URL. Required unless `mode` is `unset`."
+    required: false
+    default: ""
+  host:
+    description: "Git host to rewrite, without scheme."
+    required: false
+    default: github.com
+  username:
+    description: >-
+      Username part of the rewritten URL. `x-access-token` is what GitHub
+      expects for App installation tokens and also accepts for PATs.
+    required: false
+    default: x-access-token
+  mode:
+    description: "`set` adds the rewrite, `unset` removes it (and the SSH rewrite, if any)."
+    required: false
+    default: set
+  rewrite_ssh:
+    description: >-
+      `true`: also rewrite `ssh://git@<host>/` and `git@<host>:` to the token
+      URL, for lockfiles or manifests that pin SSH remotes.
+    required: false
+    default: "false"
+  safe_directory:
+    description: >-
+      `true`: `git config --global --add safe.directory '*'`, needed on
+      container runners whose workspace is owned by a different user than
+      the one running git.
+    required: false
+    default: "false"
+  disable_low_speed_abort:
+    description: >-
+      `true`: set `http.lowSpeedLimit 0` and `http.lowSpeedTime 999999` so git
+      never aborts a slow fetch. The old per-repository copies did this.
+    required: false
+    default: "false"
+  show_config:
+    description: "`true`: print `git config --global --list` afterwards (the token is masked)."
+    required: false
+    default: "false"
+
+outputs:
+  rewrite:
+    description: The `url.<…>.insteadOf` key that was set or unset, token elided.
+    value: ${{ steps.configure.outputs.rewrite }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure git
+      id: configure
+      shell: bash
+      env:
+        GIT_TOKEN: ${{ inputs.token }}
+        GIT_HOST: ${{ inputs.host }}
+        GIT_USERNAME: ${{ inputs.username }}
+        MODE: ${{ inputs.mode }}
+        REWRITE_SSH: ${{ inputs.rewrite_ssh }}
+        SAFE_DIRECTORY: ${{ inputs.safe_directory }}
+        DISABLE_LOW_SPEED_ABORT: ${{ inputs.disable_low_speed_abort }}
+        SHOW_CONFIG: ${{ inputs.show_config }}
+      run: |
+        set -euo pipefail
+        case "$MODE" in set|unset) ;; *) echo "::error::mode must be 'set' or 'unset', got '$MODE'"; exit 1 ;; esac
+        [[ "$GIT_HOST" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || { echo "::error::host must be a bare host name, got '$GIT_HOST'"; exit 1; }
+        [[ "$GIT_USERNAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::username must be a plain word, got '$GIT_USERNAME'"; exit 1; }
+        https_url="https://${GIT_HOST}/"
+        ssh_url="ssh://git@${GIT_HOST}/"
+        scp_url="git@${GIT_HOST}:"
+        if [[ "$MODE" == "unset" ]]; then
+          # Remove every rewrite that maps onto this host, whatever its token.
+          removed=0
+          while IFS= read -r key; do
+            [[ -n "$key" ]] || continue
+            git config --global --unset-all "$key" || true
+            removed=$((removed + 1))
+          done < <(git config --global --get-regexp '^url\..*\.insteadof$' 2>/dev/null \
+                   | awk -v h="$GIT_HOST" '$1 ~ ("^url\\.https://([^@/]+@)?" h "/\\.insteadof$") {print $1}')
+          # Drop now-empty url sections so the config stays tidy.
+          for section in $(git config --global --name-only --get-regexp '^url\.' 2>/dev/null | sed -E 's/\.[^.]+$//' | sort -u); do
+            git config --global --get-regexp "^${section//./\\.}\\." >/dev/null 2>&1 || git config --global --remove-section "$section" 2>/dev/null || true
+          done
+          echo "rewrite=url.https://***@${GIT_HOST}/.insteadOf" >> "$GITHUB_OUTPUT"
+          echo "removed $removed rewrite(s) for $GIT_HOST"
+          exit 0
+        fi
+        [[ -n "$GIT_TOKEN" ]] || { echo "::error::token is required when mode is 'set'"; exit 1; }
+        [[ "$GIT_TOKEN" =~ [[:space:]/@:] ]] && { echo "::error::token contains characters that cannot go in a URL"; exit 1; }
+        echo "::add-mask::$GIT_TOKEN"
+        token_url="https://${GIT_USERNAME}:${GIT_TOKEN}@${GIT_HOST}/"
+        # Replace, never accumulate: a second run with a new token must win.
+        git config --global --unset-all "url.${token_url}.insteadOf" 2>/dev/null || true
+        for existing in $(git config --global --get-regexp '^url\..*\.insteadof$' 2>/dev/null \
+                          | awk -v h="$GIT_HOST" '$1 ~ ("^url\\.https://([^@/]+@)?" h "/\\.insteadof$") {print $1}' | sort -u); do
+          git config --global --unset-all "$existing" || true
+        done
+        git config --global --add "url.${token_url}.insteadOf" "$https_url"
+        if [[ "$REWRITE_SSH" == "true" ]]; then
+          git config --global --add "url.${token_url}.insteadOf" "$ssh_url"
+          git config --global --add "url.${token_url}.insteadOf" "$scp_url"
+        fi
+        if [[ "$SAFE_DIRECTORY" == "true" ]]; then
+          git config --global --add safe.directory '*'
+        fi
+        if [[ "$DISABLE_LOW_SPEED_ABORT" == "true" ]]; then
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+        fi
+        echo "rewrite=url.https://${GIT_USERNAME}:***@${GIT_HOST}/.insteadOf" >> "$GITHUB_OUTPUT"
+        echo "git will fetch $https_url$([[ "$REWRITE_SSH" == "true" ]] && echo ", $ssh_url and $scp_url") with the token (as $GIT_USERNAME)"
+        if [[ "$SHOW_CONFIG" == "true" ]]; then
+          git config --global --list
+        fi
