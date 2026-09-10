@@ -80,11 +80,12 @@ runs:
             text)
               body="$(jq -cn --arg text "$MESSAGE" '{msg_type: "text", content: {text: $text}}')" ;;
             post)
-              # One paragraph per line, plain text only.
+              # One paragraph per line, plain text only; a block scalar's
+              # trailing newline would otherwise become an empty paragraph.
               body="$(jq -cn --arg title "$TITLE" --arg text "$MESSAGE" '
                 {msg_type: "post", content: {post: {zh_cn: {
                   title: $title,
-                  content: ($text | split("\n") | map([{tag: "text", text: .}]))
+                  content: ($text | sub("\\n+$"; "") | split("\n") | map([{tag: "text", text: .}]))
                 }}}}')" ;;
             *) echo "::error::msg_type must be text or post (use payload for other types), got '$MSG_TYPE'"; exit 1 ;;
           esac
