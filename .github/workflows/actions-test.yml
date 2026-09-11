@@ -441,6 +441,241 @@ jobs:
           [[ "$SKIP" == "false" && -z "$PR" ]] || { echo "skip-check=$SKIP pr_number=$PR"; exit 1; }
           echo "false outside a queue, as documented"
 
+  # release-candidate's propose shell runs at the start of every release in
+  # every repository, and a real run needs an app token and a live remote.
+  # Drive the shipped script instead — extracted from action.yml, never copied
+  # — against a throwaway repository shaped like a settled release line, with
+  # a fake `gh` for the default-branch lookup and the ref call.
+  release-candidate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      TOOLS: ${{ github.workspace }}/.github/actions/release-tools/release_tools.py
+      ACTION: ${{ github.workspace }}/.github/actions/release-candidate/action.yml
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # `runner` is not a context a job-level `env:` may read, so the paths
+      # the steps below share are set here instead.
+      - name: Where the rehearsal lives
+        run: |
+          set -euo pipefail
+          {
+            echo "REPO=$RUNNER_TEMP/repo"
+            echo "SH=$RUNNER_TEMP/sh"
+            echo "OUT=$RUNNER_TEMP/step-output"
+          } >> "$GITHUB_ENV"
+
+      - name: The shell under test, taken from the action
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          mkdir -p "$SH"
+          python3 - "$ACTION" "$SH" <<'PY'
+          import pathlib, sys, yaml
+
+          want = {
+              "Guard (propose)": "guard.sh",
+              "Cut the release branch at the base commit (propose)": "cut-branch.sh",
+              "Draft changelog": "changelog.sh",
+          }
+          steps = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"]
+          found = {s["name"]: s["run"] for s in steps if s.get("name") in want}
+          missing = sorted(set(want) - set(found))
+          if missing:
+              sys.exit(f"action.yml has no step named {missing}; this job drives them by name")
+          for name, script in found.items():
+              pathlib.Path(sys.argv[2], want[name]).write_text(script)
+              print(f"extracted {name!r} -> {want[name]}")
+          PY
+          cat > "$SH/helpers.sh" <<'SH'
+          # Run the guard the way the action's step does.
+          guard() { # <version> [base_commit] [ref_name]
+            : > "$OUT"
+            ( cd "$REPO" && env \
+                GH_TOKEN=fake \
+                GITHUB_REPOSITORY=megaeth-labs/fake \
+                GITHUB_REF_NAME="${3:-main}" \
+                GITHUB_OUTPUT="$OUT" \
+                VERSION="$1" \
+                PREFIX=release-v \
+                BASE_COMMIT="${2:-}" \
+                TOOLS="$TOOLS" \
+                bash "$SH/guard.sh" )
+          }
+
+          expect_output() { # <exact line the step should have written>
+            grep -qxF "$1" "$OUT" || { echo "no '$1' in the step output:"; cat "$OUT"; exit 1; }
+          }
+
+          refuse() { # <version> <base_commit> <message fragment> [ref_name]
+            local log="$RUNNER_TEMP/refused.log"
+            if guard "$1" "$2" "${4:-main}" > "$log" 2>&1; then
+              echo "expected a refusal for version=$1 base=$2"; cat "$log"; exit 1
+            fi
+            grep -qF "$3" "$log" || { echo "refused, but not for '$3':"; cat "$log"; exit 1; }
+          }
+          SH
+
+      - name: A fake gh
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/gh" <<'SH'
+          #!/usr/bin/env bash
+          # Only what the shell under test calls: the default branch, and
+          # creating a ref, which here is a push into the throwaway remote.
+          set -euo pipefail
+          case "${1:-}" in
+            repo)
+              echo "main"
+              ;;
+            api)
+              ref=""; sha=""
+              while [[ $# -gt 0 ]]; do
+                if [[ "$1" == "-f" ]]; then
+                  case "${2:-}" in
+                    ref=*) ref="${2#ref=}" ;;
+                    sha=*) sha="${2#sha=}" ;;
+                  esac
+                  shift 2 || break
+                else
+                  shift
+                fi
+              done
+              if [[ -n "$ref" && -n "$sha" ]]; then
+                git push --quiet origin "$sha:$ref"
+              fi
+              ;;
+          esac
+          SH
+          chmod +x "$RUNNER_TEMP/bin/gh"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: A repository shaped like a settled release line
+        run: |
+          set -euo pipefail
+          git config --global user.name tester
+          git config --global user.email tester@example.invalid
+          git config --global init.defaultBranch main
+          git init --quiet --bare "$REPO.git"
+          git clone --quiet "$REPO.git" "$REPO" 2>/dev/null
+          cd "$REPO"
+          echo 1.0.0 > VERSION
+          printf '# Changelog\n\n## v1.0.0 (2024-01-01)\n\n- shipped in 1.0.0\n' > CHANGELOG.md
+          git add -A && git commit --quiet -m "feat: the first release"
+          git commit --quiet --allow-empty -m "feat: two"
+          git commit --quiet --allow-empty -m "fix: three"
+          git rev-parse HEAD > "$RUNNER_TEMP/base"
+          git commit --quiet --allow-empty -m "feat: not shipping this"
+          git commit --quiet --allow-empty -m "feat: nor this"
+          git push --quiet -u origin main
+          # v1.0.0 sits on its own release branch, off trunk, exactly where
+          # settlement leaves it.
+          git checkout --quiet -b release-v1.0.0 "$(git rev-list --max-parents=0 HEAD)"
+          git commit --quiet --allow-empty -m "chore(release): settle v1.0.0"
+          git tag -a v1.0.0 -m v1.0.0
+          git push --quiet origin release-v1.0.0 --tags
+          git checkout --quiet main
+          git branch --quiet -D release-v1.0.0
+          # A commit the default branch cannot reach.
+          git checkout --quiet -b side
+          git commit --quiet --allow-empty -m "feat: never reviewed"
+          git rev-parse HEAD > "$RUNNER_TEMP/unreachable"
+          git checkout --quiet main
+          echo "base commit $(cat "$RUNNER_TEMP/base")"
+
+      - name: The trunk-first path is unchanged
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          guard 1.1.0
+          expect_output "base="
+          expect_output "branch=release-v1.1.0"
+          echo "no base commit still means the default-branch flow"
+
+      - name: An explicit commit resolves, however it was written
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          base="$(cat "$RUNNER_TEMP/base")"
+          guard 1.1.0 "$base"
+          expect_output "base=$base"
+          guard 1.1.0 "origin/main~2"
+          expect_output "base=$base"
+          echo "a full SHA and a relative ref both resolve to $base"
+
+      - name: A commit the default branch cannot reach is refused
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          refuse 1.1.0 "$(cat "$RUNNER_TEMP/unreachable")" "not reachable from the default branch"
+          refuse 1.1.0 v1.0.0 "not reachable from the default branch"
+          refuse 1.1.0 0000000000000000000000000000000000000000 "is not a commit in this checkout"
+          echo "an off-trunk commit, a release tag and nonsense are all refused"
+
+      - name: The rules that were already there still apply
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          refuse 1.1.0 "" "release candidates start from the default branch" some-branch
+          refuse 1.1.0 "$(cat "$RUNNER_TEMP/base")" "release candidates start from the default branch" some-branch
+          refuse 0.9.0 "" "is not newer than the latest tag"
+          refuse 0.9.0 "$(cat "$RUNNER_TEMP/base")" "is not newer than the latest tag"
+          echo "the default-branch and version rules come first, with or without a base commit"
+
+      - name: The release branch is cut at the commit, and the notes stop there
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          base="$(cat "$RUNNER_TEMP/base")"
+          guard 1.1.0 "$base"
+          : > "$OUT"
+          ( cd "$REPO" && env \
+              GH_TOKEN=fake \
+              GITHUB_REPOSITORY=megaeth-labs/fake \
+              GITHUB_OUTPUT="$OUT" \
+              BRANCH=release-v1.1.0 \
+              BASE="$base" \
+              bash "$SH/cut-branch.sh" )
+          expect_output "release_branch=release-v1.1.0"
+          [[ "$(git -C "$REPO" rev-parse HEAD)" == "$base" ]] \
+            || { echo "HEAD is not the base commit"; exit 1; }
+          [[ "$(git -C "$REPO" symbolic-ref --short HEAD)" == "release-v1.1.0" ]] \
+            || { echo "the job is not on the release branch"; exit 1; }
+          [[ "$(git -C "$REPO" ls-remote --heads origin refs/heads/release-v1.1.0 | cut -f1)" == "$base" ]] \
+            || { echo "the remote branch is not at the base commit"; exit 1; }
+          # The changelog step itself is untouched by this change; run it to
+          # prove the entry covers what ships, not what is on the trunk tip.
+          ( cd "$REPO" && env \
+              VERSION=1.1.0 \
+              CHANGELOG=CHANGELOG.md \
+              GITHUB_REPOSITORY=megaeth-labs/fake \
+              GITHUB_OUTPUT="$OUT" \
+              TOOLS="$TOOLS" \
+              bash "$SH/changelog.sh" )
+          entry="$(sed -n '/^## v1.1.0/,/^## v1.0.0/p' "$REPO/CHANGELOG.md")"
+          echo "$entry"
+          grep -q '^- two' <<< "$entry" || { echo "a commit that ships is missing"; exit 1; }
+          grep -q '^- three' <<< "$entry" || { echo "a commit that ships is missing"; exit 1; }
+          ! grep -q 'not shipping' <<< "$entry" || { echo "a commit past the base is in the entry"; exit 1; }
+          echo "release-v1.1.0 cut at $base, notes stop there"
+
+      - name: A re-dispatch reuses its own branch, and nothing else
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          base="$(cat "$RUNNER_TEMP/base")"
+          guard 1.1.0 "$base"
+          expect_output "base=$base"
+          refuse 1.1.0 "origin/main~1" "already exists"
+          refuse 1.1.0 "" "already exists"
+          echo "the same commit is reused; a different one, and the trunk flow, are refused"
+
   # The generated parts of every action README (inputs, outputs, steps,
   # errors) and the catalogue come from action.yml; stale docs fail here.
   docs:
