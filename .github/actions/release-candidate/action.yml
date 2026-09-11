@@ -6,8 +6,11 @@ description: >-
   tag, and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`,
   run when that PR merges, creates `release-vX.Y.Z` at the merge commit. No tag
   is created at either stage — tags come from release-publish, once, at
-  settlement. Run as a step in a job the consumer owns; the consumer checks the
-  repository out first (`fetch-depth: 0`, `persist-credentials: false`).
+  settlement. `base_commit` releases a commit that is not the tip of the
+  default branch: `propose` cuts the release branch there itself and points the
+  candidate PR at it, leaving `cut` nothing to do. Run as a step in a job the
+  consumer owns; the consumer checks the repository out first
+  (`fetch-depth: 0`, `persist-credentials: false`).
   Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
@@ -22,6 +25,21 @@ inputs:
     required: true
   version:
     description: "Version to release, X.Y.Z or vX.Y.Z. Required for `propose`."
+    required: false
+    default: ""
+  base_commit:
+    description: >-
+      The commit to release, for `propose`, when it must not be the tip of the
+      default branch. Any commit-ish the checkout can resolve (a full SHA, a
+      tag, `origin/main~3`), and it must be reachable from the default branch
+      — a release still ships code that went through trunk. Empty (the
+      default) is the trunk-first flow: the candidate PR merges into the
+      default branch and `cut` creates the release branch at that merge commit.
+      Set, `propose` creates the release branch at this commit and opens the
+      candidate PR against that branch, because merging it into the default
+      branch would take the commits this release is leaving out; the default
+      branch is then untouched and `cut` never runs. The version must still be
+      newer than the newest `v*` tag in the repository.
     required: false
     default: ""
   version_file:
@@ -81,8 +99,11 @@ outputs:
     description: "`propose`: URL of the candidate PR."
     value: ${{ steps.pr.outputs.pull-request-url }}
   release_branch:
-    description: "`cut`: the release branch created."
-    value: ${{ steps.cut.outputs.release_branch }}
+    description: "The release branch: created by `cut`, or by `propose` when `base_commit` is set."
+    value: ${{ steps.cut.outputs.release_branch || steps.branch.outputs.release_branch }}
+  base_commit:
+    description: "`propose` with `base_commit`: that commit-ish resolved to a full SHA."
+    value: ${{ steps.guard.outputs.base }}
 
 runs:
   using: composite
@@ -130,11 +151,13 @@ runs:
     # ---------------------------------------------------------------- propose
     - name: Guard (propose)
       if: inputs.stage == 'propose'
+      id: guard
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
         VERSION: ${{ steps.version.outputs.version }}
         PREFIX: ${{ inputs.release_branch_prefix }}
+        BASE_COMMIT: ${{ inputs.base_commit }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
@@ -152,9 +175,63 @@ runs:
         if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
           echo "::error::tag v$VERSION already exists"; exit 1
         fi
-        if git ls-remote --exit-code --heads origin "refs/heads/${PREFIX}${VERSION}" >/dev/null; then
-          echo "::error::branch ${PREFIX}${VERSION} already exists"; exit 1
+        branch="${PREFIX}${VERSION}"
+        # An explicit commit is the release. Resolve it here so everything
+        # downstream works on a full SHA, and refuse anything the default
+        # branch cannot reach: a release ships code that went through trunk.
+        base=""
+        if [[ -n "$BASE_COMMIT" ]]; then
+          git fetch --quiet origin "+refs/heads/$default:refs/remotes/origin/$default"
+          base="$(git rev-parse --verify --quiet "${BASE_COMMIT}^{commit}" || true)"
+          if [[ -z "$base" ]]; then
+            echo "::error::base_commit $BASE_COMMIT is not a commit in this checkout; check the repository out with fetch-depth: 0"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$base" "origin/$default"; then
+            echo "::error::base_commit $base is not reachable from the default branch ($default); a release must ship code that landed on trunk"
+            exit 1
+          fi
+          echo "base commit: $BASE_COMMIT -> $base"
         fi
+        # The release branch must not exist yet. One exception: with an
+        # explicit commit, propose creates that branch before it opens the PR,
+        # so a re-dispatch after a failed attempt finds its own branch still
+        # sitting on the requested commit, with nothing merged into it.
+        existing="$(git ls-remote --heads origin "refs/heads/$branch" | cut -f1)"
+        if [[ -n "$existing" ]]; then
+          if [[ -n "$base" && "$existing" == "$base" ]]; then
+            echo "::notice title=Reusing the release branch::$branch already exists at $base, from an earlier attempt at this candidate"
+          else
+            echo "::error::branch $branch already exists"; exit 1
+          fi
+        fi
+        {
+          echo "base=$base"
+          echo "branch=$branch"
+        } >> "$GITHUB_OUTPUT"
+
+    # With an explicit base commit the candidate PR cannot target the default
+    # branch: merging it there would take the commits this release is
+    # deliberately leaving out. So the release branch is cut here instead of at
+    # `cut`, and the PR targets it. Checking it out also means the bump and the
+    # changelog below are drafted over what this release contains.
+    - name: Cut the release branch at the base commit (propose)
+      if: inputs.stage == 'propose' && inputs.base_commit != ''
+      id: branch
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        BRANCH: ${{ steps.guard.outputs.branch }}
+        BASE: ${{ steps.guard.outputs.base }}
+      run: |
+        set -euo pipefail
+        if ! git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null; then
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$BASE" >/dev/null
+          echo "created $BRANCH at $BASE"
+        fi
+        git checkout --quiet -B "$BRANCH" "$BASE"
+        echo "release_branch=$BRANCH" >> "$GITHUB_OUTPUT"
+        echo "candidate PR will target $BRANCH"
 
     - name: Bump version file
       if: inputs.stage == 'propose'
@@ -263,6 +340,9 @@ runs:
       with:
         token: ${{ inputs.token }}
         branch: chore/release-candidate-${{ steps.version.outputs.version }}
+        # Empty means the branch this job checked out, i.e. the default
+        # branch; set, it is the release branch cut above.
+        base: ${{ steps.branch.outputs.release_branch }}
         delete-branch: true
         commit-message: "chore(release): candidate v${{ steps.version.outputs.version }}"
         committer: "${{ inputs.git_user_name }} <${{ inputs.git_user_email }}>"
@@ -272,8 +352,9 @@ runs:
         body: |
           Release candidate **v${{ steps.version.outputs.version }}** (was ${{ steps.bump.outputs.old }}).
 
-          Merging this PR creates the release branch `${{ inputs.release_branch_prefix }}${{ steps.version.outputs.version }}`
-          at the merge commit. It creates **no tag**; the tag is cut once, at settlement, by `release-settle` → `release-publish`.
+          ${{ steps.branch.outputs.release_branch && format('Cut from `{0}`, which is not the tip of the default branch: `{1}` already exists at that commit, and merging this PR puts the version bump and the changelog entry on it. The default branch is left untouched — the next candidate syncs this entry back from the tag.', steps.guard.outputs.base, steps.branch.outputs.release_branch) || format('Merging this PR creates the release branch `{0}{1}` at the merge commit.', inputs.release_branch_prefix, steps.version.outputs.version) }}
+
+          It creates **no tag**; the tag is cut once, at settlement, by `release-settle` → `release-publish`.
 
           Changelog: this release's entry drafted under `## v${{ steps.version.outputs.version }}` (settle stamps the date on the release branch);
           previous release's entry synced from its tag: ${{ steps.changelog.outputs.synced || 'n/a' }}.
@@ -295,6 +376,7 @@ runs:
         MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
         EXPECTED_AUTHOR: ${{ inputs.pr_author }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
@@ -311,6 +393,14 @@ runs:
           echo "::error::$FILE at $MERGE_SHA says $actual, expected $VERSION"; exit 1
         fi
         branch="${PREFIX}${VERSION}"
+        # A candidate that targeted the release branch was proposed with an
+        # explicit base commit: propose already cut the branch there, this
+        # merge landed the bump on it, and there is nothing left to create.
+        if [[ "$BASE_REF" == "$branch" ]]; then
+          echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Release branch already cut::$branch was created by propose at the requested base commit and this candidate merged into it"
+          exit 0
+        fi
         if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
           echo "::error::branch $branch already exists"; exit 1
         fi

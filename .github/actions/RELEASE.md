@@ -40,7 +40,10 @@ The choices that shape it:
   default branch through an ordinary reviewed PR; the release branch is cut
   from that merge. Fixes for a release go to the release branch by PR and
   must also land on the default branch, because the next candidate is cut
-  from there.
+  from there. When the release is an earlier commit rather than the tip
+  (`base_commit`), the same reviewed PR lands on the release branch instead,
+  and the default branch is left alone — see [Releasing a commit that is not
+  the tip](#releasing-a-commit-that-is-not-the-tip).
 - **No release-candidate tags.** A tag is created exactly once, at
   settlement, on the commit that ships. Tags are immutable: the `v*` tag
   ruleset forbids updating or deleting them, and nothing but the app can
@@ -133,6 +136,52 @@ onto the release branch with the dated entry, and merging that PR is the
 decision; `release-publish.yml` then tags the merge commit and publishes the
 Release, refusing if the branch moved since the PR was made (the merge's first
 parent must be the settled SHA) or the PR was not opened by the app.
+
+### Releasing a commit that is not the tip
+
+`main` moves while a release is being prepared. To ship an earlier commit,
+name it:
+
+```sh
+gh workflow run release-candidate.yml --ref main \
+  -f version=1.2.3 -f base_commit="$(git rev-parse origin/main~4)"
+```
+
+The commit may be given as anything the checkout resolves — a full SHA, a
+tag, `origin/main~4` — but it must be reachable from the default branch: a
+release ships code that went through trunk. Note that `v*` release tags are
+not reachable from it, because settlement commits the dated changelog on the
+release branch; to release from an old release line, name a commit on the
+default branch, not its tag.
+
+Step 1 then works differently, and steps 3 and 4 are unchanged:
+
+- `propose` creates `release-v1.2.3` at that commit itself, rather than
+  leaving it to `cut`, and opens the candidate PR **against that branch**.
+  The PR cannot target the default branch: merging it there would take the
+  commits this release is deliberately leaving out.
+- The changelog entry is drafted over what actually ships, the commits from
+  the previous tag up to the named commit, not up to the tip.
+- Merging the candidate PR puts the version bump and the entry on
+  `release-v1.2.3`. There is no step 2: the `cut` job does not fire, because
+  the PR's base is the release branch and the workflow's `pull_request`
+  trigger filters on the default branch. The `release branch` ruleset governs
+  this PR, so it needs its approving review and a squash merge, like any
+  other change to a release branch.
+- **The default branch is left untouched.** Its version file keeps the old
+  version, and it gains no changelog entry until the next candidate, which
+  syncs the entry back from the tag the way it does after any release. The
+  next version must still be newer than `v1.2.3`.
+
+The version must be newer than the newest `v*` tag in the repository, as
+usual, so this releases an earlier commit on the current line. It does not
+patch an older line that a higher tag has already passed; there is no
+backport flow.
+
+If an attempt fails after the branch was created — a broken `bump_command`,
+say — re-dispatching the same version and commit reuses the branch, because
+it is still sitting on exactly that commit with nothing merged into it. Any
+other mismatch is refused, and the branch has to be deleted by hand.
 
 ## Installing it in a repository
 
@@ -267,6 +316,11 @@ toolchain it needs. Examples in use:
 | `direct` (the templates) | the dispatch, approved through the `release` environment | the environment's required reviewers; the app bypasses the release-branch ruleset. `settlers` (default `any`) may additionally name who can start a settle: comma-separated logins and/or `admin` (the dispatcher must have admin permission, checked with the job token) |
 | `pr` (the action default) | merging the settle PR | the release-branch ruleset requires a reviewed PR; `release-publish.yml` present on the release branch |
 
+**Which commit is released** (`base_commit`, candidate only): empty, the
+default, releases the tip of the default branch through the trunk-first flow.
+A commit-ish releases that commit instead — see
+[Releasing a commit that is not the tip](#releasing-a-commit-that-is-not-the-tip).
+
 **Labels** (`pr_labels`, candidate and settle): for repositories whose
 label gates apply to the app's PRs.
 
@@ -400,7 +454,7 @@ What each action does, in one line:
 
 | Action | Trigger in the consumer | Does |
 |---|---|---|
-| `release-candidate` `stage: propose` | `workflow_dispatch` on the default branch | bumps `version_file`, runs `bump_command`, drafts this release's changelog entry under `## vX.Y.Z`, syncs the previous release's entry from its tag, opens `chore/release-candidate-X.Y.Z` |
+| `release-candidate` `stage: propose` | `workflow_dispatch` on the default branch | bumps `version_file`, runs `bump_command`, drafts this release's changelog entry under `## vX.Y.Z`, syncs the previous release's entry from its tag, opens `chore/release-candidate-X.Y.Z`; with `base_commit`, cuts `release-vX.Y.Z` at that commit first and aims the PR there |
 | `release-candidate` `stage: cut` | that PR merging | creates `release-vX.Y.Z` at the merge commit |
 | `release-settle` | `workflow_dispatch` with version + tip SHA | guards, warns if the tip lacks a workflow the default branch has, regenerates the entry up to the tip and stamps the date; `direct`: commits it to the release branch and publishes at once; `pr`: opens `chore/release-settle-vX.Y.Z` (a re-run closes the previous settle PR and opens a fresh one) |
 | `release-publish` | the settle PR merging, or `release-settle` in direct mode | annotated tag at the commit (refuses if it exists or the branch drifted), GitHub Release with the entry as notes, marked latest |
