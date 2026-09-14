@@ -104,6 +104,10 @@ runs:
         REVIEW_DEPTH: ${{ inputs.review_depth }}
         PREMORTEM: ${{ inputs.premortem }}
         STATE_DIR: ${{ github.workspace }}/.pr-review
+        # Passed through the environment, never interpolated into the script:
+        # the body is attacker-controlled text. prepare only tests it for the
+        # `claude-review:skip` marker a bot puts on a placeholder comment.
+        TRIGGER_COMMENT_BODY: ${{ github.event.comment.body }}
       run: |
         set -euo pipefail
         python3 "$GITHUB_ACTION_PATH/review_pipeline.py" prepare \

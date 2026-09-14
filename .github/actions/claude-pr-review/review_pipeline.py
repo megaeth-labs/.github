@@ -33,6 +33,12 @@ QUESTION_MARKER_RE = re.compile(
     r"<!-- claude-review-question:v1 Q-[0-9a-f]+ -->"
 )
 QUESTION_DISPOSITIONS = {"open", "answered", "withdrawn"}
+# A comment carrying this marker never drives a review round. It exists for
+# bots that announce work before they have anything to say — post a
+# placeholder, then rewrite it in place once the real answer is ready. The
+# placeholder is worth no round; the rewrite replaces the whole body, marker
+# included, so the resulting `edited` event is a normal comment again.
+COMMENT_SKIP_MARKER = "claude-review:skip"
 CONVERSATION_MAX_ENTRIES = 120
 CONVERSATION_MAX_BODY_CHARS = 6_000
 CONVERSATION_MAX_TOTAL_BODY_CHARS = 96_000
@@ -1138,6 +1144,19 @@ def write_github_output(values: dict[str, Any]) -> None:
             output.write(f"{key}={value}\n")
 
 
+def comment_round_is_suppressed(body: str | None) -> bool:
+    """True when a triggering comment opts out of driving a review round.
+
+    An agent that answers review feedback typically posts a placeholder
+    ("Looking into this...") the moment it picks the work up and edits that
+    same comment into the real answer minutes later. Without the marker the
+    reviewer spends a round reconciling the placeholder and never sees the
+    answer, because the answer arrives as an edit of an already-reviewed
+    comment. Marking the placeholder moves the round to where the content is.
+    """
+    return COMMENT_SKIP_MARKER in (body or "")
+
+
 def manifest_has_open_items(manifest: dict[str, Any]) -> bool:
     """True when the manifest still has an open question or open finding.
 
@@ -1398,6 +1417,11 @@ def prepare(args: argparse.Namespace) -> None:
             "pull request opened by the reviewer's own identity "
             f"({self_author})"
         )
+    elif args.event_name == "issue_comment" and comment_round_is_suppressed(
+        os.environ.get("TRIGGER_COMMENT_BODY", "")
+    ):
+        mode = "skip"
+        mode_reason = "triggering comment carries the no-review marker"
     elif args.event_name == "issue_comment":
         # A comment never adds code to review — it can only answer an open
         # question or justify/invalidate an open finding. Run a reconcile-only

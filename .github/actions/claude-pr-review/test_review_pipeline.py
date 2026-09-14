@@ -170,6 +170,35 @@ class ReviewPipelineTests(unittest.TestCase):
             )
         )
 
+    def test_placeholder_comments_do_not_spend_a_review_round(self):
+        # An agent that answers feedback posts "looking into this", then edits
+        # that comment into the answer. The placeholder carries the marker and
+        # is worth no round; the rewrite replaces the whole body, marker
+        # included, so the edit that carries the answer does drive one.
+        self.assertTrue(
+            pipeline.comment_round_is_suppressed(
+                ":mag: Looking into this...\n\n<!-- claude-review:skip -->"
+            )
+        )
+        self.assertFalse(
+            pipeline.comment_round_is_suppressed(
+                "I don't have evidence of such an auth failure pattern."
+            )
+        )
+        self.assertFalse(pipeline.comment_round_is_suppressed(None))
+        self.assertFalse(pipeline.comment_round_is_suppressed(""))
+
+    def test_action_reads_trigger_comment_body_from_the_environment(self):
+        action = Path(pipeline.__file__).with_name("action.yml").read_text(
+            encoding="utf-8"
+        )
+        # The body is attacker-controlled text, so it reaches prepare as an
+        # environment variable and never as shell script interpolation.
+        self.assertIn(
+            "TRIGGER_COMMENT_BODY: ${{ github.event.comment.body }}", action
+        )
+        self.assertNotIn("github.event.comment.body }}\" \\", action)
+
     def test_action_wires_comment_trigger_inputs(self):
         action = Path(pipeline.__file__).with_name("action.yml").read_text(
             encoding="utf-8"

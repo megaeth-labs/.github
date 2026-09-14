@@ -198,18 +198,26 @@ on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
   issue_comment:
-    types: [created]
+    # `edited` matters as much as `created`: an agent that answers review
+    # feedback posts a placeholder the moment it picks the work up and
+    # rewrites that same comment into the real answer minutes later, so the
+    # answer only ever arrives as an edit. Any job that must not re-fire on an
+    # edit (an `@claude` mention job, say) pins `github.event.action ==
+    # 'created'` in its own `if`.
+    types: [created, edited]
 
 jobs:
   pr-review:
     # Any PR comment except the reviewer's own status comment, which is posted
-    # by the CI app and would otherwise retrigger the review. Other bots are
-    # allowed — their comments may answer a question or push back on a finding.
-    # Replace mega-maxwell[bot] with your reviewer app's login.
+    # by the CI app and rewritten in place every round — it would otherwise
+    # retrigger the review on both events. Other bots are allowed — their
+    # comments may answer a question or push back on a finding. Replace
+    # mega-maxwell[bot] with your reviewer app's login.
     if: >-
       github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request != null &&
-       github.event.comment.user.login != 'mega-maxwell[bot]')
+       github.event.comment.user.login != 'mega-maxwell[bot]' &&
+       !contains(github.event.comment.body, 'claude-review:skip'))
     concurrency:
       # issue_comment payloads carry issue.number, not pull_request.number.
       group: claude-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -218,7 +226,11 @@ jobs:
 
 The action gates the round cheaply so routine chatter does not spend a review: on an
 `issue_comment` event, `prepare` skips unless the PR still has an **open question or open
-finding** in the manifest (something a comment could answer, justify, or invalidate). When it
+finding** in the manifest (something a comment could answer, justify, or invalidate). It also
+skips any comment whose body contains `claude-review:skip` — the opt-out marker a bot puts on
+a placeholder it intends to rewrite, so the round lands on the rewrite that carries the
+content rather than on the "working on it" it replaces. The `if` above declines the same
+comment one step earlier, before a runner starts; the action enforces it either way. When it
 does run it is an incremental round that reuses the same sticky-comment manifest — so the
 reviewer keeps its full prior context, unlike a fresh `@claude` session — and it runs on the
 cheaper incremental model tier. If the comment turns out not to change anything, the publisher
