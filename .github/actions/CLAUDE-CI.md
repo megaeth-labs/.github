@@ -159,18 +159,19 @@ jobs:
 Give the `pr-review` job a timeout and a concurrency group:
 
 Consumers should give the `pr-review` job a `timeout-minutes` value of at least `25` plus a
-job-level concurrency group with `cancel-in-progress: true`.
+job-level concurrency group with `cancel-in-progress: false`.
 The publisher revalidates the live PR base and head immediately before each GitHub mutation,
 and review submissions are pinned to the frozen head commit. If either revision changes,
 publication stops without advancing the manifest.
-Latest-only cancellation avoids spending review time on queued, obsolete heads:
+Keeping each code-triggered round avoids cancelling a publisher while it is updating the
+durable review state:
 
 ```yaml
 pr-review:
   timeout-minutes: 25
   concurrency:
-    group: claude-pr-review-${{ github.event.pull_request.number }}
-    cancel-in-progress: true
+    group: claude-pr-review-code-${{ github.event.pull_request.number }}
+    cancel-in-progress: false
 ```
 
 Consumers that already create a GitHub App token can make it the single
@@ -219,8 +220,10 @@ jobs:
        github.event.comment.user.login != 'mega-maxwell[bot]' &&
        !contains(github.event.comment.body, 'claude-review:skip'))
     concurrency:
-      # issue_comment payloads carry issue.number, not pull_request.number.
-      group: claude-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      # Keep code and comment rounds in separate groups so neither kind can
+      # queue behind or cancel the other. issue_comment payloads carry
+      # issue.number, not pull_request.number.
+      group: claude-pr-review-${{ github.event_name == 'issue_comment' && 'comment' || 'code' }}-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: false
 ```
 
