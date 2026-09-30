@@ -262,9 +262,8 @@ runs:
         if ! git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null; then
           gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$checkout" >/dev/null
           echo "created $BRANCH at $checkout"
-        else
-          git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
         fi
+        git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
         git checkout --quiet -B "$BRANCH" "$checkout"
         echo "release_branch=$BRANCH" >> "$GITHUB_OUTPUT"
         echo "candidate PR will target $BRANCH at $checkout"
