@@ -682,9 +682,37 @@ jobs:
           base="$(cat "$RUNNER_TEMP/base")"
           guard 1.1.0 "$base"
           expect_output "base=$base"
+          expect_output "checkout=$base"
           refuse 1.1.0 "origin/main~1" "already exists"
           refuse 1.1.0 "" "already exists"
           echo "the same commit is reused; a different one, and the trunk flow, are refused"
+
+      - name: A hotfix branch that already moved is reused at its tip
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          base="$(cat "$RUNNER_TEMP/base")"
+          git -C "$REPO" checkout --quiet release-v1.1.0
+          git -C "$REPO" commit --quiet --allow-empty -m "fix: already on the release branch"
+          git -C "$REPO" push --quiet origin release-v1.1.0
+          tip="$(git -C "$REPO" rev-parse HEAD)"
+          git -C "$REPO" checkout --quiet main
+          guard 1.1.0 "$base"
+          expect_output "base=$base"
+          expect_output "checkout=$tip"
+          : > "$OUT"
+          ( cd "$REPO" && env \
+              GH_TOKEN=fake \
+              GITHUB_REPOSITORY=megaeth-labs/fake \
+              GITHUB_OUTPUT="$OUT" \
+              BRANCH=release-v1.1.0 \
+              BASE="$base" \
+              CHECKOUT="$tip" \
+              bash "$SH/cut-branch.sh" )
+          expect_output "release_branch=release-v1.1.0"
+          [[ "$(git -C "$REPO" rev-parse HEAD)" == "$tip" ]] \
+            || { echo "HEAD was reset to the base commit, dropping hotfix commits"; exit 1; }
+          echo "propose sits on $tip, not $base"
 
   # The generated parts of every action README (inputs, outputs, steps,
   # errors) and the catalogue come from action.yml; stale docs fail here.

@@ -185,9 +185,11 @@ candidate PR aimed at that branch). It still does not patch an older line
 that a higher tag has already passed.
 
 If an attempt fails after the branch was created — a broken `bump_command`,
-say — re-dispatching the same version and commit reuses the branch, because
-it is still sitting on exactly that commit with nothing merged into it. Any
-other mismatch is refused, and the branch has to be deleted by hand.
+say — re-dispatching the same version and commit reuses the branch. If
+hotfix PRs have already landed on it, propose sits on the tip (it does not
+reset to `base_commit`) and skips the version bump when the version file
+already reads the requested version. A branch that does not contain
+`base_commit` is refused.
 
 ## Installing it in a repository
 

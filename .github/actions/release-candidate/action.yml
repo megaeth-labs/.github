@@ -214,21 +214,32 @@ runs:
           fi
           echo "base commit: $BASE_COMMIT -> $base"
         fi
-        # The release branch must not exist yet. One exception: with an
-        # explicit commit, propose creates that branch before it opens the PR,
-        # so a re-dispatch after a failed attempt finds its own branch still
-        # sitting on the requested commit, with nothing merged into it.
+        # The release branch must not exist yet, except with an explicit
+        # commit: propose creates it, so a re-dispatch may find it still on
+        # that commit, or already ahead with hotfix PRs. Sit on the tip in
+        # that case (do not reset to base_commit). A branch that does not
+        # contain base_commit is someone else's and is refused.
         existing="$(git ls-remote --heads origin "refs/heads/$branch" | cut -f1)"
+        checkout="$base"
         if [[ -n "$existing" ]]; then
-          if [[ -n "$base" && "$existing" == "$base" ]]; then
-            echo "::notice title=Reusing the release branch::$branch already exists at $base, from an earlier attempt at this candidate"
-          else
+          if [[ -z "$base" ]]; then
             echo "::error::branch $branch already exists"; exit 1
+          fi
+          git fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+          if [[ "$existing" == "$base" ]]; then
+            echo "::notice title=Reusing the release branch::$branch already exists at $base, from an earlier attempt at this candidate"
+          elif git merge-base --is-ancestor "$base" "$existing"; then
+            echo "::notice title=Reusing the release branch::$branch already has commits on top of $base; proposing from $existing"
+            checkout="$existing"
+          else
+            echo "::error::branch $branch already exists at $existing, which does not contain base_commit $base"
+            exit 1
           fi
         fi
         {
           echo "base=$base"
           echo "branch=$branch"
+          echo "checkout=$checkout"
         } >> "$GITHUB_OUTPUT"
 
     # With an explicit base commit the candidate PR cannot target the default
@@ -244,15 +255,19 @@ runs:
         GH_TOKEN: ${{ inputs.token }}
         BRANCH: ${{ steps.guard.outputs.branch }}
         BASE: ${{ steps.guard.outputs.base }}
+        CHECKOUT: ${{ steps.guard.outputs.checkout }}
       run: |
         set -euo pipefail
+        checkout="${CHECKOUT:-$BASE}"
         if ! git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null; then
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$BASE" >/dev/null
-          echo "created $BRANCH at $BASE"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$checkout" >/dev/null
+          echo "created $BRANCH at $checkout"
+        else
+          git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
         fi
-        git checkout --quiet -B "$BRANCH" "$BASE"
+        git checkout --quiet -B "$BRANCH" "$checkout"
         echo "release_branch=$BRANCH" >> "$GITHUB_OUTPUT"
-        echo "candidate PR will target $BRANCH"
+        echo "candidate PR will target $BRANCH at $checkout"
 
     - name: Bump version file
       if: inputs.stage == 'propose'
@@ -265,13 +280,21 @@ runs:
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
-        old="$(python3 "$TOOLS" bump-file "$FILE" "$PATTERN" "$VERSION")"
+        old="$(python3 "$TOOLS" read-file "$FILE" "$PATTERN")"
+        if [[ "$old" == "$VERSION" ]]; then
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+          echo "$FILE already $VERSION; skipping bump"
+          exit 0
+        fi
+        python3 "$TOOLS" bump-file "$FILE" "$PATTERN" "$VERSION" >/dev/null
         echo "old=$old" >> "$GITHUB_OUTPUT"
+        echo "skipped=false" >> "$GITHUB_OUTPUT"
         echo "$FILE: $old -> $VERSION"
         git diff --stat
 
     - name: Run bump command
-      if: inputs.stage == 'propose' && inputs.bump_command != ''
+      if: inputs.stage == 'propose' && inputs.bump_command != '' && steps.bump.outputs.skipped != 'true'
       shell: bash
       env:
         OLD_VERSION: ${{ steps.bump.outputs.old }}
@@ -292,7 +315,7 @@ runs:
         git diff --stat
 
     - name: Draft changelog
-      if: inputs.stage == 'propose' && inputs.changelog_file != ''
+      if: inputs.stage == 'propose' && inputs.changelog_file != '' && steps.bump.outputs.skipped != 'true'
       id: changelog
       shell: bash
       env:
