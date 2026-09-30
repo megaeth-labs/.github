@@ -47,8 +47,8 @@ Family: [Release pipeline](../RELEASE.md).
 1. Guard (propose) *(only if `inputs.stage == 'propose'`)*
 1. Cut the release branch at the base commit (propose) *(only if `inputs.stage == 'propose' && inputs.base_commit != ''`)*
 1. Bump version file *(only if `inputs.stage == 'propose'`)*
-1. Run bump command *(only if `inputs.stage == 'propose' && inputs.bump_command != ''`)*
-1. Draft changelog *(only if `inputs.stage == 'propose' && inputs.changelog_file != ''`)*
+1. Run bump command *(only if `inputs.stage == 'propose' && inputs.bump_command != '' && steps.bump.outputs.skipped != 'true'`)*
+1. Draft changelog *(only if `inputs.stage == 'propose' && inputs.changelog_file != '' && steps.bump.outputs.skipped != 'true'`)*
 1. Remove git auth before opening the PR *(only if `inputs.stage == 'propose'`)*
 1. Drop a stale candidate branch *(only if `inputs.stage == 'propose'`)*
 1. Open candidate PR — `peter-evans/create-pull-request` *(only if `inputs.stage == 'propose'`)*
@@ -66,6 +66,7 @@ Family: [Release pipeline](../RELEASE.md).
 - `base_commit $BASE_COMMIT is not a commit in this checkout; check the repository out with fetch-depth: 0`
 - `base_commit $base is not reachable from the default branch ($default); a release must ship code that landed on trunk`
 - `branch $branch already exists`
+- `branch $branch already exists at $existing, which does not contain base_commit $base`
 - `after bump_command, $FILE reads $actual, expected $NEW_VERSION`
 - `cut runs on a merged candidate PR (pull_request closed, merged == true)`
 - `candidate PR #$PR_NUMBER was opened by`
