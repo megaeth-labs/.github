@@ -614,9 +614,19 @@ jobs:
           set -euo pipefail
           source "$SH/helpers.sh"
           refuse 1.1.0 "$(cat "$RUNNER_TEMP/unreachable")" "not reachable from the default branch"
-          refuse 1.1.0 v1.0.0 "not reachable from the default branch"
           refuse 1.1.0 0000000000000000000000000000000000000000 "is not a commit in this checkout"
-          echo "an off-trunk commit, a release tag and nonsense are all refused"
+          echo "an off-trunk commit and nonsense are refused"
+
+      - name: The latest release tag is an allowed base
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          latest="$(git -C "$REPO" rev-parse 'v1.0.0^{commit}')"
+          guard 1.1.0 v1.0.0
+          expect_output "base=$latest"
+          guard 1.1.0 "$latest"
+          expect_output "base=$latest"
+          echo "a hotfix of the current tag starts from that tag"
 
       - name: The rules that were already there still apply
         run: |

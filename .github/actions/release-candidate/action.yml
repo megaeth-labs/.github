@@ -31,8 +31,10 @@ inputs:
     description: >-
       The commit to release, for `propose`, when it must not be the tip of the
       default branch. Any commit-ish the checkout can resolve (a full SHA, a
-      tag, `origin/main~3`), and it must be reachable from the default branch
-      — a release still ships code that went through trunk. Empty (the
+      tag, `origin/main~3`). It must be reachable from the default branch, or
+      sit on the latest `v*` release line (from the merge-base with trunk
+      through that tag), so a hotfix of the current tag works even though
+      settlement left the tag off trunk. Empty (the
       default) is the trunk-first flow: the candidate PR merges into the
       default branch and `cut` creates the release branch at that merge commit.
       Set, `propose` creates the release branch at this commit and opens the
@@ -188,8 +190,27 @@ runs:
             exit 1
           fi
           if ! git merge-base --is-ancestor "$base" "origin/$default"; then
-            echo "::error::base_commit $base is not reachable from the default branch ($default); a release must ship code that landed on trunk"
-            exit 1
+            # Settlement leaves the latest tag off trunk (bump + dated
+            # changelog). A hotfix of that tag is still the current line,
+            # not a random side branch.
+            latest="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+            on_release_line=0
+            if [[ -n "$latest" ]]; then
+              latest_sha="$(git rev-parse --verify --quiet "${latest}^{commit}" || true)"
+              if [[ -n "$latest_sha" ]]; then
+                mb="$(git merge-base "$latest_sha" "origin/$default" || true)"
+                if [[ -n "$mb" ]] \
+                  && git merge-base --is-ancestor "$mb" "$base" \
+                  && git merge-base --is-ancestor "$base" "$latest_sha"; then
+                  on_release_line=1
+                fi
+              fi
+            fi
+            if [[ "$on_release_line" -ne 1 ]]; then
+              echo "::error::base_commit $base is not reachable from the default branch ($default); a release must ship code that landed on trunk"
+              exit 1
+            fi
+            echo "base commit $base is on the latest release line (${latest}), not on $default"
           fi
           echo "base commit: $BASE_COMMIT -> $base"
         fi

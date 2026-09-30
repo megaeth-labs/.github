@@ -148,11 +148,16 @@ gh workflow run release-candidate.yml --ref main \
 ```
 
 The commit may be given as anything the checkout resolves — a full SHA, a
-tag, `origin/main~4` — but it must be reachable from the default branch: a
-release ships code that went through trunk. Note that `v*` release tags are
-not reachable from it, because settlement commits the dated changelog on the
-release branch; to release from an old release line, name a commit on the
-default branch, not its tag.
+tag, `origin/main~4`. It must be reachable from the default branch, **or**
+sit on the latest `v*` release line (from the merge-base with the default
+branch through that tag). Settlement leaves the tag off trunk, so a hotfix
+of the current release is named as that tag (or its peeled SHA), not as a
+commit further down the default branch.
+
+A side branch that never landed on trunk is still refused. So is an older
+release line that a higher `v*` tag has already passed: the version must
+still beat the newest tag, and those commits are outside the latest-line
+window.
 
 Step 1 then works differently, and steps 3 and 4 are unchanged:
 
@@ -174,9 +179,10 @@ Step 1 then works differently, and steps 3 and 4 are unchanged:
   next version must still be newer than `v1.2.3`.
 
 The version must be newer than the newest `v*` tag in the repository, as
-usual, so this releases an earlier commit on the current line. It does not
-patch an older line that a higher tag has already passed; there is no
-backport flow.
+usual. That covers two cases: an earlier commit on the current default
+branch, and a hotfix of the latest tag (new `release-vX.Y.Z` cut there,
+candidate PR aimed at that branch). It still does not patch an older line
+that a higher tag has already passed.
 
 If an attempt fails after the branch was created — a broken `bump_command`,
 say — re-dispatching the same version and commit reuses the branch, because
