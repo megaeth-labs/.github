@@ -292,6 +292,10 @@ diff is read, and a small diff inside a large file spends many more paging throu
 budget tracks files to understand rather than lines changed.
 The retry gets half again as many turns as the first attempt, because exhausting the budget is
 deterministic and replaying it with the same budget cannot succeed.
+The retry is skipped when the first analysis attempt is a provider quota or rate-limit
+failure (Claude 5-hour session limit, HTTP 429). Immediate replay cannot succeed.
+The existing sticky status comment then records the provider's own message and a link to
+the workflow run. The job still fails. No extra PR comment is posted.
 
 Consumers that already create a GitHub App token can opt into the unified identity with:
 
@@ -361,6 +365,9 @@ It carries the reviewed range, an update timestamp, this round's counts, and a r
 questions still awaiting an answer with a link to the review that asked each one.
 It moves through three phases: `🔄 Review in progress` from preparation, then either the
 finished verdict or `🛠️ Review did not finish` for a round that ends without publishing.
+A quota or rate-limit failure puts the provider sentence (for example the session-limit
+reset time) on that sticky comment, with a link to the workflow run, instead of only an
+internal `MODEL_NO_OUTPUT` code.
 Every non-publishing path — a failure, a discarded stale head — retires the in-progress phase
 itself, so the comment never sits at "in progress" after the job ends. A skip-mode round
 publishes nothing and is never announced.

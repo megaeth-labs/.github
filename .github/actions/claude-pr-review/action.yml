@@ -348,10 +348,24 @@ runs:
 
           ${{ inputs.extra_prompt }}
 
+    - name: Classify first analysis attempt
+      id: classify
+      if: steps.prepare.outputs.mode != 'skip'
+      shell: bash
+      env:
+        EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        STATE_DIR: ${{ github.workspace }}/.pr-review
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/review_pipeline.py" classify \
+          --state-dir "$STATE_DIR" \
+          --execution-file "${EXECUTION_FILE:-}"
+
     - name: Retry missing structured review output
       id: review_retry
       if: >-
         steps.prepare.outputs.mode != 'skip' &&
+        steps.classify.outputs.retryable != 'false' &&
         (steps.review.outcome == 'failure' ||
          steps.review.outputs.structured_output == '')
       uses: anthropics/claude-code-action@5ef2e550a465a721f4f45e4a7d3c340c873e1dcc # v1
