@@ -45,7 +45,8 @@ Family: [Claude CI](../CLAUDE-CI.md).
 1. Prepare immutable review context
 1. Compose bounded LLM analysis
 1. Analyze and verify findings — `anthropics/claude-code-action` *(only if `steps.prepare.outputs.mode != 'skip'`)*
-1. Retry missing structured review output — `anthropics/claude-code-action` *(only if `steps.prepare.outputs.mode != 'skip' && (steps.review.outcome == 'failure' || steps.review.outputs.structured_output == '')`)*
+1. Classify first analysis attempt *(only if `steps.prepare.outputs.mode != 'skip'`)*
+1. Retry missing structured review output — `anthropics/claude-code-action` *(only if `steps.prepare.outputs.mode != 'skip' && steps.classify.outputs.retryable != 'false' && (steps.review.outcome == 'failure' || steps.review.outputs.structured_output == '')`)*
 1. Capture analysis session transcript *(only if `always()`)*
 1. Compile and validate review
 1. Publish atomically and persist state

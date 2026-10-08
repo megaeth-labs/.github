@@ -2425,6 +2425,170 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("<summary>Model output (before compilation)</summary>", summary)
         self.assertIn("Reviewed the delta.", summary)
 
+
+
+    def test_action_skips_retry_when_classify_says_not_retryable(self):
+        action = Path(pipeline.__file__).with_name("action.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("id: classify", action)
+        self.assertIn("review_pipeline.py\" classify", action)
+        self.assertIn(
+            "steps.classify.outputs.retryable != 'false'",
+            action,
+        )
+        # Still the same two Claude invocations; classify is local Python.
+        self.assertEqual(action.count("show_full_output: true"), 2)
+
+    def test_classify_session_limit_from_transcript(self):
+        transcript = [
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "result": (
+                    "You've hit your session limit · resets 11:30am (UTC)"
+                ),
+                "errors": [
+                    {
+                        "rate_limit_event": True,
+                        "status": "rejected",
+                        "rateLimitType": "five_hour",
+                        "api_error_status": 429,
+                    }
+                ],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "analysis-transcript.json")
+            path.write_text(json.dumps(transcript), encoding="utf-8")
+            classified = pipeline.classify_model_failure(
+                execution_file=str(path)
+            )
+
+        self.assertEqual(classified["code"], "MODEL_SESSION_LIMIT")
+        self.assertFalse(classified["retryable"])
+        self.assertIn("session limit", classified["message"].lower())
+        self.assertIn("11:30am", classified["message"])
+
+    def test_classify_missing_file_is_retryable(self):
+        classified = pipeline.classify_model_failure(
+            execution_file="/no/such/transcript.json"
+        )
+        self.assertTrue(classified["retryable"])
+        self.assertEqual(classified["code"], "")
+
+    def test_classify_ignores_bare_429_digits(self):
+        classified = pipeline.classify_model_text(
+            "checked line 429 in src/example.py"
+        )
+        self.assertIsNone(classified)
+
+    def test_compile_uses_classified_session_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / "review-input.json").write_text(
+                json.dumps(review_input()),
+                encoding="utf-8",
+            )
+            pipeline.write_model_failure(
+                state,
+                {
+                    "code": "MODEL_SESSION_LIMIT",
+                    "retryable": False,
+                    "message": (
+                        "You've hit your session limit · resets 11:30am (UTC)"
+                    ),
+                    "remediation": "Wait until the quoted reset time.",
+                },
+            )
+            with mock.patch.dict("os.environ", {"REVIEW_STRUCTURED_OUTPUT": ""}):
+                with self.assertRaises(pipeline.PipelineError) as raised:
+                    pipeline.compile_command(
+                        SimpleNamespace(state_dir=str(state))
+                    )
+        self.assertEqual(raised.exception.code, "MODEL_SESSION_LIMIT")
+        self.assertIn("session limit", str(raised.exception))
+
+    def test_failed_status_includes_provider_message_and_run_url(self):
+        payload = {
+            "repository": "megaeth-labs/example",
+            "pull_request": 7,
+            "status_summary": {
+                "scope_text": "head `bbbbbbbb`",
+                "phase": "failed",
+                "reason": (
+                    "MODEL_SESSION_LIMIT: You've hit your session limit "
+                    "· resets 11:30am (UTC)"
+                ),
+                "run_url": (
+                    "https://github.com/megaeth-labs/example/actions/runs/1"
+                ),
+            },
+        }
+        body = pipeline.render_status_body(payload, {"findings": {}})
+        self.assertIn("🛠️ Review did not finish", body)
+        self.assertIn("You've hit your session limit", body)
+        self.assertIn("11:30am", body)
+        self.assertIn(
+            "https://github.com/megaeth-labs/example/actions/runs/1",
+            body,
+        )
+        self.assertNotIn("🔄", body)
+
+    def test_report_quota_failure_rewrites_sticky_not_new_comment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / "review-input.json").write_text(
+                json.dumps(review_input()),
+                encoding="utf-8",
+            )
+            (state / "failure.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "failed",
+                        "phase": "compile",
+                        "code": "MODEL_SESSION_LIMIT",
+                        "message": (
+                            "You've hit your session limit · resets 11:30am (UTC)"
+                        ),
+                        "remediation": "Wait until the quoted reset time.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                pipeline, "set_sticky_phase"
+            ) as phase_mock, mock.patch.object(
+                pipeline, "gh_json"
+            ) as gh_mock, mock.patch.dict(
+                "os.environ",
+                {
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_REPOSITORY": "megaeth-labs/example",
+                    "GITHUB_RUN_ID": "99",
+                    "PREPARE_OUTCOME": "success",
+                    "REVIEW_OUTCOME": "failure",
+                    "REVIEW_RETRY_OUTCOME": "skipped",
+                    "COMPILE_OUTCOME": "failure",
+                    "PUBLISH_OUTCOME": "skipped",
+                },
+                clear=False,
+            ):
+                pipeline.report(SimpleNamespace(state_dir=str(state)))
+
+        gh_mock.assert_not_called()
+        self.assertEqual(phase_mock.call_args.kwargs["phase"], "failed")
+        self.assertIn(
+            "You've hit your session limit",
+            phase_mock.call_args.kwargs["reason"],
+        )
+        self.assertEqual(
+            phase_mock.call_args.kwargs["run_url"],
+            "https://github.com/megaeth-labs/example/actions/runs/99",
+        )
+
     def test_action_uploads_the_review_state_artifact(self):
 
         action = Path(pipeline.__file__).with_name("action.yml").read_text(

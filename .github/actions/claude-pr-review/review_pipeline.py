@@ -78,6 +78,7 @@ GITHUB_LINK_RETRY_DELAY_SECONDS = 1
 FAILURE_FILENAME = "failure.json"
 TRACE_FILENAME = "trace.log"
 MODEL_OUTPUT_FILENAME = "model-output.json"
+MODEL_FAILURE_FILENAME = "model-failure.json"
 TRACE_LIST_LIMIT = 40
 
 DEFAULT_REMEDIATIONS = {
@@ -1133,6 +1134,165 @@ def sync_manifest_threads(
                 finding["thread_resolution"] = "skipped"
             else:
                 finding["thread_resolution"] = "unresolved"
+
+
+
+def workflow_run_url() -> str | None:
+    """Public Actions URL for this job, when the runner exported the usual vars."""
+    server = (os.environ.get("GITHUB_SERVER_URL") or "").rstrip("/")
+    repo = os.environ.get("GITHUB_REPOSITORY") or ""
+    run_id = os.environ.get("GITHUB_RUN_ID") or ""
+    if server and repo and run_id:
+        return f"{server}/{repo}/actions/runs/{run_id}"
+    return None
+
+
+def iter_json_strings(value: Any):
+    """Yield every string in a JSON-like value, depth first."""
+    if isinstance(value, str):
+        if value:
+            yield value
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from iter_json_strings(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from iter_json_strings(item)
+
+
+def load_json_value(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def classify_model_text(text: str) -> dict[str, Any] | None:
+    """Map provider quota / rate-limit prose onto a non-retryable failure.
+
+    Bare HTTP 429 is not enough: SHAs and line numbers contain that digit
+    sequence. Require session-limit or rate-limit wording.
+    """
+    blob = text or ""
+    if not blob.strip():
+        return None
+    sessionish = bool(
+        re.search(r"session limit", blob, re.I)
+        or re.search(r"five[_-]?hour", blob, re.I)
+        or re.search(r"rateLimitType", blob)
+    )
+    rate_limited = bool(
+        sessionish
+        or re.search(r"rate_limit", blob, re.I)
+        or re.search(r"rate limit", blob, re.I)
+    )
+    if not rate_limited:
+        return None
+    match = re.search(
+        r"You've hit your session limit[^\n]*",
+        blob,
+        re.I,
+    )
+    if sessionish:
+        message = (
+            match.group(0).strip()
+            if match
+            else "Claude session limit reached (5-hour quota)."
+        )
+        return {
+            "code": "MODEL_SESSION_LIMIT",
+            "retryable": False,
+            "message": public_text(message, maximum=300),
+            "remediation": (
+                "Wait until the quoted reset time, then rerun the workflow. "
+                "An immediate retry hits the same quota."
+            ),
+        }
+    return {
+        "code": "MODEL_RATE_LIMITED",
+        "retryable": False,
+        "message": "Claude API rate limit (HTTP 429).",
+        "remediation": (
+            "Wait and rerun the workflow. An immediate retry hits the same limit."
+        ),
+    }
+
+
+def classify_model_failure(*, execution_file: str = "") -> dict[str, Any]:
+    """Read the first analysis transcript and decide whether retry can help."""
+    chunks: list[str] = []
+    path = Path(execution_file) if execution_file else None
+    if path is not None and path.is_file():
+        value = load_json_value(path)
+        if value is not None:
+            chunks.extend(iter_json_strings(value))
+        else:
+            try:
+                chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    classified = classify_model_text("\n".join(chunks))
+    if classified is None:
+        return {
+            "retryable": True,
+            "code": "",
+            "message": "",
+            "remediation": "",
+        }
+    return classified
+
+
+def write_model_failure(state_dir: Path, classified: dict[str, Any]) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / MODEL_FAILURE_FILENAME).write_text(
+        json.dumps(classified, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def classify_command(args: argparse.Namespace) -> None:
+    """Classify the first Claude attempt so retry and compile can see quota hits.
+
+    Always exits successfully: a classifier bug must not skip a useful retry
+    by failing the step. Missing transcripts are retryable.
+    """
+    state_dir = Path(args.state_dir)
+    try:
+        classified = classify_model_failure(
+            execution_file=args.execution_file or "",
+        )
+        write_model_failure(state_dir, classified)
+        write_github_output(
+            {
+                "retryable": (
+                    "true" if classified.get("retryable", True) else "false"
+                ),
+                "code": classified.get("code") or "",
+            }
+        )
+        if classified.get("code"):
+            log(
+                f"classified first analysis as {classified['code']} "
+                f"retryable={classified.get('retryable')}: "
+                f"{classified.get('message')}"
+            )
+        else:
+            log("classified first analysis as retryable (no quota signature)")
+    except Exception as error:  # noqa: BLE001 — fail open toward retry
+        log(f"classify failed open toward retry: {error}")
+        fallback = {
+            "retryable": True,
+            "code": "",
+            "message": "",
+            "remediation": "",
+        }
+        try:
+            write_model_failure(state_dir, fallback)
+        except OSError:
+            pass
+        write_github_output({"retryable": "true", "code": ""})
 
 
 def write_github_output(values: dict[str, Any]) -> None:
@@ -2388,6 +2548,16 @@ def compile_command(args: argparse.Namespace) -> None:
     else:
         raw = os.environ.get("REVIEW_STRUCTURED_OUTPUT", "")
         if not raw:
+            classified = read_json_file(state_dir / MODEL_FAILURE_FILENAME) or {}
+            if classified.get("code") and classified.get("retryable") is False:
+                raise PipelineError(
+                    str(
+                        classified.get("message")
+                        or "Claude returned no structured review output"
+                    ),
+                    code=str(classified["code"]),
+                    remediation=classified.get("remediation"),
+                )
             raise PipelineError(
                 "Claude returned no structured review output",
                 code="MODEL_NO_OUTPUT",
@@ -2817,13 +2987,20 @@ def render_status_body(
         )
     elif phase == "failed":
         status_title = "🛠️ Review did not finish"
-        reason = public_text(summary.get("reason"), maximum=200)
+        reason = public_text(summary.get("reason"), maximum=400)
         progress_line = f"Attempted {scope_text} · updated {utc_now()}"
         detail_line = (
             f"This round did not publish{': ' + reason if reason else ''}."
-            " Anything listed below is from the last round that did. Re-run"
-            " the workflow or push a new commit to try again."
+            " Anything listed below is from the last round that did."
         )
+        run_url = str(summary.get("run_url") or "").strip()
+        if run_url:
+            detail_line += f" Workflow run: {run_url}"
+        else:
+            detail_line += (
+                " Re-run the workflow after the limit resets, or push a new"
+                " commit to try again."
+            )
     else:
         if open_findings:
             status_title = f"⚠️ {len(open_findings)} open finding(s)"
@@ -2875,6 +3052,7 @@ def set_sticky_phase(
     scope_text: str,
     phase: str,
     reason: str | None = None,
+    run_url: str | None = None,
 ) -> int | None:
     """Move the sticky status comment to a non-publishing phase.
 
@@ -2890,6 +3068,7 @@ def set_sticky_phase(
             "scope_text": scope_text,
             "phase": phase,
             "reason": reason,
+            "run_url": run_url,
         },
     }
     try:
@@ -3216,7 +3395,12 @@ def report_status_line(
     return "✅ Review completed."
 
 
-def close_out_sticky(state_dir: Path, *, reason: str | None = None) -> None:
+def close_out_sticky(
+    state_dir: Path,
+    *,
+    reason: str | None = None,
+    run_url: str | None = None,
+) -> None:
     """Move an announced-but-unpublished round out of the in-progress phase.
 
     `prepare` announces every round, so any path that ends without publishing
@@ -3237,6 +3421,7 @@ def close_out_sticky(state_dir: Path, *, reason: str | None = None) -> None:
         scope_text=scope_label(review_input),
         phase="failed",
         reason=reason,
+        run_url=run_url,
     )
 
 
@@ -3283,9 +3468,14 @@ def report(args: argparse.Namespace) -> None:
             + details_block("Pipeline trace", read_trace(state_dir))
         )
         write_job_summary(body)
+        reason = diagnostic["message"]
+        code = diagnostic.get("code") or ""
+        if code and code not in reason:
+            reason = f"{code}: {reason}"
         close_out_sticky(
             state_dir,
-            reason=f"{diagnostic['code']} in phase {diagnostic['phase']}",
+            reason=reason,
+            run_url=workflow_run_url(),
         )
         print(
             "Claude PR review: FAILED "
@@ -3566,6 +3756,11 @@ def parser() -> argparse.ArgumentParser:
         default="auto",
     )
     prepare_parser.set_defaults(func=prepare)
+
+    classify_parser = subparsers.add_parser("classify")
+    classify_parser.add_argument("--state-dir", required=True)
+    classify_parser.add_argument("--execution-file", default="")
+    classify_parser.set_defaults(func=classify_command)
 
     compile_parser = subparsers.add_parser("compile")
     compile_parser.add_argument("--state-dir", required=True)
