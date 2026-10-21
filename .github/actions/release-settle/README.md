@@ -45,14 +45,13 @@ Family: [Release pipeline](../RELEASE.md).
 ## What it runs
 
 <!-- generated: steps -->
-1. Configure git auth
+1. Configure git identity
 1. Guard
 1. Compare workflows with the default branch
 1. Authorise the settler (direct mode) *(only if `inputs.settle_mode == 'direct'`)*
 1. Generate release notes
 1. Write changelog and open settle PR *(only if `inputs.settle_mode != 'direct'`)*
 1. Write changelog onto the release branch (direct mode) *(only if `inputs.settle_mode == 'direct'`)*
-1. Remove git auth *(only if `always()`)*
 1. Tag and publish (direct mode) — `megaeth-labs/.github/.github/actions/release-publish` *(only if `inputs.settle_mode == 'direct'`)*
 <!-- /generated -->
 

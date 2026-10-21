@@ -15,6 +15,7 @@ Family: [Release pipeline](../RELEASE.md).
 |---|---|---|---|
 | `stage` | yes |  | `propose` (on workflow_dispatch) or `cut` (on the candidate PR merging). |
 | `token` | yes |  | Token that authors the PR and creates the branch. Must be a GitHub App installation token (e.g. the Maxwell app) so the PR triggers CI; the job's GITHUB_TOKEN does not. |
+| `dependency_token` | no |  | Optional read-only token for bump_command's private dependencies; defaults to token. |
 | `version` | no |  | Version to release, X.Y.Z or vX.Y.Z. Required for `propose`. |
 | `base_commit` | no |  | The commit to release, for `propose`, when it must not be the tip of the default branch. Any commit-ish the checkout can resolve (a full SHA, a tag, `origin/main~3`). It must be reachable from the default branch, or sit on the latest `v*` release line (from the merge-base with trunk through that tag), so a hotfix of the current tag works even though settlement left the tag off trunk. Empty (the default) is the trunk-first flow: the candidate PR merges into the default branch and `cut` creates the release branch at that merge commit. Set, `propose` creates the release branch at this commit and opens the candidate PR against that branch, because merging it into the default branch would take the commits this release is leaving out; the default branch is then untouched and `cut` never runs. The version must still be newer than the newest `v*` tag in the repository. |
 | `version_file` | yes |  | File holding the version (VERSION, Cargo.toml, pyproject.toml, package.json). |
@@ -43,17 +44,15 @@ Family: [Release pipeline](../RELEASE.md).
 
 <!-- generated: steps -->
 1. Resolve version
-1. Configure git auth
+1. Configure git identity
 1. Guard (propose) *(only if `inputs.stage == 'propose'`)*
 1. Cut the release branch at the base commit (propose) *(only if `inputs.stage == 'propose' && inputs.base_commit != ''`)*
 1. Bump version file *(only if `inputs.stage == 'propose'`)*
 1. Run bump command *(only if `inputs.stage == 'propose' && inputs.bump_command != '' && steps.bump.outputs.skipped != 'true'`)*
 1. Draft changelog *(only if `inputs.stage == 'propose' && inputs.changelog_file != '' && steps.bump.outputs.skipped != 'true'`)*
-1. Remove git auth before opening the PR *(only if `inputs.stage == 'propose'`)*
 1. Drop a stale candidate branch *(only if `inputs.stage == 'propose'`)*
 1. Open candidate PR — `peter-evans/create-pull-request` *(only if `inputs.stage == 'propose'`)*
 1. Cut release branch *(only if `inputs.stage == 'cut'`)*
-1. Remove git auth *(only if `always()`)*
 <!-- /generated -->
 
 ## Errors it reports

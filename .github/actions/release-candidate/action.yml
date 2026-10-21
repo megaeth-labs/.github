@@ -23,6 +23,10 @@ inputs:
       installation token (e.g. the Maxwell app) so the PR triggers CI; the
       job's GITHUB_TOKEN does not.
     required: true
+  dependency_token:
+    description: Optional read-only token for bump_command's private dependencies; defaults to token.
+    required: false
+    default: ""
   version:
     description: "Version to release, X.Y.Z or vX.Y.Z. Required for `propose`."
     required: false
@@ -129,26 +133,14 @@ runs:
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "release version: $version"
 
-    - name: Configure git auth
+    - name: Configure git identity
       shell: bash
       env:
-        TOKEN: ${{ inputs.token }}
         NAME: ${{ inputs.git_user_name }}
         EMAIL: ${{ inputs.git_user_email }}
       run: |
-        set -euo pipefail
         git config user.name "$NAME"
         git config user.email "$EMAIL"
-        # Same mechanism actions/checkout uses, scoped to this clone and
-        # removed in the last step. Drop any header a persisted checkout left
-        # behind first: git sends every configured extraheader, and two
-        # Authorization headers get a 400.
-        git config --unset-all "http.https://github.com/.extraheader" || true
-        auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
-        # The token itself is masked by create-github-app-token; its base64
-        # form is not, so mask it too before it can reach a log.
-        echo "::add-mask::$auth"
-        git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $auth"
 
     # ---------------------------------------------------------------- propose
     - name: Guard (propose)
@@ -156,12 +148,15 @@ runs:
       id: guard
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ inputs.token }}
         VERSION: ${{ steps.version.outputs.version }}
         PREFIX: ${{ inputs.release_branch_prefix }}
         BASE_COMMIT: ${{ inputs.base_commit }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         default="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)"
         if [[ "$GITHUB_REF_NAME" != "$default" ]]; then
@@ -241,22 +236,27 @@ runs:
           echo "branch=$branch"
           echo "checkout=$checkout"
         } >> "$GITHUB_OUTPUT"
+        GITHUB_AUTH_COMMAND
 
     # With an explicit base commit the candidate PR cannot target the default
     # branch: merging it there would take the commits this release is
     # deliberately leaving out. So the release branch is cut here instead of at
     # `cut`, and the PR targets it. Checking it out also means the bump and the
     # changelog below are drafted over what this release contains.
+
     - name: Cut the release branch at the base commit (propose)
       if: inputs.stage == 'propose' && inputs.base_commit != ''
       id: branch
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ inputs.token }}
         BRANCH: ${{ steps.guard.outputs.branch }}
         BASE: ${{ steps.guard.outputs.base }}
         CHECKOUT: ${{ steps.guard.outputs.checkout }}
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         checkout="${CHECKOUT:-$BASE}"
         if ! git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null; then
@@ -267,6 +267,7 @@ runs:
         git checkout --quiet -B "$BRANCH" "$checkout"
         echo "release_branch=$BRANCH" >> "$GITHUB_OUTPUT"
         echo "candidate PR will target $BRANCH at $checkout"
+        GITHUB_AUTH_COMMAND
 
     - name: Bump version file
       if: inputs.stage == 'propose'
@@ -296,6 +297,8 @@ runs:
       if: inputs.stage == 'propose' && inputs.bump_command != '' && steps.bump.outputs.skipped != 'true'
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.dependency_token || inputs.token }}
         OLD_VERSION: ${{ steps.bump.outputs.old }}
         NEW_VERSION: ${{ steps.version.outputs.version }}
         BUMP_COMMAND: ${{ inputs.bump_command }}
@@ -303,6 +306,7 @@ runs:
         PATTERN: ${{ inputs.version_pattern }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         echo "bump command: $BUMP_COMMAND"
         bash -euo pipefail -c "$BUMP_COMMAND"
@@ -312,6 +316,7 @@ runs:
           echo "::error::after bump_command, $FILE reads $actual, expected $NEW_VERSION"; exit 1
         fi
         git diff --stat
+        GITHUB_AUTH_COMMAND
 
     - name: Draft changelog
       if: inputs.stage == 'propose' && inputs.changelog_file != '' && steps.bump.outputs.skipped != 'true'
@@ -346,20 +351,16 @@ runs:
         echo "changelog: previous entry ${latest:-<none>} $synced; v$VERSION entry $drafted"
         git diff --stat
 
-    # create-pull-request authenticates its own push with the token input;
-    # hand it a clone without our header so the two never overlap.
-    - name: Remove git auth before opening the PR
-      if: inputs.stage == 'propose'
-      shell: bash
-      run: git config --unset-all "http.https://github.com/.extraheader" || true
-
     - name: Drop a stale candidate branch
       if: inputs.stage == 'propose'
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ inputs.token }}
         VERSION: ${{ steps.version.outputs.version }}
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         head="chore/release-candidate-$VERSION"
         # A previous candidate for this version whose PR is closed/merged may
@@ -375,6 +376,7 @@ runs:
             echo "$head has an open PR; it will be updated"
           fi
         fi
+        GITHUB_AUTH_COMMAND
 
     - name: Open candidate PR
       if: inputs.stage == 'propose'
@@ -410,6 +412,8 @@ runs:
       id: cut
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ inputs.token }}
         VERSION: ${{ steps.version.outputs.version }}
         PREFIX: ${{ inputs.release_branch_prefix }}
@@ -423,6 +427,7 @@ runs:
         EXPECTED_AUTHOR: ${{ inputs.pr_author }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         if [[ "$MERGED" != "true" || -z "$MERGE_SHA" ]]; then
           echo "::error::cut runs on a merged candidate PR (pull_request closed, merged == true)"; exit 1
@@ -450,8 +455,4 @@ runs:
         gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$MERGE_SHA" >/dev/null
         echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
         echo "created $branch at $MERGE_SHA"
-
-    - name: Remove git auth
-      if: always()
-      shell: bash
-      run: git config --unset-all "http.https://github.com/.extraheader" || true
+        GITHUB_AUTH_COMMAND

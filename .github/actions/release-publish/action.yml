@@ -78,31 +78,21 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Configure git auth
+    - name: Configure git identity
       shell: bash
       env:
-        TOKEN: ${{ inputs.token }}
         NAME: ${{ inputs.git_user_name }}
         EMAIL: ${{ inputs.git_user_email }}
       run: |
-        set -euo pipefail
         git config user.name "$NAME"
         git config user.email "$EMAIL"
-        # Same mechanism actions/checkout uses, scoped to this clone and
-        # removed in the last step. Drop any header a persisted checkout left
-        # behind first: git sends every configured extraheader, and two
-        # Authorization headers get a 400.
-        git config --unset-all "http.https://github.com/.extraheader" || true
-        auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
-        # The token itself is masked by create-github-app-token; its base64
-        # form is not, so mask it too before it can reach a log.
-        echo "::add-mask::$auth"
-        git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $auth"
 
     - name: Guard
       id: guard
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         MERGED: ${{ github.event.pull_request.merged }}
         HEAD_REF: ${{ github.event.pull_request.head.ref }}
         BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -119,6 +109,7 @@ runs:
         CHANGELOG: ${{ inputs.changelog_file }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         if [[ -n "$EXPLICIT_COMMIT" ]]; then
           # Explicit-commit mode: release-settle (direct) made this commit a
@@ -174,20 +165,25 @@ runs:
           echo "notes_file=$notes"
         } >> "$GITHUB_OUTPUT"
         echo "publishing v$version at $MERGE_SHA"; echo "--- notes ---"; cat "$notes"
+        GITHUB_AUTH_COMMAND
 
     - name: Create and push tag
       id: tag
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         VERSION: ${{ steps.guard.outputs.version }}
         MERGE_SHA: ${{ steps.guard.outputs.merge_sha }}
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         tag="v$VERSION"
         git tag -a "$tag" "$MERGE_SHA" -m "Release $tag"
         git push --quiet origin "refs/tags/$tag"
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
         echo "tagged $MERGE_SHA as $tag"
+        GITHUB_AUTH_COMMAND
 
     - name: Publish GitHub Release
       id: release
@@ -201,8 +197,3 @@ runs:
         url="$(gh release create "$TAG" --verify-tag --latest --title "$TAG" --notes-file "$NOTES")"
         echo "url=$url" >> "$GITHUB_OUTPUT"
         echo "release: $url"
-
-    - name: Remove git auth
-      if: always()
-      shell: bash
-      run: git config --unset-all "http.https://github.com/.extraheader" || true

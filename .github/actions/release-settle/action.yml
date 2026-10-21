@@ -104,31 +104,21 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Configure git auth
+    - name: Configure git identity
       shell: bash
       env:
-        TOKEN: ${{ inputs.token }}
         NAME: ${{ inputs.git_user_name }}
         EMAIL: ${{ inputs.git_user_email }}
       run: |
-        set -euo pipefail
         git config user.name "$NAME"
         git config user.email "$EMAIL"
-        # Same mechanism actions/checkout uses, scoped to this clone and
-        # removed in the last step. Drop any header a persisted checkout left
-        # behind first: git sends every configured extraheader, and two
-        # Authorization headers get a 400.
-        git config --unset-all "http.https://github.com/.extraheader" || true
-        auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
-        # The token itself is masked by create-github-app-token; its base64
-        # form is not, so mask it too before it can reach a log.
-        echo "::add-mask::$auth"
-        git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $auth"
 
     - name: Guard
       id: guard
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         INPUT_VERSION: ${{ inputs.version }}
         COMMIT: ${{ inputs.commit }}
         BRANCH_IN: ${{ inputs.release_branch }}
@@ -137,6 +127,7 @@ runs:
         PATTERN: ${{ inputs.version_pattern }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         version="$(python3 "$TOOLS" normalize "$INPUT_VERSION")"
         branch="${BRANCH_IN:-${PREFIX}${version}}"
@@ -166,14 +157,18 @@ runs:
           echo "previous_tag=$latest"
         } >> "$GITHUB_OUTPUT"
         echo "settling v$version at $COMMIT on $branch (previous tag: ${latest:-<none>})"
+        GITHUB_AUTH_COMMAND
 
     - name: Compare workflows with the default branch
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         COMMIT: ${{ inputs.commit }}
         BRANCH: ${{ steps.guard.outputs.branch }}
         DEFAULT: ${{ github.event.repository.default_branch }}
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         # A `release: published` workflow runs from the tagged commit's tree,
         # not from the default branch, and so does release-publish (it runs on
@@ -191,6 +186,7 @@ runs:
         else
           echo "every workflow on $DEFAULT is present at $COMMIT"
         fi
+        GITHUB_AUTH_COMMAND
 
     - name: Authorise the settler (direct mode)
       if: inputs.settle_mode == 'direct'
@@ -246,6 +242,8 @@ runs:
       id: pr
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         GH_TOKEN: ${{ inputs.token }}
         VERSION: ${{ steps.guard.outputs.version }}
         BRANCH: ${{ steps.guard.outputs.branch }}
@@ -255,6 +253,7 @@ runs:
         PR_LABELS: ${{ inputs.pr_labels }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         head="chore/release-settle-v$VERSION"
         label_args=()
@@ -297,12 +296,15 @@ runs:
         url="$(gh pr create --base "$BRANCH" --head "$head" --title "chore(release): settle v$VERSION" --body-file "$body" "${label_args[@]}")"
         echo "pr_url=$url" >> "$GITHUB_OUTPUT"
         echo "settle PR: $url"
+        GITHUB_AUTH_COMMAND
 
     - name: Write changelog onto the release branch (direct mode)
       if: inputs.settle_mode == 'direct'
       id: direct
       shell: bash
       env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         VERSION: ${{ steps.guard.outputs.version }}
         BRANCH: ${{ steps.guard.outputs.branch }}
         COMMIT: ${{ inputs.commit }}
@@ -310,6 +312,7 @@ runs:
         NOTES: ${{ steps.notes.outputs.notes_file }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         git checkout --quiet -B "$BRANCH" "$COMMIT"
         what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
@@ -325,11 +328,7 @@ runs:
         fi
         echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
         echo "settle commit $(git rev-parse --short HEAD) pushed to $BRANCH"
-
-    - name: Remove git auth
-      if: always()
-      shell: bash
-      run: git config --unset-all "http.https://github.com/.extraheader" || true
+        GITHUB_AUTH_COMMAND
 
     - name: Tag and publish (direct mode)
       if: inputs.settle_mode == 'direct'

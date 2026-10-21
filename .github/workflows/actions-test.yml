@@ -10,6 +10,17 @@ on:
     branches: [main]
 
 jobs:
+  git-auth:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Exercise Git HTTPS authentication without credential files
+        run: python3 .github/actions/git-auth/test_git_auth.py
+
   test:
     runs-on: ubuntu-24.04
     permissions:
@@ -454,6 +465,8 @@ jobs:
     env:
       TOOLS: ${{ github.workspace }}/.github/actions/release-tools/release_tools.py
       ACTION: ${{ github.workspace }}/.github/actions/release-candidate/action.yml
+      AUTH_WRAPPER: ${{ github.workspace }}/.github/actions/git-auth/with-github-auth.sh
+      GITHUB_AUTH_TOKEN: fixture-token
     steps:
       - uses: actions/checkout@v4
         with:
