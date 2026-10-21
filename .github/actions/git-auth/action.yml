@@ -1,0 +1,40 @@
+name: Git Auth
+description: >-
+  Run a command with GitHub HTTPS authentication through GIT_ASKPASS. The token
+  is passed only through the command environment, never a Git URL or config file.
+  Supports GitHub App installation tokens and PATs. Commands must be trusted:
+  their child processes can read the token. Runner-level Git configuration is
+  ignored and credential helpers are disabled for this command.
+inputs:
+  token:
+    description: GitHub token, scoped to the repositories and permissions the command needs.
+    required: true
+  command:
+    description: Trusted shell commands to execute with GitHub HTTPS authentication.
+    required: true
+  working-directory:
+    description: Directory in which the command runs.
+    required: false
+    default: .
+runs:
+  using: composite
+  steps:
+    - name: Run with GitHub auth
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
+        COMMAND: ${{ inputs.command }}
+        AUTH_WRAPPER: ${{ github.action_path }}/with-github-auth.sh
+      run: |
+        echo "wrapper=$AUTH_WRAPPER" >> "$GITHUB_OUTPUT"
+        echo "askpass=$(dirname "$AUTH_WRAPPER")/askpass.sh" >> "$GITHUB_OUTPUT"
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail -c "$COMMAND"
+      id: run
+outputs:
+  wrapper:
+    description: Path to the credential-free command wrapper in this pinned action version.
+    value: ${{ steps.run.outputs.wrapper }}
+  askpass:
+    description: Path to the credential-free Git askpass program.
+    value: ${{ steps.run.outputs.askpass }}

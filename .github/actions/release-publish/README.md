@@ -38,11 +38,10 @@ Family: [Release pipeline](../RELEASE.md).
 ## What it runs
 
 <!-- generated: steps -->
-1. Configure git auth
+1. Configure git identity
 1. Guard
 1. Create and push tag
 1. Publish GitHub Release
-1. Remove git auth *(only if `always()`)*
 <!-- /generated -->
 
 ## Errors it reports
