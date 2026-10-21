@@ -14,7 +14,7 @@ Family: [Claude CI](../CLAUDE-CI.md).
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `claude_code_oauth_token` | yes |  | OAuth token for Claude Code. |
-| `github_identity_token` | no |  | Optional GitHub token used for review publication and state updates. When supplied, it is also used to resolve addressed automated review threads. Empty uses the job token and skips thread resolution. |
+| `github_identity_token` | no |  | Optional GitHub token used for review publication and state updates. When supplied, it also authenticates model analysis and resolves addressed automated review threads. Empty uses OIDC for model analysis and the job token for publication, and skips thread resolution. |
 | `allowed_bots` | no | `mega-putin` | Bot accounts allowed to trigger Claude Code. |
 | `extra_allowed_tools` | no |  | Additional read-only tools to append to the canonical allowedTools list. |
 | `extra_prompt` | no |  | Additional analysis instructions appended after the canonical prompt. |
