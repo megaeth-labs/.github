@@ -65,3 +65,8 @@ Family: [Release pipeline](../RELEASE.md).
 ## Notes
 
 The calling job needs `contents: read` and `pull-requests: read`.
+
+A push to a `release_branch_prefix` branch whose suffix is not `X.Y.Z` (for
+example `release-vnext`) routes to `skip` with a reason naming the branch; a
+manual dispatch leaves such branches out of `targets`. Input the route cannot
+read fails the step with a `Release route` error annotation.

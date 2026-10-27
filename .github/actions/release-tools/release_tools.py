@@ -79,13 +79,38 @@ def is_greater(version: str, latest: str) -> bool:
 # --- release routing --------------------------------------------------------
 
 
+def _field(data: dict, key: str, default):
+    """Return data[key], treating absent and JSON null alike; reject other types."""
+    value = data.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, type(default)):
+        raise ValueError(f"route field {key!r} must be {type(default).__name__}, got {value!r}")
+    return value
+
+
+def _items(data: dict, key: str) -> list[dict]:
+    items = _field(data, key, [])
+    if not all(isinstance(item, dict) for item in items):
+        raise ValueError(f"route field {key!r} must be a list of objects")
+    return items
+
+
+def _branch_version(branch: str, prefix: str) -> str | None:
+    """X.Y.Z for a release branch, None when the suffix is not a version."""
+    try:
+        return normalize_version(branch[len(prefix):])
+    except ValueError:
+        return None
+
+
 def route(data: dict) -> dict:
     """Decide the next release action from an already collected snapshot."""
     if not isinstance(data, dict):
         raise ValueError("route input must be a JSON object")
-    kind, event, ref = (data.get(key, "") for key in ("kind", "event", "ref_name"))
-    prefix = data.get("prefix", "release-v")
-    sha = data.get("sha", "")
+    kind, event, ref = (_field(data, key, "") for key in ("kind", "event", "ref_name"))
+    prefix = _field(data, "prefix", "release-v")
+    sha = _field(data, "sha", "")
     result = {
         "action": "skip",
         "reason": f"no route for kind={kind}, event={event}, ref={ref}",
@@ -102,18 +127,23 @@ def route(data: dict) -> dict:
         candidate = kind == "candidate"
         head_prefix = "chore/release-candidate-"
         if not candidate:
-            version = normalize_version(ref[len(prefix):])
+            version = _branch_version(ref, prefix)
+            if version is None:
+                result["reason"] = (
+                    f"{ref} is not a release branch: {ref[len(prefix):]!r} after {prefix!r} is not X.Y.Z"
+                )
+                return result
             result.update(version=version, release_branch=ref, commit=sha)
             if data.get("tag_exists") and data.get("release_exists"):
                 result["reason"] = f"v{version} is already published"
                 return result
         pr = next((
-            pr for pr in data.get("pulls", [])
+            pr for pr in _items(data, "pulls")
             if pr.get("merged_at") and pr.get("merge_commit_sha") == sha
-            and pr.get("base", {}).get("ref") == ref
+            and (pr.get("base") or {}).get("ref") == ref
             and (
-                pr.get("head", {}).get("ref", "").startswith(head_prefix)
-                if candidate else pr.get("head", {}).get("ref") == f"chore/release-settle-v{version}"
+                str((pr.get("head") or {}).get("ref") or "").startswith(head_prefix)
+                if candidate else (pr.get("head") or {}).get("ref") == f"chore/release-settle-v{version}"
             )
         ), None)
         fresh = False
@@ -125,8 +155,8 @@ def route(data: dict) -> dict:
             )
             marker = match.group(1) if match else None
             fresh = marker is not None and marker == data.get("first_parent")
-        author = pr.get("user", {}).get("login") if pr else None
-        expected_author = data.get("pr_author", "mega-gutenberg[bot]")
+        author = (pr.get("user") or {}).get("login") if pr else None
+        expected_author = _field(data, "pr_author", "mega-gutenberg[bot]")
         if not candidate and data.get("tag_exists") and not (
             fresh and author == expected_author
         ):
@@ -151,9 +181,10 @@ def route(data: dict) -> dict:
             if fresh:
                 result.update(action="publish", reason=f"merged fresh settle PR #{pr['number']}")
                 return result
+            settled = f"settled {marker}" if marker else "no release-settle marker"
             result["reason"] = (
-                f"merged settle PR #{pr['number']} was stale (settled {marker}, "
-                f"tip was {data.get('first_parent')}); a fresh settle PR follows"
+                f"merged settle PR #{pr['number']} was stale ({settled}, "
+                f"tip was {data.get('first_parent') or 'unknown'}); a fresh settle PR follows"
             )
         elif candidate:
             result["reason"] = "no merged candidate PR matches this push"
@@ -161,7 +192,7 @@ def route(data: dict) -> dict:
         elif data.get("version_at_sha") != version:
             result["reason"] = "the candidate has not landed on this branch yet"
             return result
-        elif not is_greater(version, data.get("latest_tag", "")):
+        elif not is_greater(version, _field(data, "latest_tag", "")):
             result["reason"] = f"v{version} is not greater than latest tag {data.get('latest_tag')}"
             return result
         else:
@@ -170,17 +201,20 @@ def route(data: dict) -> dict:
             {"version": version, "release_branch": ref, "commit": sha},
         ])
     elif kind == "settle" and event == "workflow_dispatch":
-        selected = data.get("dispatch_version", "")
+        selected = _field(data, "dispatch_version", "")
         selected = normalize_version(selected) if selected else ""
-        for branch in data.get("branches", []):
-            if not branch["name"].startswith(prefix) or branch["tag_exists"]:
+        for branch in _items(data, "branches"):
+            name = branch.get("name")
+            if not isinstance(name, str) or not name.startswith(prefix) or branch.get("tag_exists"):
                 continue
-            version = normalize_version(branch["name"][len(prefix):])
-            if (branch["version_at_tip"] == version
-                    and is_greater(version, data.get("latest_tag", ""))
+            version = _branch_version(name, prefix)
+            if version is None:
+                continue
+            if (branch.get("version_at_tip") == version
+                    and is_greater(version, _field(data, "latest_tag", ""))
                     and (not selected or version == selected)):
                 result["targets"].append({
-                    "version": version, "release_branch": branch["name"], "commit": branch["tip"],
+                    "version": version, "release_branch": name, "commit": branch.get("tip") or "",
                 })
         result.update(
             action="refresh" if result["targets"] else "skip",
@@ -417,7 +451,7 @@ def main(argv: list[str]) -> int:
                 print(f"no section for v{normalize_version(a.version)} in {a.path}", file=sys.stderr)
                 return 1
             print(body, end="")
-    except (ValueError, OSError) as e:
+    except (ValueError, OSError, TypeError, KeyError, AttributeError) as e:
         print(f"release_tools: {e}", file=sys.stderr)
         return 1
     return 0

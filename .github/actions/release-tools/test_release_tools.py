@@ -124,6 +124,7 @@ class Route(unittest.TestCase):
                 data["pulls"][0]["body"] = body
                 result = self.decision(data, "refresh")
                 self.assertIn("was stale", result["reason"])
+                self.assertNotIn("None", result["reason"])
 
     def test_tag_and_release_exist_skips_before_pr_checks(self):
         data = self.fixture()
@@ -251,6 +252,53 @@ class Route(unittest.TestCase):
                 result = self.decision(data, "skip")
                 for value in (kind, event, ref):
                     self.assertIn(value, result["reason"])
+
+    def test_unparsable_release_branch_push_skips_naming_branch(self):
+        for ref in ("release-vnext", "release-v1.2", "release-v"):
+            with self.subTest(ref=ref):
+                data = self.fixture()
+                data.update(ref_name=ref, version_at_sha=None)
+                result = self.decision(data, "skip")
+                self.assertIn(ref, result["reason"])
+                self.assertEqual(result["version"], "")
+
+    def test_dispatch_ignores_unparsable_release_branch(self):
+        data = self.dispatch_fixture()
+        data["branches"].insert(0, {
+            "name": "release-vnext", "tip": self.PARENT, "version_at_tip": None, "tag_exists": False,
+        })
+        result = self.decision(data, "refresh")
+        self.assertEqual([t["release_branch"] for t in result["targets"]], ["release-v1.2.0"])
+
+    def test_null_fields_behave_like_absent(self):
+        data = self.fixture()
+        data.update(pulls=None, latest_tag=None, prefix=None, pr_author=None, first_parent=None)
+        self.assertEqual(self.decision(data, "refresh")["targets"][0]["release_branch"], "release-v1.2.0")
+        data = self.dispatch_fixture()
+        data.update(latest_tag=None, dispatch_version=None)
+        self.decision(data, "refresh")
+        data.update(branches=None)
+        self.decision(data, "skip")
+        for key in ("ref_name", "kind", "event"):
+            with self.subTest(key=key):
+                data = self.fixture()
+                data[key] = None
+                self.decision(data, "skip")
+
+    def test_route_cli_rejects_wrong_types_without_traceback(self):
+        for data in (
+            {"kind": "settle", "event": "push", "ref_name": 7},
+            {**self.fixture(), "pulls": {"number": 1}},
+            {**self.fixture(), "pulls": ["x"]},
+            {**self.dispatch_fixture(), "branches": [None]},
+        ):
+            with self.subTest(data=data):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch("sys.stdin", io.StringIO(json.dumps(data))), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    self.assertEqual(rt.main(["route"]), 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertTrue(stderr.getvalue().startswith("release_tools: "))
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
 
     def test_route_cli_json_and_invalid_input(self):
         for raw, code in ((json.dumps(self.fixture()), 0), ("not json", 1), ("[]", 1)):

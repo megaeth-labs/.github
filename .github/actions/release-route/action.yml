@@ -102,8 +102,9 @@ runs:
           pulls="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" |
             jq -ces 'if all(.[]; type == "array") then add else error("pulls API must return arrays") end')"
           actual="$(read_version "$GITHUB_SHA" 2>/dev/null || true)"
-          if [[ "$KIND" == settle && "$GITHUB_REF_NAME" == "$PREFIX"* ]]; then
-            version="$(python3 "$TOOLS" normalize "${GITHUB_REF_NAME#"$PREFIX"}")"
+          # route skips and names a prefix branch whose suffix is not X.Y.Z.
+          if [[ "$KIND" == settle && "$GITHUB_REF_NAME" == "$PREFIX"* ]] &&
+              version="$(python3 "$TOOLS" normalize "${GITHUB_REF_NAME#"$PREFIX"}" 2>/dev/null)"; then
             tag="v$version"
             if has_tag "$tag"; then
               tag_exists=true
@@ -128,7 +129,9 @@ runs:
           while read -r tip ref; do
             [[ -n "$tip" ]] || continue
             branch="${ref#refs/heads/}"
-            version="$(python3 "$TOOLS" normalize "${branch#"$PREFIX"}")"
+            if ! version="$(python3 "$TOOLS" normalize "${branch#"$PREFIX"}" 2>/dev/null)"; then
+              echo "::notice title=Release route::skipping $branch: not $PREFIX<X.Y.Z>"; continue
+            fi
             git fetch --quiet origin "$tip"
             actual="$(read_version "$tip" 2>/dev/null || true)"
             tagged=false
@@ -138,7 +141,7 @@ runs:
               '. + [{name: $name, tip: $tip, version_at_tip: (if $actual == "" then null else $actual end), tag_exists: $tagged}]' <<< "$branches")"
           done <<< "$heads"
         fi
-        decision="$(jq -n --arg kind "$KIND" --arg event "$GITHUB_EVENT_NAME" \
+        if ! decision="$(jq -n --arg kind "$KIND" --arg event "$GITHUB_EVENT_NAME" \
           --arg sha "$GITHUB_SHA" --arg first_parent "$parent" --arg ref_name "$GITHUB_REF_NAME" \
           --arg default_branch "$default" --arg prefix "$PREFIX" --arg pr_author "$EXPECTED_AUTHOR" \
           --arg version_at_sha "$actual" --arg latest_tag "$latest" --arg dispatch_version "$DISPATCH_VERSION" \
@@ -150,7 +153,10 @@ runs:
             latest_tag: $latest_tag, dispatch_version: $dispatch_version,
             tag_commit: (if $tag_commit == "" then null else $tag_commit end),
             pulls: $pulls, branches: $branches, tag_exists: $tag_exists, release_exists: $release_exists}' |
-          python3 "$TOOLS" route)"
+          python3 "$TOOLS" route)"; then
+          echo "::error title=Release route::cannot route $KIND $GITHUB_EVENT_NAME on $GITHUB_REF_NAME; see the release_tools error above"
+          exit 1
+        fi
         # Multiline output framing also keeps API-supplied reasons from becoming output keys.
         while read -r key; do
           delimiter="route_$(openssl rand -hex 16)"
