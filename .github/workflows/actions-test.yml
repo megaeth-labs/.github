@@ -1812,7 +1812,10 @@ jobs:
       AUTH_WRAPPER: ${{ github.workspace }}/.github/actions/git-auth/with-github-auth.sh
       GITHUB_AUTH_TOKEN: fixture-token
       GH_TOKEN: fixture-token
-      GITHUB_REPOSITORY: megaeth-labs/fake
+      # GitHub ignores env: for its default GITHUB_* variables, so the runner's
+      # real GITHUB_REPOSITORY would reach the scripts; every invocation below
+      # passes this one explicitly instead.
+      FAKE_REPOSITORY: megaeth-labs/fake
       EXPECTED_AUTHOR: mega-gutenberg[bot]
       PREFIX: release-v
       FILE: VERSION
@@ -1853,8 +1856,8 @@ jobs:
           cat > "$SH/helpers.sh" <<'SH'
           route() { # <kind> <ref> <sha> [event]
             : > "$OUT"
-            ( cd "$REPO" && env KIND="$1" GITHUB_REF_NAME="$2" GITHUB_SHA="$3" \
-                GITHUB_EVENT_NAME="${4:-push}" GITHUB_OUTPUT="$OUT" bash "$SH/route.sh" )
+            ( cd "$REPO" && env KIND="$1" GITHUB_REPOSITORY="$FAKE_REPOSITORY" GITHUB_REF_NAME="$2" \
+                GITHUB_SHA="$3" GITHUB_EVENT_NAME="${4:-push}" GITHUB_OUTPUT="$OUT" bash "$SH/route.sh" )
           }
           out_get() {
             python3 - "$OUT" "$1" <<'PY'
@@ -1897,11 +1900,14 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
           [[ "$GH_TOKEN" == fixture-token ]]
+          # Calls without a repo argument resolve it from the checkout's remote.
+          [[ -z "${GH_REPO:-}" && "$(git config --get remote.origin.url)" == "https://github.com/$FAKE_REPOSITORY.git" ]] \
+            || { echo "gh would resolve a repository other than $FAKE_REPOSITORY" >&2; exit 98; }
           case "$*" in
-            "repo view "*) echo main ;;
-            api*"/commits/"*"/pulls")
+            "repo view $FAKE_REPOSITORY "*) echo main ;;
+            api*"repos/$FAKE_REPOSITORY/commits/"*"/pulls")
               cat "$FIX/pulls.json" ;;
-            api*"repos/megaeth-labs/fake/pulls/42")
+            api*"repos/$FAKE_REPOSITORY/pulls/42")
               jq '.[0]' "$FIX/settle.json" ;;
             "pr list "*)
               echo fallback >> "$FIX/fallback-calls"
@@ -1945,8 +1951,8 @@ jobs:
           git checkout --quiet release-v1.2.0
           # Local rewrite survives the real wrapper's blank global config.
           # Without the wrapper the git shim refuses before touching HTTPS.
-          git config "url.file://$REPO.git.insteadOf" https://github.com/megaeth-labs/fake.git
-          git remote set-url origin https://github.com/megaeth-labs/fake.git
+          git config "url.file://$REPO.git.insteadOf" "https://github.com/$FAKE_REPOSITORY.git"
+          git remote set-url origin "https://github.com/$FAKE_REPOSITORY.git"
           if git ls-remote origin > "$FIX/unwrapped.log" 2>&1; then
             echo "unwrapped remote read succeeded"; exit 1
           else
@@ -2056,8 +2062,8 @@ jobs:
           route settle release-v1.2.0 "$merge"
           expect_output action publish
           : > "$OUT"
-          ( cd "$REPO" && env MERGE_SHA="$merge" PR_NUMBER=42 CHANGELOG=CHANGELOG.md \
-              GITHUB_OUTPUT="$OUT" bash "$SH/publish-guard.sh" )
+          ( cd "$REPO" && env GITHUB_REPOSITORY="$FAKE_REPOSITORY" MERGE_SHA="$merge" PR_NUMBER=42 \
+              CHANGELOG=CHANGELOG.md GITHUB_OUTPUT="$OUT" bash "$SH/publish-guard.sh" )
           expect_output tag_exists true
           expect_output merge_sha "$merge"
           # A different push must name the peeled commit, not the tag object.
