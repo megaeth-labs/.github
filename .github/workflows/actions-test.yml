@@ -967,7 +967,7 @@ jobs:
               "Draft changelog": "changelog.sh",
               "Resolve version": "version.sh",
               "Cut release branch": "cut.sh",
-              "Drop a stale candidate branch": "drop.sh",
+              "Open candidate PR": "open-pr.sh",
           }
           steps = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"]
           found = {s["name"]: s["run"] for s in steps if s.get("name") in want}
@@ -1016,20 +1016,24 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           cat > "$RUNNER_TEMP/bin/gh" <<'SH'
           #!/usr/bin/env bash
-          # Only what the shell under test calls: the default branch, the open
-          # PR count, and creating or deleting a ref, which here is a push into
+          # Only what the shell under test calls: the default branch, pull
+          # requests (fake-pr.py, below), the repository's auto-delete setting,
+          # labels, and creating or deleting a ref, which here is a push into
           # the throwaway remote and fails like GitHub's 422. A case injects a
           # concurrent run by leaving a file: race-create (a sha the racer
           # creates the ref at first), race-delete (the racer deletes it
           # first), race-recreate (the racer keeps it and opens a PR),
-          # fail-delete (the delete just fails).
+          # race-push (right after the delete the racer pushes its own commit,
+          # and opens a PR if the file says "with-pr"), fail-delete (the
+          # delete just fails).
           set -euo pipefail
           case "${1:-}" in
             repo)
               echo "main"
               ;;
             pr)
-              cat "$RUNNER_TEMP/open-prs" 2>/dev/null || echo 0
+              shift
+              exec python3 "$RUNNER_TEMP/bin/fake-pr.py" "$@"
               ;;
             api)
               # A pull request read: the fixture the case wrote for that number.
@@ -1037,13 +1041,26 @@ jobs:
                 cat "$RUNNER_TEMP/pr/${2##*/}.json"
                 exit 0
               fi
+              if [[ "${2:-}" =~ ^repos/[^/]+/[^/]+$ ]]; then
+                cat "$RUNNER_TEMP/auto-delete" 2>/dev/null || echo false
+                exit 0
+              fi
+              if [[ "${2:-}" == -X && "${3:-}" == POST && "${4:-}" == repos/*/issues/*/labels ]]; then
+                n="${4%/labels}"; n="${n##*/}"; shift 4; labels=()
+                while [[ $# -gt 0 ]]; do
+                  [[ "$1" == -f ]] && labels+=("${2#labels[]=}")
+                  shift 2
+                done
+                exec python3 "$RUNNER_TEMP/bin/fake-pr.py" label "$n" "${labels[@]}"
+              fi
               if [[ "${2:-}" == -X && "${3:-}" == DELETE ]]; then
                 ref="refs/${4#repos/*/git/refs/}"
                 if [[ -e "$RUNNER_TEMP/race-delete" ]]; then
                   rm "$RUNNER_TEMP/race-delete"; git push --quiet origin ":$ref"
                 fi
                 if [[ -e "$RUNNER_TEMP/race-recreate" ]]; then
-                  rm "$RUNNER_TEMP/race-recreate"; echo 1 > "$RUNNER_TEMP/open-prs"
+                  rm "$RUNNER_TEMP/race-recreate"
+                  python3 "$RUNNER_TEMP/bin/fake-pr.py" racer "${ref#refs/heads/}" >/dev/null
                   echo "gh: Reference update failed (HTTP 422)" >&2; exit 1
                 fi
                 if [[ -e "$RUNNER_TEMP/fail-delete" ]]; then
@@ -1053,6 +1070,14 @@ jobs:
                   echo "gh: Reference does not exist (HTTP 422)" >&2; exit 1
                 fi
                 git push --quiet origin ":$ref"
+                if [[ -e "$RUNNER_TEMP/race-push" ]]; then
+                  racer="$(git commit-tree "HEAD^{tree}" -p HEAD~1 -m "chore(release): a concurrent candidate")"
+                  git push --quiet origin "$racer:$ref"
+                  if [[ "$(cat "$RUNNER_TEMP/race-push")" == with-pr ]]; then
+                    python3 "$RUNNER_TEMP/bin/fake-pr.py" racer "${ref#refs/heads/}" >/dev/null
+                  fi
+                  rm "$RUNNER_TEMP/race-push"
+                fi
                 exit 0
               fi
               ref=""; sha=""
@@ -1081,6 +1106,71 @@ jobs:
           esac
           SH
           chmod +x "$RUNNER_TEMP/bin/gh"
+          # Pull requests live in $RUNNER_TEMP/prs/<n>.json. race-close: a
+          # concurrent run closes the PR first, and this close fails. race-pr:
+          # a concurrent run opens the PR first, and this create fails.
+          cat > "$RUNNER_TEMP/bin/fake-pr.py" <<'PY'
+          import json, os, pathlib, subprocess, sys
+
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          store = temp / "prs"
+          store.mkdir(exist_ok=True)
+
+          def load():
+              return {int(f.stem): json.loads(f.read_text()) for f in store.glob("*.json")}
+
+          def save(pr):
+              (store / f"{pr['number']}.json").write_text(json.dumps(pr))
+
+          def new(head, base, title, body, by):
+              n = max(load(), default=99) + 1
+              pr = {"number": n, "url": f"https://github.com/megaeth-labs/fake/pull/{n}", "head": head,
+                    "base": base, "title": title, "body": body, "author": by, "state": "OPEN",
+                    "labels": [], "comments": []}
+              save(pr)
+              return pr
+
+          def opt(args, name):
+              return args[args.index(name) + 1] if name in args else None
+
+          def race(name):
+              f = temp / name
+              if f.exists():
+                  f.unlink()
+                  return True
+              return False
+
+          cmd, args = sys.argv[1], sys.argv[2:]
+          if cmd == "list":
+              head, state = opt(args, "--head"), (opt(args, "--state") or "open").upper()
+              print(json.dumps([{"number": p["number"], "url": p["url"], "isCrossRepository": False}
+                                for p in load().values() if p["head"] == head and p["state"] == state]))
+          elif cmd == "close":
+              pr = load()[int(args[0])]
+              if race("race-close"):
+                  pr["state"] = "CLOSED"; save(pr)
+              if pr["state"] != "OPEN":
+                  sys.exit(f"Pull request #{pr['number']} is already closed")
+              pr["state"] = "CLOSED"; pr["comments"].append(opt(args, "--comment")); save(pr)
+          elif cmd == "create":
+              head, base = opt(args, "--head"), opt(args, "--base")
+              if race("race-pr"):
+                  new(head, base, "a concurrent candidate", "", "mega-gutenberg[bot]")
+              if any(p["head"] == head and p["state"] == "OPEN" for p in load().values()):
+                  sys.exit(f"a pull request for branch \"{head}\" into branch \"{base}\" already exists")
+              if subprocess.run(["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{head}"],
+                                capture_output=True).returncode != 0:
+                  sys.exit("pull request create failed: Head sha can't be blank, Head ref must be a branch")
+              print(new(head, base, opt(args, "--title"), pathlib.Path(opt(args, "--body-file")).read_text(),
+                        "mega-gutenberg[bot]")["url"])
+          elif cmd == "label":
+              pr = load()[int(args[0])]
+              pr["labels"] += args[1:]; save(pr)
+          elif cmd == "racer":
+              print(new(args[0], "main", "a concurrent candidate", "", "mega-gutenberg[bot]")["url"])
+          else:
+              sys.exit(f"fake gh pr: {cmd} is not faked")
+          PY
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: A repository shaped like a settled release line
@@ -1522,7 +1612,8 @@ jobs:
 
           # The branch at another commit is not this cut: refused, both SHAs
           # named, and it is not moved.
-          git -C "$UP" push --quiet --force origin "$earlier:refs/heads/release-v1.3.0"
+          git -C "$UP" push --quiet origin ":refs/heads/release-v1.3.0"
+          git -C "$UP" push --quiet origin "$earlier:refs/heads/release-v1.3.0"
           if run_cut 11 "$merge"; then
             echo "a cut over a branch at another commit succeeded"; cat "$RUNNER_TEMP/cut.log"; exit 1
           fi
@@ -1549,50 +1640,173 @@ jobs:
             || { echo "refused, but not for the racer's commit:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
           echo "cut creates the branch for a merged gutenberg candidate, is a no-op when it is already there, and refuses the rest"
 
-      # propose drops a candidate branch left behind by a closed PR. A retry or
-      # a concurrent propose may have deleted it first, or recreated it with an
-      # open PR; neither is a failure.
-      - name: A stale candidate branch is dropped, whoever got there first
+      # propose never rewrites the candidate branch. A re-dispatch closes the
+      # open candidate PR, deletes the branch and pushes a fresh one as a new
+      # ref; the remote here refuses every non-fast-forward update, the way a
+      # ruleset that bans force pushes does, so a forced push anywhere in the
+      # step fails this case. Retries and concurrent runs, whoever got where
+      # first, converge on one branch and one open PR.
+      - name: A re-dispatched candidate supersedes the open one, and nothing is force-pushed
         run: |
           set -euo pipefail
-          D="$RUNNER_TEMP/drop"
-          git init --quiet --bare "$D.git"
-          git clone --quiet "$D.git" "$D" 2>/dev/null
-          git -C "$D" commit --quiet --allow-empty -m "feat: first"
-          git -C "$D" push --quiet origin HEAD:refs/heads/main
-          head=refs/heads/chore/release-candidate-1.3.0
-          stale() { git -C "$D" push --quiet origin "HEAD:$head"; }
-          there() { git -C "$D" ls-remote --exit-code origin "$head" >/dev/null; }
-          drop() {
-            ( cd "$D" && env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake VERSION=1.3.0 \
-                bash "$SH/drop.sh" ) > "$RUNNER_TEMP/drop.log" 2>&1
+          C="$RUNNER_TEMP/candidate"
+          git init --quiet --bare "$C.git"
+          git -C "$C.git" config receive.denyNonFastForwards true
+          git clone --quiet "$C.git" "$C" 2>/dev/null
+          echo 1.2.0 > "$C/VERSION"
+          git -C "$C" add -A && git -C "$C" commit --quiet -m "feat: first"
+          git -C "$C" push --quiet origin HEAD:refs/heads/main
+          main="$(git -C "$C" rev-parse HEAD)"
+          head=chore/release-candidate-1.3.0
+          app='mega-gutenberg[bot]'
+          rm -rf "$RUNNER_TEMP/prs"
+          # Each propose commits at its own time, so every candidate is a
+          # different commit and an in-place update would be non-fast-forward.
+          tick=1700000000
+          propose() { # [VAR=value ...] — the bump, then the step, on a fresh checkout of main
+            tick=$((tick + 60))
+            export GIT_AUTHOR_DATE="@$tick +0000" GIT_COMMITTER_DATE="@$tick +0000"
+            git -C "$C" checkout --quiet -B main "$main"
+            echo "${BUMP_TO:-1.3.0}" > "$C/VERSION"
+            : > "$OUT"
+            ( cd "$C" && env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake GITHUB_OUTPUT="$OUT" \
+                VERSION=1.3.0 OLD_VERSION=1.2.0 RELEASE_BRANCH= BASE_COMMIT= PREFIX=release-v SYNCED=unchanged \
+                PR_LABELS="release, candidate" \
+                GIT_AUTHOR_NAME="$app" GIT_AUTHOR_EMAIL=app@example.invalid \
+                GIT_COMMITTER_NAME="$app" GIT_COMMITTER_EMAIL=app@example.invalid \
+                "$@" bash "$SH/open-pr.sh" ) > "$RUNNER_TEMP/open-pr.log" 2>&1
           }
-          says() { grep -qF "$1" "$RUNNER_TEMP/drop.log" || { echo "no '$1' in:"; cat "$RUNNER_TEMP/drop.log"; exit 1; }; }
+          says() { grep -qF "$1" "$RUNNER_TEMP/open-pr.log" || { echo "no '$1' in:"; cat "$RUNNER_TEMP/open-pr.log"; exit 1; }; }
+          ok() { propose "$@" || { echo "propose failed:"; cat "$RUNNER_TEMP/open-pr.log"; exit 1; }; }
+          remote_head() { git -C "$C" ls-remote --heads origin "refs/heads/$head" | cut -f1; }
+          pr() { # <number> <field>
+            python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))[sys.argv[2]]; print(v if isinstance(v,str) else json.dumps(v))' \
+              "$RUNNER_TEMP/prs/$1.json" "$2"
+          }
+          open_prs() { python3 "$RUNNER_TEMP/bin/fake-pr.py" list --head "$head" --state open \
+            | python3 -c 'import json,sys; print(" ".join(str(p["number"]) for p in json.load(sys.stdin)))'; }
+          converged() { # <the one open PR> — one branch, one open PR, and the step reported it
+            [[ "$(open_prs)" == "$1" ]] || { echo "open candidate PRs: '$(open_prs)', expected '$1'"; exit 1; }
+            [[ -n "$(remote_head)" ]] || { echo "$head is missing"; exit 1; }
+            grep -qxF "pr_url=https://github.com/megaeth-labs/fake/pull/$1" "$OUT" \
+              || { echo "the step did not report PR $1:"; cat "$OUT"; exit 1; }
+          }
 
-          drop || { cat "$RUNNER_TEMP/drop.log"; exit 1; }
-          stale; drop || { cat "$RUNNER_TEMP/drop.log"; exit 1; }
-          ! there || { echo "the stale branch was not deleted"; exit 1; }
-          says "deleted stale branch"
-          stale; echo 1 > "$RUNNER_TEMP/open-prs"; drop || { cat "$RUNNER_TEMP/drop.log"; exit 1; }
-          there || { echo "a branch with an open PR was deleted"; exit 1; }
-          rm "$RUNNER_TEMP/open-prs"
+          # The fixture remote really refuses a forced update.
+          git -C "$C" push --quiet origin "HEAD:refs/heads/probe"
+          if git -C "$C" push --quiet --force origin "$(git -C "$C" commit-tree "HEAD^{tree}" -m probe):refs/heads/probe" 2>/dev/null; then
+            echo "the fixture remote accepted a force push"; exit 1
+          fi
+          git -C "$C" push --quiet origin :refs/heads/probe
 
+          # A first propose: a new branch on main, one PR, opened by the app.
+          ok
+          converged 100
+          first="$(remote_head)"
+          [[ "$(git -C "$C" rev-parse "$first~1")" == "$main" ]] || { echo "the candidate is not on main"; exit 1; }
+          [[ "$(git -C "$C" log -1 --format='%an|%cn|%s' "$first")" == "$app|$app|chore(release): candidate v1.3.0" ]] \
+            || { echo "wrong commit: $(git -C "$C" log -1 --format='%an|%cn|%s' "$first")"; exit 1; }
+          [[ "$(git -C "$C" show "$first:VERSION")" == 1.3.0 ]] || { echo "the bump is not in the candidate"; exit 1; }
+          [[ "$(pr 100 base)" == main && "$(pr 100 author)" == "$app" ]] || { echo "PR 100 base/author is wrong"; exit 1; }
+          [[ "$(pr 100 labels)" == '["release", "candidate"]' ]] || { echo "PR 100 labels: $(pr 100 labels)"; exit 1; }
+          pr 100 body > "$RUNNER_TEMP/body"
+          grep -qxF '<!-- release-candidate: v1.3.0 -->' "$RUNNER_TEMP/body" || { echo "no marker:"; cat "$RUNNER_TEMP/body"; exit 1; }
+          grep -qF "Merging this PR creates the release branch \`release-v1.3.0\` at the merge commit." "$RUNNER_TEMP/body" \
+            || { cat "$RUNNER_TEMP/body"; exit 1; }
+          grep -qxF "previous release's entry synced from its tag: unchanged." "$RUNNER_TEMP/body" || { cat "$RUNNER_TEMP/body"; exit 1; }
+          says "pushed $head at $first as a new ref"
+          says "stays after the PR merges"
+
+          # A re-dispatch supersedes it: closed with a comment, the branch
+          # deleted and pushed again as a new ref, a fresh PR.
+          echo true > "$RUNNER_TEMP/auto-delete"
+          ok
+          converged 101
+          [[ "$(remote_head)" != "$first" ]] || { echo "the re-dispatch did not make a new candidate commit"; exit 1; }
+          [[ "$(pr 100 state)" == CLOSED ]] || { echo "the superseded PR is still open"; exit 1; }
+          grep -qF "Superseded: a fresh candidate for v1.3.0 replaces this PR" <<< "$(pr 100 comments)" \
+            || { echo "no supersede comment: $(pr 100 comments)"; exit 1; }
+          says "closed superseded candidate PR #100"
+          says "deleted the old $head"
+          says "deleted when the PR merges, by the repository's 'Automatically delete head branches' setting"
+          rm "$RUNNER_TEMP/auto-delete"
+
+          # A retry after a partial failure: the PR was closed, the branch is
+          # still there and has no PR (equally: pushed, then died before the PR).
+          python3 "$RUNNER_TEMP/bin/fake-pr.py" close 101 --comment "closed by hand"
+          ok
+          converged 102
+          says "deleted the old $head"
+
+          # The PR this run would close was closed by a concurrent run first.
+          : > "$RUNNER_TEMP/race-close"
+          ok
+          converged 103
+          says "candidate PR #102 was already closed"
+
+          # The branch was deleted by a concurrent run first.
           : > "$RUNNER_TEMP/race-delete"
-          drop || { echo "a delete that found the ref already gone failed"; cat "$RUNNER_TEMP/drop.log"; exit 1; }
-          ! there || { echo "the branch is still there"; exit 1; }
+          ok
+          converged 104
           says "was already deleted"
 
-          stale; : > "$RUNNER_TEMP/race-recreate"
-          drop || { echo "a delete that lost to a concurrent creator failed"; cat "$RUNNER_TEMP/drop.log"; exit 1; }
-          there || { echo "the concurrent run's branch was deleted"; exit 1; }
-          says "recreated by a concurrent run"
-          rm "$RUNNER_TEMP/open-prs"
+          # A concurrent run pushed its own branch right after the delete and
+          # opened its PR: this push is refused, its branch and PR stand.
+          echo with-pr > "$RUNNER_TEMP/race-push"
+          ok
+          converged 105
+          [[ ! -e "$RUNNER_TEMP/race-push" ]] || { echo "the race was not exercised"; exit 1; }
+          [[ "$(git -C "$C" log -1 --format=%s "$(remote_head)")" == "chore(release): a concurrent candidate" ]] \
+            || { echo "the concurrent run's branch was replaced"; exit 1; }
+          says "was created at $(remote_head) by a concurrent run"
+          says "candidate PR https://github.com/megaeth-labs/fake/pull/105 was opened by a concurrent run"
 
+          # The same, but the concurrent run died before its PR: this run opens it.
+          echo no-pr > "$RUNNER_TEMP/race-push"
+          ok
+          converged 106
+          [[ "$(git -C "$C" log -1 --format=%s "$(remote_head)")" == "chore(release): a concurrent candidate" ]] \
+            || { echo "the concurrent run's branch was replaced"; exit 1; }
+          says "opened candidate PR https://github.com/megaeth-labs/fake/pull/106"
+
+          # A concurrent run opened the PR between this push and this create.
+          : > "$RUNNER_TEMP/race-pr"
+          ok
+          converged 107
+          says "candidate PR https://github.com/megaeth-labs/fake/pull/107 was opened by a concurrent run"
+
+          # The delete lost to a concurrent run that kept the branch and opened
+          # a PR: nothing is pushed over it.
+          before="$(remote_head)"
+          : > "$RUNNER_TEMP/race-recreate"
+          ok
+          converged 108
+          [[ "$(remote_head)" == "$before" ]] || { echo "the concurrent run's branch moved"; exit 1; }
+          says "by a concurrent run; keeping it rather than replacing it"
+
+          # A delete that just fails, with no PR owning the branch, is an error.
+          python3 "$RUNNER_TEMP/bin/fake-pr.py" close 108 --comment "closed by hand"
           : > "$RUNNER_TEMP/fail-delete"
-          if drop; then echo "a failed delete with the branch still stale succeeded"; cat "$RUNNER_TEMP/drop.log"; exit 1; fi
-          says "could not delete stale branch"
+          if propose; then echo "a failed delete succeeded"; cat "$RUNNER_TEMP/open-pr.log"; exit 1; fi
+          says "could not delete $head, and no open PR owns it"
           rm "$RUNNER_TEMP/fail-delete"
-          echo "drop deletes a stale branch, keeps an open PR's, and tolerates a racer either way"
+          ok
+          converged 109
+
+          # Nothing to propose: no PR closed, nothing pushed.
+          before="$(remote_head)"
+          BUMP_TO=1.2.0 ok
+          says "no candidate PR opened, nothing pushed"
+          grep -qxF "pr_url=" "$OUT" || { cat "$OUT"; exit 1; }
+          [[ "$(open_prs)" == 109 && "$(remote_head)" == "$before" ]] || { echo "an empty propose touched the candidate"; exit 1; }
+
+          # A base_commit candidate targets the release branch.
+          ok RELEASE_BRANCH=release-v1.3.0 BASE_COMMIT="$main"
+          converged 110
+          [[ "$(pr 110 base)" == release-v1.3.0 ]] || { echo "PR 110 targets $(pr 110 base)"; exit 1; }
+          pr 110 body | grep -qF "Cut from \`$main\`, which is not the tip of the default branch: \`release-v1.3.0\` already exists" \
+            || { pr 110 body; exit 1; }
+          echo "every propose left one $head and one open PR, and the remote never took a forced update"
 
   # release-publish re-verifies the merged settle PR through the API and tags
   # the pushed commit. The three steps that do it are extracted by name and run

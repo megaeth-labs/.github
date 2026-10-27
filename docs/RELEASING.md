@@ -80,9 +80,14 @@ Rulesets the app relies on:
   reviewed. Required checks use `do_not_enforce_on_create: true`; "require
   branches to be up to date" is on; merge methods include squash or merge, not
   rebase only.
-- A repository whose `prohibit-force-push` ruleset covers all branches (mega-reth
-  does) must exempt the release app for `refs/heads/chore/release-*`;
-  otherwise the update of the candidate or settle PR branch is rejected.
+- No exemption from a `prohibit-force-push` ruleset is needed, even one that
+  covers all branches (mega-reth's does): nothing in the pipeline force-pushes
+  any branch. A re-dispatched candidate supersedes the open one — it closes
+  that PR with a comment, deletes its `chore/release-candidate-*` branch,
+  pushes a fresh one as a new ref and opens a fresh PR. A re-run settle
+  fast-forwards its own open PR's branch, or closes a PR it does not maintain
+  and starts a new branch. The app does need to delete those branches, so a
+  ruleset that restricts deletions must not cover `refs/heads/chore/release-*`.
 
 ## The dry-run flag
 

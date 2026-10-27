@@ -69,12 +69,14 @@ The choices that shape it:
   `publish` environment whose deployment policy allows only `v*` tag refs, so
   a branch build can never read them. The environment has no reviewers: the
   human gate is settlement.
-- **No force pushes to release branches, settle branches or tags.**
-  Re-running settle supersedes what it made before (closes the old PR, drops
-  the branch, pushes fresh), so it works in repositories whose rulesets ban
-  force pushes. The one exception is a candidate re-dispatched while its PR
-  is still open: that PR's branch is updated in place, which is a force push
-  (see [Operations](#operations-and-recovery)).
+- **Nothing force-pushes any branch, or a tag.** Re-dispatching a candidate
+  supersedes the open one: it closes that PR with a comment, deletes the
+  branch, pushes a fresh one as a new ref and opens a fresh PR. Re-running
+  settle fast-forwards its own PR's branch, or closes a PR it does not
+  maintain and starts fresh. So the pipeline works in repositories whose rulesets
+  ban force pushes on every branch, with no exemption. A test
+  (`.github/scripts/test_no_force_push.py`) fails if any shipped action or
+  template gains a forced push.
 - **Generic.** The actions know nothing about MegaETH: the version file and
   its format, the changelog path, the branch prefix, the app identity and
   every publish destination are inputs. The templates carry this
@@ -97,8 +99,9 @@ branch `chore/release-candidate-1.2.3`: the version file bumped, whatever
 changelog entry `## v1.2.3` drafted from the merged PR titles since the last
 `v*` tag (grouped by Conventional Commit type, with PR links), and the
 previous release's entry synced from its tag. Review it like any PR; fix
-wording in it if the generated entry needs work. A stale candidate branch
-from an earlier attempt is dropped first, unless its PR is still open.
+wording in it if the generated entry needs work. Re-dispatching the
+candidate supersedes this PR (closed with a comment, a fresh branch and PR
+opened, nothing force-pushed), so edits made on it are not carried over.
 
 **2. Cut.** Merging the candidate PR runs the `cut` job, which creates
 `release-v1.2.3` at the merge commit. No tag yet. From here, fixes for the
@@ -424,12 +427,17 @@ default branch has. Fix: cherry-pick the file onto the release branch through
 its own PR, then settle. (A tag's tree is final: a target that was missing
 or broken at a tag cannot be re-run for that tag; the next release gets it.)
 
-**A stale candidate branch exists** from an earlier attempt: the candidate
-action deletes it before pushing, unless a PR on it is still open, in which
-case that PR is updated in place with a force push of its branch. In a
-repository whose rulesets ban force pushes, close the open candidate PR
-before re-dispatching; the action then drops the branch and opens a fresh
-PR.
+**A candidate is re-dispatched** (a fix landed, or the first attempt failed
+part-way): the fresh candidate supersedes the old one. An open candidate PR
+for that version is closed with a comment saying so, its branch is deleted,
+the new candidate commit is pushed as a new branch and a fresh PR is opened.
+Nothing is force-pushed, so there is nothing to close by hand first. A retry
+converges from wherever the last attempt stopped (a PR already closed, a
+branch already gone, a branch pushed with no PR yet), and a concurrent run
+that pushed the branch or opened the PR first is kept rather than replaced:
+the result is always one branch and one open PR. The branch is deleted on
+merge only by the repository's "Automatically delete head branches" setting;
+without it, a merged candidate's branch stays, unused.
 
 **Two runs of the same stage overlap.** They queue, never cancel: the
 candidate's `propose` and `cut`, and `release-publish`'s `publish`, carry

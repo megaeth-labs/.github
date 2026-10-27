@@ -54,8 +54,7 @@ Family: [Release pipeline](../RELEASE.md).
 1. Bump version file *(only if `inputs.stage == 'propose'`)*
 1. Run bump command *(only if `inputs.stage == 'propose' && inputs.bump_command != '' && steps.bump.outputs.skipped != 'true'`)*
 1. Draft changelog *(only if `inputs.stage == 'propose' && inputs.changelog_file != '' && steps.bump.outputs.skipped != 'true'`)*
-1. Drop a stale candidate branch *(only if `inputs.stage == 'propose'`)*
-1. Open candidate PR — `peter-evans/create-pull-request` *(only if `inputs.stage == 'propose'`)*
+1. Open candidate PR *(only if `inputs.stage == 'propose'`)*
 1. Cut release branch *(only if `inputs.stage == 'cut'`)*
 <!-- /generated -->
 
@@ -74,7 +73,10 @@ Family: [Release pipeline](../RELEASE.md).
 - `could not create $BRANCH at $checkout (it is now at`
 - `bump_command needs a separate dependency_token, so the command never runs with the release token`
 - `after bump_command, $FILE reads $actual, expected $NEW_VERSION`
-- `could not delete stale branch $head`
+- `could not close the open candidate PR #$number ($url)`
+- `could not delete $head, and no open PR owns it`
+- `could not push $head`
+- `could not open the candidate PR for $head`
 - `cut needs the commit and pr_number inputs (the release-route outputs)`
 - `candidate PR #$PR_NUMBER has not been merged; cut only runs for a merged candidate`
 - `candidate PR #$PR_NUMBER merged as`
@@ -108,9 +110,14 @@ both from `workflow-templates/release-candidate.yml`:
 - `propose` bumps the version file, runs `bump_command` with `OLD_VERSION`
   and `NEW_VERSION` set, drafts the `## vX.Y.Z` changelog entry from the
   merged PR titles since the last `v*` tag, syncs the previous release's
-  entry from its tag, drops a stale `chore/release-candidate-X.Y.Z` branch
-  (unless its PR is still open, in which case that PR is updated, with a
-  force push of its branch), and opens the candidate PR.
+  entry from its tag, and opens the candidate PR from a new
+  `chore/release-candidate-X.Y.Z` branch. It never rewrites a branch: a
+  candidate PR still open for that version is closed with a comment saying a
+  fresh candidate supersedes it, its branch is deleted, and the new commit is
+  pushed as a new ref. A retry, or a run racing another, converges on one
+  branch and one open PR (a branch or PR the other run made first is kept).
+  The branch is deleted on merge only by the repository's "Automatically
+  delete head branches" setting; the step log says which applies.
 - `cut` runs when that PR merges and creates `<release_branch_prefix>X.Y.Z`
   at the merge commit; it refuses a PR not opened by `pr_author`. A retry
   that finds the branch already at that commit exits 0 with a notice; at
