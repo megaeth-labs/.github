@@ -117,9 +117,11 @@ copy before pushing (from a checkout of this repository):
 python3 .github/scripts/app_token_lint.py --repo my-repo /path/to/my-repo/.github/workflows
 ```
 
-> The release templates are being rewritten for the push-driven flow in a
-> separate change; `workflow-templates/README.md` is not part of this commit,
-> so this page links the directory rather than that file.
+Each template ships with a `.properties.json` sidecar that feeds the "New
+workflow" picker; keep the pair together when copying. The templates carry the
+mega-reth values as the worked example: `Cargo.toml` with `version_pattern:
+toml`, `cargo update --workspace` as the bump command, and the private
+dependency repos as the read-only dependency token's `repositories`.
 
 ## The reviewer step: the `compat:` label
 
