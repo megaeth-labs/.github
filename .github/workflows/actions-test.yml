@@ -917,6 +917,7 @@ jobs:
               "Draft changelog": "changelog.sh",
               "Resolve version": "version.sh",
               "Cut release branch": "cut.sh",
+              "Drop a stale candidate branch": "drop.sh",
           }
           steps = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"]
           found = {s["name"]: s["run"] for s in steps if s.get("name") in want}
@@ -965,17 +966,43 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           cat > "$RUNNER_TEMP/bin/gh" <<'SH'
           #!/usr/bin/env bash
-          # Only what the shell under test calls: the default branch, and
-          # creating a ref, which here is a push into the throwaway remote.
+          # Only what the shell under test calls: the default branch, the open
+          # PR count, and creating or deleting a ref, which here is a push into
+          # the throwaway remote and fails like GitHub's 422. A case injects a
+          # concurrent run by leaving a file: race-create (a sha the racer
+          # creates the ref at first), race-delete (the racer deletes it
+          # first), race-recreate (the racer keeps it and opens a PR),
+          # fail-delete (the delete just fails).
           set -euo pipefail
           case "${1:-}" in
             repo)
               echo "main"
               ;;
+            pr)
+              cat "$RUNNER_TEMP/open-prs" 2>/dev/null || echo 0
+              ;;
             api)
               # A pull request read: the fixture the case wrote for that number.
               if [[ "${2:-}" == repos/*/pulls/* ]]; then
                 cat "$RUNNER_TEMP/pr/${2##*/}.json"
+                exit 0
+              fi
+              if [[ "${2:-}" == -X && "${3:-}" == DELETE ]]; then
+                ref="refs/${4#repos/*/git/refs/}"
+                if [[ -e "$RUNNER_TEMP/race-delete" ]]; then
+                  rm "$RUNNER_TEMP/race-delete"; git push --quiet origin ":$ref"
+                fi
+                if [[ -e "$RUNNER_TEMP/race-recreate" ]]; then
+                  rm "$RUNNER_TEMP/race-recreate"; echo 1 > "$RUNNER_TEMP/open-prs"
+                  echo "gh: Reference update failed (HTTP 422)" >&2; exit 1
+                fi
+                if [[ -e "$RUNNER_TEMP/fail-delete" ]]; then
+                  echo "gh: Server Error (HTTP 500)" >&2; exit 1
+                fi
+                if ! git ls-remote --exit-code origin "$ref" >/dev/null; then
+                  echo "gh: Reference does not exist (HTTP 422)" >&2; exit 1
+                fi
+                git push --quiet origin ":$ref"
                 exit 0
               fi
               ref=""; sha=""
@@ -991,6 +1018,13 @@ jobs:
                 fi
               done
               if [[ -n "$ref" && -n "$sha" ]]; then
+                if [[ -e "$RUNNER_TEMP/race-create" ]]; then
+                  git push --quiet origin "$(cat "$RUNNER_TEMP/race-create"):$ref"
+                  rm "$RUNNER_TEMP/race-create"
+                fi
+                if git ls-remote --exit-code origin "$ref" >/dev/null; then
+                  echo "gh: Reference already exists (HTTP 422)" >&2; exit 1
+                fi
                 git push --quiet origin "$sha:$ref"
               fi
               ;;
@@ -1428,15 +1462,87 @@ jobs:
             || { echo "release-v1.3.0 is not at the merge commit: '$(branch_at)'"; exit 1; }
           echo "release-v1.3.0 created at $merge"
 
-          # Stale state: the branch is there now, and a second cut is refused
-          # without moving it.
-          if run_cut 11 "$merge"; then
-            echo "a second cut succeeded"; cat "$RUNNER_TEMP/cut.log"; exit 1
-          fi
-          grep -qF "branch release-v1.3.0 already exists" "$RUNNER_TEMP/cut.log" \
-            || { echo "refused, but not because the branch exists:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          # A retry of the cut that succeeded: the branch is already at the
+          # merge commit, so it is a no-op that says so and exits 0.
+          run_cut 11 "$merge" || { echo "a retried cut failed"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          expect_out "release_branch=release-v1.3.0"
+          grep -qF "release-v1.3.0 already exists at $merge" "$RUNNER_TEMP/cut.log" \
+            || { echo "the retry did not report the existing cut:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
           [[ "$(branch_at)" == "$merge" ]] || { echo "the existing branch moved"; exit 1; }
-          echo "cut creates the branch for a merged gutenberg candidate and refuses the rest"
+
+          # The branch at another commit is not this cut: refused, both SHAs
+          # named, and it is not moved.
+          git -C "$UP" push --quiet --force origin "$earlier:refs/heads/release-v1.3.0"
+          if run_cut 11 "$merge"; then
+            echo "a cut over a branch at another commit succeeded"; cat "$RUNNER_TEMP/cut.log"; exit 1
+          fi
+          grep -qF "branch release-v1.3.0 already exists at $earlier, not at the candidate merge commit $merge" "$RUNNER_TEMP/cut.log" \
+            || { echo "refused, but without both SHAs:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          [[ "$(branch_at)" == "$earlier" ]] || { echo "the conflicting branch moved"; exit 1; }
+
+          # Two cuts race: the ref is absent when this one looks, a concurrent
+          # one creates it first and this create gets a 422. At the merge
+          # commit that is the same cut; anywhere else it is refused.
+          git -C "$UP" push --quiet origin ":refs/heads/release-v1.3.0"
+          echo "$merge" > "$RUNNER_TEMP/race-create"
+          run_cut 11 "$merge" || { echo "a cut that lost the race to the same cut failed"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          [[ ! -e "$RUNNER_TEMP/race-create" ]] || { echo "the race was not exercised"; exit 1; }
+          grep -qF "release-v1.3.0 already exists at $merge" "$RUNNER_TEMP/cut.log" \
+            || { echo "the lost race was not reported:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          [[ "$(branch_at)" == "$merge" ]] || { echo "release-v1.3.0 is not at the merge commit after the race"; exit 1; }
+          git -C "$UP" push --quiet origin ":refs/heads/release-v1.3.0"
+          echo "$earlier" > "$RUNNER_TEMP/race-create"
+          if run_cut 11 "$merge"; then
+            echo "a cut that lost the race to another commit succeeded"; cat "$RUNNER_TEMP/cut.log"; exit 1
+          fi
+          grep -qF "already exists at $earlier, not at the candidate merge commit $merge" "$RUNNER_TEMP/cut.log" \
+            || { echo "refused, but not for the racer's commit:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          echo "cut creates the branch for a merged gutenberg candidate, is a no-op when it is already there, and refuses the rest"
+
+      # propose drops a candidate branch left behind by a closed PR. A retry or
+      # a concurrent propose may have deleted it first, or recreated it with an
+      # open PR; neither is a failure.
+      - name: A stale candidate branch is dropped, whoever got there first
+        run: |
+          set -euo pipefail
+          D="$RUNNER_TEMP/drop"
+          git init --quiet --bare "$D.git"
+          git clone --quiet "$D.git" "$D" 2>/dev/null
+          git -C "$D" commit --quiet --allow-empty -m "feat: first"
+          git -C "$D" push --quiet origin HEAD:refs/heads/main
+          head=refs/heads/chore/release-candidate-1.3.0
+          stale() { git -C "$D" push --quiet origin "HEAD:$head"; }
+          there() { git -C "$D" ls-remote --exit-code origin "$head" >/dev/null; }
+          drop() {
+            ( cd "$D" && env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake VERSION=1.3.0 \
+                bash "$SH/drop.sh" ) > "$RUNNER_TEMP/drop.log" 2>&1
+          }
+          says() { grep -qF "$1" "$RUNNER_TEMP/drop.log" || { echo "no '$1' in:"; cat "$RUNNER_TEMP/drop.log"; exit 1; }; }
+
+          drop || { cat "$RUNNER_TEMP/drop.log"; exit 1; }
+          stale; drop || { cat "$RUNNER_TEMP/drop.log"; exit 1; }
+          ! there || { echo "the stale branch was not deleted"; exit 1; }
+          says "deleted stale branch"
+          stale; echo 1 > "$RUNNER_TEMP/open-prs"; drop || { cat "$RUNNER_TEMP/drop.log"; exit 1; }
+          there || { echo "a branch with an open PR was deleted"; exit 1; }
+          rm "$RUNNER_TEMP/open-prs"
+
+          : > "$RUNNER_TEMP/race-delete"
+          drop || { echo "a delete that found the ref already gone failed"; cat "$RUNNER_TEMP/drop.log"; exit 1; }
+          ! there || { echo "the branch is still there"; exit 1; }
+          says "was already deleted"
+
+          stale; : > "$RUNNER_TEMP/race-recreate"
+          drop || { echo "a delete that lost to a concurrent creator failed"; cat "$RUNNER_TEMP/drop.log"; exit 1; }
+          there || { echo "the concurrent run's branch was deleted"; exit 1; }
+          says "recreated by a concurrent run"
+          rm "$RUNNER_TEMP/open-prs"
+
+          : > "$RUNNER_TEMP/fail-delete"
+          if drop; then echo "a failed delete with the branch still stale succeeded"; cat "$RUNNER_TEMP/drop.log"; exit 1; fi
+          says "could not delete stale branch"
+          rm "$RUNNER_TEMP/fail-delete"
+          echo "drop deletes a stale branch, keeps an open PR's, and tolerates a racer either way"
 
   # release-publish re-verifies the merged settle PR through the API and tags
   # the pushed commit. The three steps that do it are extracted by name and run
@@ -1494,6 +1600,9 @@ jobs:
           cond = next(s for s in steps if s.get("name") == "Create and push tag").get("if")
           if cond != "steps.guard.outputs.tag_exists != 'true'":
               sys.exit(f"the tag step's condition is {cond!r}; update this job to match")
+          cond = next(s for s in steps if s.get("name") == "Publish GitHub Release").get("if")
+          if cond != "steps.guard.outputs.published != 'true'":
+              sys.exit(f"the Release step's condition is {cond!r}; update this job to match")
           for name, script in found.items():
               pathlib.Path(sys.argv[2], want[name]).write_text(script)
               print(f"extracted {name!r} -> {want[name]}")
@@ -1531,6 +1640,8 @@ jobs:
           }
 
           release_step() {
+            touch "$FIX/release-ran"
+            : > "$OUT.release"
             ( cd "$REPO" && env \
                 GH_TOKEN=fake \
                 TAG="$(out_get tag)" \
@@ -1540,14 +1651,17 @@ jobs:
           }
 
           # The action's step list: the tag step runs unless the guard says the
-          # tag is already at the commit.
+          # tag is already at the commit, the Release step unless the guard
+          # found the Release too.
           publish() { # <pr> [expected author]
-            rm -f "$FIX/tag-ran"
+            rm -f "$FIX/tag-ran" "$FIX/release-ran"
             guard "$@" || return 1
             if [[ "$(out_get tag_exists)" != true ]]; then
               tag_step || return 1
             fi
-            release_step
+            if [[ "$(out_get published)" != true ]]; then
+              release_step || return 1
+            fi
           }
 
           refuse() { # <pr> <message fragment> [expected author]
@@ -1638,13 +1752,20 @@ jobs:
             exit 0
           fi
           if [[ "${1:-}" == release && "${2:-}" == view ]]; then
-            grep -qxF "${3:-}" "$RELEASES" && exit 0
+            if grep -qxF "${3:-}" "$RELEASES"; then
+              echo "https://github.com/megaeth-labs/fake/releases/tag/$3"
+              exit 0
+            fi
             echo "release not found" >&2
             exit 1
           fi
           if [[ "${1:-}" == release && "${2:-}" == create ]]; then
             if [[ -e "$FIX/fail-create" ]]; then
               echo "gh: release create failed (injected)" >&2
+              exit 1
+            fi
+            if grep -qxF "${3:-}" "$RELEASES"; then
+              echo "HTTP 422: Validation Failed (Release.tag_name already_exists)" >&2
               exit 1
             fi
             notes=""
@@ -1706,15 +1827,22 @@ jobs:
             || { echo "the notes are not the changelog section"; exit 1; }
           echo "v1.2.0 is an annotated tag at $merge and the Release was asked for with --verify-tag"
 
-      - name: A published release is not published twice
+      - name: A retry of a finished publish is a no-op
         run: |
           set -euo pipefail
           source "$SH/helpers.sh"
           before="$(remote_tag_object v1.2.0)"
-          refuse 101 "a release is published once"
+          publish 101 > "$RUNNER_TEMP/retry.log" 2>&1 \
+            || { echo "a retry of a finished publish failed"; cat "$RUNNER_TEMP/retry.log"; exit 1; }
+          expect_output "tag_exists=true"
+          expect_output "published=true"
+          expect_output "release_url=https://github.com/megaeth-labs/fake/releases/tag/v1.2.0"
+          grep -qF "Already published" "$RUNNER_TEMP/retry.log" \
+            || { echo "the no-op was not reported:"; cat "$RUNNER_TEMP/retry.log"; exit 1; }
+          [[ ! -e "$FIX/tag-ran" && ! -e "$FIX/release-ran" ]] || { echo "a step ran on the retry"; exit 1; }
           [[ "$(remote_tag_object v1.2.0)" == "$before" ]] || { echo "the tag moved"; exit 1; }
           [[ "$(grep -c 'release create v1.2.0 ' "$ARGS")" == 1 ]] || { echo "a second Release was created"; exit 1; }
-          echo "tag and Release both existing is refused, and nothing changed"
+          echo "tag and Release both at the commit: exit 0, notice, nothing changed"
 
       - name: A run that died after the tag is resumed, not refused
         run: |
@@ -1762,11 +1890,6 @@ jobs:
           refuse 105 "a release is published once"
           [[ "$(remote_commit v1.6.0)" == "$(cat "$FIX/settled-105")" ]] || { echo "the tag moved"; exit 1; }
 
-          settle 1.7.0 106
-          seed_tag v1.7.0 "$(cat "$FIX/merge-106")"
-          echo v1.7.0 >> "$RELEASES"
-          refuse 106 "a release is published once"
-
           WRONG_FILE=1.8.1 settle 1.8.0 107
           refuse 107 "says 1.8.1, expected 1.8.0"
 
@@ -1798,7 +1921,41 @@ jobs:
           done
           [[ "$(grep -c . "$ARGS")" == 2 ]] \
             || { echo "expected exactly the v1.2.0 and v1.3.0 Releases:"; cat "$ARGS"; exit 1; }
-          echo "ten refusals, no tag, no Release"
+          echo "nine refusals, no tag, no Release"
+
+      # Two publishes of the same merge race (a re-run while the first is still
+      # going): whichever pushes the tag or creates the Release second keeps
+      # the first one's, if it is at this commit.
+      - name: A publish that loses a race to its twin keeps the winner's tag and Release
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 2.0.0 120
+          merge="$(cat "$FIX/merge-120")"
+          guard 120
+          expect_output "tag_exists=false"
+          seed_tag v2.0.0 "$merge"          # the twin pushed first
+          object="$(remote_tag_object v2.0.0)"
+          tag_step > "$RUNNER_TEMP/race.log" 2>&1 \
+            || { echo "losing the tag race to the same commit failed"; cat "$RUNNER_TEMP/race.log"; exit 1; }
+          grep -qF "by a concurrent run" "$RUNNER_TEMP/race.log" || { cat "$RUNNER_TEMP/race.log"; exit 1; }
+          [[ "$(remote_tag_object v2.0.0)" == "$object" ]] || { echo "the twin's tag was replaced"; exit 1; }
+          echo v2.0.0 >> "$RELEASES"          # the twin created the Release first
+          release_step > "$RUNNER_TEMP/race.log" 2>&1 \
+            || { echo "losing the Release race failed"; cat "$RUNNER_TEMP/race.log"; exit 1; }
+          grep -qxF "url=https://github.com/megaeth-labs/fake/releases/tag/v2.0.0" "$OUT.release" \
+            || { echo "no url for the twin's Release:"; cat "$OUT.release"; exit 1; }
+          [[ "$(grep -c 'release create v2.0.0 ' "$ARGS")" == 0 ]] || { echo "a Release was recorded twice"; exit 1; }
+
+          # The twin's tag at another commit is not ours: the tag step fails.
+          settle 2.1.0 121
+          guard 121
+          seed_tag v2.1.0 "$(cat "$FIX/settled-121")"
+          if tag_step > "$RUNNER_TEMP/race.log" 2>&1; then
+            echo "a tag race lost to another commit succeeded"; exit 1
+          fi
+          grep -qF "not $(cat "$FIX/merge-121")" "$RUNNER_TEMP/race.log" || { cat "$RUNNER_TEMP/race.log"; exit 1; }
+          echo "races at the same commit converge; a tag elsewhere still fails"
 
   release-route:
     runs-on: ubuntu-24.04

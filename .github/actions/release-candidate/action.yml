@@ -7,7 +7,8 @@ description: >-
   run on the push that merged that PR (the consumer passes the `commit` and
   `pr_number` outputs of `release-route`), re-reads the PR through the API,
   refuses anything but a merged, gutenberg-authored candidate into the default
-  branch, and creates `release-vX.Y.Z` at the merge commit. No tag
+  branch, and creates `release-vX.Y.Z` at the merge commit (a retry that
+  finds it already there is a no-op; at any other commit it refuses). No tag
   is created at either stage — tags come from release-publish, once, at
   settlement. `base_commit` releases a commit that is not the tip of the
   default branch: `propose` cuts the release branch there itself, carries the
@@ -255,7 +256,7 @@ runs:
         checkout="$base"
         if [[ -n "$existing" ]]; then
           if [[ -z "$base" ]]; then
-            echo "::error::branch $branch already exists"; exit 1
+            echo "::error::branch $branch already exists: v$VERSION was already cut from its merged candidate, so there is nothing left to propose; settle it from $branch"; exit 1
           fi
           git fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch"
           if [[ "$existing" == "$base" ]]; then
@@ -297,8 +298,16 @@ runs:
         set -euo pipefail
         checkout="${CHECKOUT:-$BASE}"
         if ! git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null; then
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$checkout" >/dev/null
-          echo "created $BRANCH at $checkout"
+          if gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$checkout" >/dev/null; then
+            echo "created $BRANCH at $checkout"
+          else
+            # Lost a race to a concurrent propose: only the same commit is ours.
+            raced="$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)"
+            if [[ "$raced" != "$checkout" ]]; then
+              echo "::error::could not create $BRANCH at $checkout (it is now at '${raced:-<absent>}')"; exit 1
+            fi
+            echo "::notice title=Reusing the release branch::$BRANCH was created at $checkout by a concurrent run"
+          fi
         fi
         git fetch --quiet origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
         git checkout --quiet -B "$BRANCH" "$checkout"
@@ -448,8 +457,16 @@ runs:
         if git ls-remote --exit-code --heads origin "refs/heads/$head" >/dev/null; then
           open="$(gh pr list --head "$head" --state open --json number -q 'length')"
           if [[ "$open" == "0" ]]; then
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$head" >/dev/null
-            echo "deleted stale branch $head (no open PR)"
+            if gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$head" >/dev/null; then
+              echo "deleted stale branch $head (no open PR)"
+            elif ! git ls-remote --exit-code --heads origin "refs/heads/$head" >/dev/null; then
+              # 404/422: a retry or a concurrent run already removed it.
+              echo "::notice::stale branch $head was already deleted"
+            elif [[ "$(gh pr list --head "$head" --state open --json number -q 'length')" != "0" ]]; then
+              echo "::notice::$head was recreated by a concurrent run with an open PR; it will be updated"
+            else
+              echo "::error::could not delete stale branch $head"; exit 1
+            fi
           else
             echo "$head has an open PR; it will be updated"
           fi
@@ -538,10 +555,23 @@ runs:
           echo "::error::$FILE at $COMMIT says $actual, expected $VERSION"; exit 1
         fi
         branch="${PREFIX}${VERSION}"
-        if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
-          echo "::error::branch $branch already exists"; exit 1
+        # A retry of a cut that already succeeded, or a run that lost the race
+        # to create the ref, finds the branch. At this merge commit it is this
+        # cut, already done; anywhere else it is not ours and is refused.
+        existing="$(git ls-remote --heads origin "refs/heads/$branch" | cut -f1)"
+        if [[ -z "$existing" ]]; then
+          if gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$COMMIT" >/dev/null; then
+            echo "created $branch at $COMMIT"
+          else
+            existing="$(git ls-remote --heads origin "refs/heads/$branch" | cut -f1)"
+            [[ -n "$existing" ]] || { echo "::error::could not create $branch at $COMMIT"; exit 1; }
+          fi
         fi
-        gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$COMMIT" >/dev/null
+        if [[ -n "$existing" && "$existing" != "$COMMIT" ]]; then
+          echo "::error::branch $branch already exists at $existing, not at the candidate merge commit $COMMIT; refusing to move it"; exit 1
+        fi
+        if [[ "$existing" == "$COMMIT" ]]; then
+          echo "::notice title=Release branch already cut::$branch already exists at $COMMIT (an earlier or concurrent cut of PR #$PR_NUMBER); nothing to do"
+        fi
         echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
-        echo "created $branch at $COMMIT"
         GITHUB_AUTH_COMMAND

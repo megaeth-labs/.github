@@ -3,7 +3,7 @@
 `uses: megaeth-labs/.github/.github/actions/release-candidate@main`
 
 <!-- generated: description -->
-Start a release (trunk-first). `stage: propose` bumps the version file on the default branch, drafts this release's changelog entry (dated at settle) from the commits since the previous tag, syncs the previous release's entry from its tag, and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`, run on the push that merged that PR (the consumer passes the `commit` and `pr_number` outputs of `release-route`), re-reads the PR through the API, refuses anything but a merged, gutenberg-authored candidate into the default branch, and creates `release-vX.Y.Z` at the merge commit. No tag is created at either stage — tags come from release-publish, once, at settlement. `base_commit` releases a commit that is not the tip of the default branch: `propose` cuts the release branch there itself, carries the default branch's release workflows onto it, and points the candidate PR at it; that PR merges into the release branch, so `cut` never runs for it. Run as a step in a job the consumer owns, in `environment: release`; the consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
+Start a release (trunk-first). `stage: propose` bumps the version file on the default branch, drafts this release's changelog entry (dated at settle) from the commits since the previous tag, syncs the previous release's entry from its tag, and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`, run on the push that merged that PR (the consumer passes the `commit` and `pr_number` outputs of `release-route`), re-reads the PR through the API, refuses anything but a merged, gutenberg-authored candidate into the default branch, and creates `release-vX.Y.Z` at the merge commit (a retry that finds it already there is a no-op; at any other commit it refuses). No tag is created at either stage — tags come from release-publish, once, at settlement. `base_commit` releases a commit that is not the tip of the default branch: `propose` cuts the release branch there itself, carries the default branch's release workflows onto it, and points the candidate PR at it; that PR merges into the release branch, so `cut` never runs for it. Run as a step in a job the consumer owns, in `environment: release`; the consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 <!-- /generated -->
 
 Family: [Release pipeline](../RELEASE.md).
@@ -69,10 +69,12 @@ Family: [Release pipeline](../RELEASE.md).
 - `tag v$VERSION already exists`
 - `base_commit $BASE_COMMIT is not a commit in this checkout; check the repository out with fetch-depth: 0`
 - `base_commit $base is not reachable from the default branch ($default); a release must ship code that landed on trunk`
-- `branch $branch already exists`
+- `branch $branch already exists: v$VERSION was already cut from its merged candidate, so there is nothing left to propose; settle it from $branch`
 - `branch $branch already exists at $existing, which does not contain base_commit $base`
+- `could not create $BRANCH at $checkout (it is now at`
 - `bump_command needs a separate dependency_token, so the command never runs with the release token`
 - `after bump_command, $FILE reads $actual, expected $NEW_VERSION`
+- `could not delete stale branch $head`
 - `cut needs the commit and pr_number inputs (the release-route outputs)`
 - `candidate PR #$PR_NUMBER has not been merged; cut only runs for a merged candidate`
 - `candidate PR #$PR_NUMBER merged as`
@@ -80,6 +82,8 @@ Family: [Release pipeline](../RELEASE.md).
 - `candidate PR #$PR_NUMBER targets`
 - `candidate PR #$PR_NUMBER was opened by`
 - `$FILE at $COMMIT says $actual, expected $VERSION`
+- `could not create $branch at $COMMIT`
+- `branch $branch already exists at $existing, not at the candidate merge commit $COMMIT; refusing to move it`
 <!-- /generated -->
 
 ## Example
@@ -108,7 +112,9 @@ both from `workflow-templates/release-candidate.yml`:
   (unless its PR is still open, in which case that PR is updated, with a
   force push of its branch), and opens the candidate PR.
 - `cut` runs when that PR merges and creates `<release_branch_prefix>X.Y.Z`
-  at the merge commit; it refuses a PR not opened by `pr_author`.
+  at the merge commit; it refuses a PR not opened by `pr_author`. A retry
+  that finds the branch already at that commit exits 0 with a notice; at
+  any other commit it refuses and names both SHAs.
 - `token` must be an App installation token: a `GITHUB_TOKEN` push would not
   trigger the consumer's CI on the candidate PR.
 - The full flow, installation and recovery: [RELEASE.md](../RELEASE.md).

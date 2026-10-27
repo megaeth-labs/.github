@@ -8,8 +8,11 @@ description: >-
   the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release
   with the changelog section as notes. A tag already at the commit without a
   Release (a run that died between the two steps) is resumed: the tag step is
-  skipped and the Release is still created; any other existing tag refuses,
-  because a release is published once. This is the only place in the release
+  skipped and the Release is still created. A tag at the commit with its
+  Release already there is a retry of a finished run and exits 0 with a
+  notice; a tag at any other commit refuses, because a release is published
+  once. A tag push or Release create that loses a race to a concurrent run of
+  the same publish keeps the winner's, if it is at this commit. This is the only place in the release
   flow that creates a tag; merging the settle PR is the approval. The default
   branch's changelog catches up in the next release candidate PR — nothing is
   back-merged. The consumer checks the repository out first
@@ -68,8 +71,8 @@ outputs:
     description: "The tag published, vX.Y.Z (created now, or already at the commit from an interrupted run)."
     value: ${{ steps.guard.outputs.tag }}
   release_url:
-    description: "URL of the GitHub Release."
-    value: ${{ steps.release.outputs.url }}
+    description: "URL of the GitHub Release (created now, or found by a retry of a finished run)."
+    value: ${{ steps.release.outputs.url || steps.guard.outputs.release_url }}
 
 runs:
   using: composite
@@ -151,17 +154,24 @@ runs:
         if [[ "$parent" != "$settled" ]]; then
           echo "::error::release branch drifted: settle PR settled $settled but the branch tip at merge was $parent. Re-run release-settle on the current tip."; exit 1
         fi
-        # A release is published once. The one exception is a run that died
-        # after pushing the tag and before creating the Release: the tag is
-        # already at this commit and no Release exists, so resume from there.
+        # A release is published once, at this commit. A tag already here is
+        # an earlier run of this same publish: without a Release it died
+        # between the two steps and is resumed; with one it finished, and this
+        # run is a no-op. A tag anywhere else refuses.
         tag="v$version"
         tag_exists=false
+        published=false
+        release_url=""
         if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
           git fetch --quiet --force origin "refs/tags/$tag:refs/tags/$tag"
-          if [[ "$(git rev-parse "$tag^{commit}")" == "$MERGE_SHA" ]] && ! gh release view "$tag" >/dev/null 2>&1; then
-            tag_exists=true
+          if [[ "$(git rev-parse "$tag^{commit}")" != "$MERGE_SHA" ]]; then
+            echo "::error::tag $tag already exists (at $(git rev-parse "$tag^{commit}")), not at $MERGE_SHA; a release is published once"; exit 1
+          fi
+          tag_exists=true
+          if release_url="$(gh release view "$tag" --json url -q .url 2>/dev/null)"; then
+            published=true
           else
-            echo "::error::tag $tag already exists (at $(git rev-parse "$tag^{commit}")) and is not an unfinished release of $MERGE_SHA; a release is published once"; exit 1
+            release_url=""
           fi
         fi
         actual="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
@@ -175,9 +185,15 @@ runs:
           echo "version=$version"
           echo "tag=$tag"
           echo "tag_exists=$tag_exists"
+          echo "published=$published"
+          echo "release_url=$release_url"
           echo "merge_sha=$MERGE_SHA"
           echo "notes_file=$notes"
         } >> "$GITHUB_OUTPUT"
+        if [[ "$published" == true ]]; then
+          echo "::notice title=Already published::$tag is at $MERGE_SHA and its Release exists ($release_url); an earlier run finished, nothing to do"
+          exit 0
+        fi
         echo "publishing $tag at $MERGE_SHA (tag already there: $tag_exists)"; echo "--- notes ---"; cat "$notes"
         GITHUB_AUTH_COMMAND
 
@@ -194,12 +210,22 @@ runs:
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         git tag -a "$TAG" "$MERGE_SHA" -m "Release $TAG"
-        git push --quiet origin "refs/tags/$TAG"
-        echo "tagged $MERGE_SHA as $TAG"
+        if git push --quiet origin "refs/tags/$TAG"; then
+          echo "tagged $MERGE_SHA as $TAG"
+        else
+          # A concurrent publish of the same merge pushed first: its tag is
+          # as good as ours. A tag at any other commit is not.
+          git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          if [[ "$(git rev-parse "$TAG^{commit}")" != "$MERGE_SHA" ]]; then
+            echo "::error::could not push $TAG; the remote tag is at $(git rev-parse "$TAG^{commit}"), not $MERGE_SHA"; exit 1
+          fi
+          echo "::notice::$TAG was pushed at $MERGE_SHA by a concurrent run; keeping it"
+        fi
         GITHUB_AUTH_COMMAND
 
     - name: Publish GitHub Release
       id: release
+      if: steps.guard.outputs.published != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
@@ -207,6 +233,11 @@ runs:
         NOTES: ${{ steps.guard.outputs.notes_file }}
       run: |
         set -euo pipefail
-        url="$(gh release create "$TAG" --verify-tag --latest --title "$TAG" --notes-file "$NOTES")"
+        if ! url="$(gh release create "$TAG" --verify-tag --latest --title "$TAG" --notes-file "$NOTES")"; then
+          # A concurrent publish created it first; that Release is this one.
+          url="$(gh release view "$TAG" --json url -q .url)" \
+            || { echo "::error::could not create the Release for $TAG"; exit 1; }
+          echo "::notice::the Release for $TAG was created by a concurrent run; keeping it"
+        fi
         echo "url=$url" >> "$GITHUB_OUTPUT"
         echo "release: $url"

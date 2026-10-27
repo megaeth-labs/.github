@@ -3,7 +3,7 @@
 `uses: megaeth-labs/.github/.github/actions/release-publish@main`
 
 <!-- generated: description -->
-Publish a settled release. Runs on a push to `release-vX.Y.Z` (the consumer passes the `commit` and `pr_number` that `release-route` resolved for the push). Re-verifies the merged `chore/release-settle-vX.Y.Z` PR through the API — merged, merge commit equals the pushed commit, head/base names, author, and the settled-SHA marker against the merge commit's parent — then creates the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release with the changelog section as notes. A tag already at the commit without a Release (a run that died between the two steps) is resumed: the tag step is skipped and the Release is still created; any other existing tag refuses, because a release is published once. This is the only place in the release flow that creates a tag; merging the settle PR is the approval. The default branch's changelog catches up in the next release candidate PR — nothing is back-merged. The consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
+Publish a settled release. Runs on a push to `release-vX.Y.Z` (the consumer passes the `commit` and `pr_number` that `release-route` resolved for the push). Re-verifies the merged `chore/release-settle-vX.Y.Z` PR through the API — merged, merge commit equals the pushed commit, head/base names, author, and the settled-SHA marker against the merge commit's parent — then creates the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release with the changelog section as notes. A tag already at the commit without a Release (a run that died between the two steps) is resumed: the tag step is skipped and the Release is still created. A tag at the commit with its Release already there is a retry of a finished run and exits 0 with a notice; a tag at any other commit refuses, because a release is published once. A tag push or Release create that loses a race to a concurrent run of the same publish keeps the winner's, if it is at this commit. This is the only place in the release flow that creates a tag; merging the settle PR is the approval. The default branch's changelog catches up in the next release candidate PR — nothing is back-merged. The consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 <!-- /generated -->
 
 Family: [Release pipeline](../RELEASE.md).
@@ -32,7 +32,7 @@ Family: [Release pipeline](../RELEASE.md).
 |---|---|
 | `version` | The normalised version, X.Y.Z. |
 | `tag` | The tag published, vX.Y.Z (created now, or already at the commit from an interrupted run). |
-| `release_url` | URL of the GitHub Release. |
+| `release_url` | URL of the GitHub Release (created now, or found by a retry of a finished run). |
 <!-- /generated -->
 
 ## What it runs
@@ -41,7 +41,7 @@ Family: [Release pipeline](../RELEASE.md).
 1. Configure git identity
 1. Guard
 1. Create and push tag *(only if `steps.guard.outputs.tag_exists != 'true'`)*
-1. Publish GitHub Release
+1. Publish GitHub Release *(only if `steps.guard.outputs.published != 'true'`)*
 <!-- /generated -->
 
 ## Errors it reports
@@ -57,6 +57,8 @@ Family: [Release pipeline](../RELEASE.md).
 - `release branch drifted: settle PR settled $settled but the branch tip at merge was $parent. Re-run release-settle on the current tip.`
 - `tag $tag already exists (at $(git rev-parse`
 - `$FILE at $MERGE_SHA says $actual, expected $version`
+- `could not push $TAG; the remote tag is at $(git rev-parse`
+- `could not create the Release for $TAG`
 <!-- /generated -->
 
 ## Example
@@ -78,7 +80,8 @@ In direct mode `release-settle` calls this action itself with `commit` and
 
 ## Notes
 
-- Creates the annotated tag once (refuses if it exists) at the merge commit
+- Creates the annotated tag once (refuses if it exists elsewhere; resumes or
+  no-ops if it is already at this commit) at the merge commit
   in PR mode — refusing if the merge's first parent is not the settled SHA
   recorded in the PR, or the PR was not opened by `pr_author` — or at
   `commit` in explicit mode; then publishes the GitHub Release, marked
