@@ -1395,6 +1395,291 @@ jobs:
             || { echo "expected exactly the v1.2.0 and v1.3.0 Releases:"; cat "$ARGS"; exit 1; }
           echo "ten refusals, no tag, no Release"
 
+  release-route:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      TOOLS: ${{ github.workspace }}/.github/actions/release-tools/release_tools.py
+      ACTION: ${{ github.workspace }}/.github/actions/release-route/action.yml
+      PUBLISH_ACTION: ${{ github.workspace }}/.github/actions/release-publish/action.yml
+      AUTH_WRAPPER: ${{ github.workspace }}/.github/actions/git-auth/with-github-auth.sh
+      GITHUB_AUTH_TOKEN: fixture-token
+      GH_TOKEN: fixture-token
+      GITHUB_REPOSITORY: megaeth-labs/fake
+      EXPECTED_AUTHOR: mega-gutenberg[bot]
+      PREFIX: release-v
+      FILE: VERSION
+      PATTERN: plain
+      DISPATCH_VERSION: ""
+      DEFAULT_BRANCH: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Where the rehearsal lives
+        run: |
+          set -euo pipefail
+          {
+            echo "REPO=$RUNNER_TEMP/route-repo"
+            echo "SH=$RUNNER_TEMP/route-sh"
+            echo "FIX=$RUNNER_TEMP/route-fixtures"
+            echo "OUT=$RUNNER_TEMP/route-output"
+            echo "REAL_GIT=$(command -v git)"
+          } >> "$GITHUB_ENV"
+
+      - name: Extract shipped scripts and install fakes
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          mkdir -p "$SH" "$FIX" "$RUNNER_TEMP/route-bin"
+          python3 - <<'PY'
+          import os, pathlib, yaml
+
+          for action, name, dest in (("ACTION", "Route", "route.sh"),
+                                     ("PUBLISH_ACTION", "Guard", "publish-guard.sh")):
+              steps = yaml.safe_load(pathlib.Path(os.environ[action]).read_text())["runs"]["steps"]
+              script = next(s["run"] for s in steps if s.get("name") == name)
+              pathlib.Path(os.environ["SH"], dest).write_text(script)
+          PY
+          [[ "$(grep -c AUTH_WRAPPER "$ACTION")" -ge 2 ]]
+          cat > "$SH/helpers.sh" <<'SH'
+          route() { # <kind> <ref> <sha> [event]
+            : > "$OUT"
+            ( cd "$REPO" && env KIND="$1" GITHUB_REF_NAME="$2" GITHUB_SHA="$3" \
+                GITHUB_EVENT_NAME="${4:-push}" GITHUB_OUTPUT="$OUT" bash "$SH/route.sh" )
+          }
+          out_get() {
+            python3 - "$OUT" "$1" <<'PY'
+          import pathlib, sys
+          lines = iter(pathlib.Path(sys.argv[1]).read_text().splitlines())
+          values = {}
+          for line in lines:
+              if "<<" in line:
+                  key, end = line.split("<<", 1)
+                  parts = []
+                  for part in lines:
+                      if part == end:
+                          break
+                      parts.append(part)
+                  values[key] = "\n".join(parts)
+              else:
+                  key, value = line.split("=", 1)
+                  values[key] = value
+          print(values.get(sys.argv[2], ""), end="")
+          PY
+          }
+          expect_output() {
+            local actual
+            actual="$(out_get "$1")"
+            [[ "$actual" == "$2" ]] || { echo "expected $1=$2, got '$actual'"; cat "$OUT"; exit 1; }
+          }
+          SH
+          cat > "$RUNNER_TEMP/route-bin/git" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "${1:-}" == fetch || "${1:-}" == ls-remote ]]; then
+            [[ "${GITHUB_AUTH_TOKEN:-}" == fixture-token && -n "${GIT_ASKPASS:-}" \
+                && "${GIT_CONFIG_GLOBAL:-}" == /dev/null ]] \
+              || { echo "remote git bypassed auth wrapper" >&2; exit 97; }
+            echo "authenticated $1" >> "$FIX/auth-calls"
+          fi
+          exec "$REAL_GIT" "$@"
+          SH
+          cat > "$RUNNER_TEMP/route-bin/gh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ "$GH_TOKEN" == fixture-token ]]
+          case "$*" in
+            "repo view "*) echo main ;;
+            api*"/commits/"*"/pulls")
+              cat "$FIX/pulls.json" ;;
+            api*"repos/megaeth-labs/fake/pulls/42")
+              jq '.[0]' "$FIX/settle.json" ;;
+            "pr list "*)
+              echo fallback >> "$FIX/fallback-calls"
+              cat "$FIX/fallback.json" ;;
+            "release view "*)
+              [[ -e "$FIX/release-exists" ]] || exit 1
+              echo '{"tagName":"v1.2.0"}' ;;
+            *) echo "unexpected gh call: $*" >&2; exit 99 ;;
+          esac
+          SH
+          chmod +x "$RUNNER_TEMP/route-bin/"*
+          echo "$RUNNER_TEMP/route-bin" >> "$GITHUB_PATH"
+
+      - name: A local remote and merged PR fixtures
+        run: |
+          set -euo pipefail
+          git init --quiet --bare -b main "$REPO.git"
+          git clone --quiet "$REPO.git" "$REPO" 2>/dev/null
+          cd "$REPO"
+          git config user.name tester
+          git config user.email tester@example.invalid
+          git config commit.gpgsign false
+          git config tag.gpgsign false
+          echo 1.1.0 > VERSION
+          git add VERSION && git commit --quiet -m "feat: initial release"
+          git tag -a v1.1.0 -m seed
+          git push --quiet origin main --tags
+          git rev-parse HEAD > "$FIX/old"
+          git branch release-v1.2.0
+          git branch release-v1.1.0
+          echo 1.2.0 > VERSION
+          printf '# Changelog\n\n## v1.2.0 (2026-10-27)\n\n- shipped\n' > CHANGELOG.md
+          git add -A && git commit --quiet -m "chore(release): candidate v1.2.0"
+          git rev-parse HEAD > "$FIX/candidate"
+          git checkout --quiet release-v1.2.0
+          git merge --quiet --ff-only main
+          git rev-parse HEAD > "$FIX/parent"
+          git commit --quiet --allow-empty -m "Merge settle PR"
+          git rev-parse HEAD > "$FIX/merge"
+          git push --quiet origin main release-v1.2.0 release-v1.1.0 --tags
+          git checkout --quiet release-v1.2.0
+          # Local rewrite survives the real wrapper's blank global config.
+          # Without the wrapper the git shim refuses before touching HTTPS.
+          git config "url.file://$REPO.git.insteadOf" https://github.com/megaeth-labs/fake.git
+          git remote set-url origin https://github.com/megaeth-labs/fake.git
+          if git ls-remote origin > "$FIX/unwrapped.log" 2>&1; then
+            echo "unwrapped remote read succeeded"; exit 1
+          else
+            [[ "$?" == 97 ]]
+          fi
+          grep -qxF "remote git bypassed auth wrapper" "$FIX/unwrapped.log"
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          fix = pathlib.Path(os.environ["FIX"])
+          def sha(name):
+              return (fix / name).read_text().strip()
+          def pr(kind):
+              return {
+                  "number": 41 if kind == "candidate" else 42,
+                  "merged_at": "2026-10-27T00:00:00Z",
+                  "merge_commit_sha": sha(kind if kind == "candidate" else "merge"),
+                  "head": {"ref": f"chore/release-{kind}-v1.2.0"},
+                  "base": {"ref": "main" if kind == "candidate" else "release-v1.2.0"},
+                  "user": {"login": "mega-gutenberg[bot]"},
+                  "body": f"<!-- release-settle: v1.2.0 {sha('parent')} -->",
+              }
+          for kind in ("candidate", "settle"):
+              (fix / f"{kind}.json").write_text(json.dumps([pr(kind)]))
+          p = pr("settle")
+          fallback = [{"number": p["number"], "mergeCommit": {"oid": p["merge_commit_sha"]},
+                       "mergedAt": p["merged_at"], "headRefName": p["head"]["ref"],
+                       "baseRefName": p["base"]["ref"], "author": p["user"], "body": p["body"]}]
+          (fix / "fallback-good.json").write_text(json.dumps(fallback))
+          (fix / "fallback.json").write_text("[]")
+          PY
+
+      - name: Candidate cut and author mismatch
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          cp "$FIX/candidate.json" "$FIX/pulls.json"
+          route candidate main "$(cat "$FIX/candidate")"
+          expect_output action cut
+          expect_output version 1.2.0
+          expect_output release_branch release-v1.2.0
+          expect_output commit "$(cat "$FIX/candidate")"
+          expect_output pr_number 41
+          expect_output targets '[]'
+          jq '.[0].user.login = "mega-maxwell[bot]"' "$FIX/candidate.json" > "$FIX/pulls.json"
+          route candidate main "$(cat "$FIX/candidate")"
+          expect_output action skip
+          [[ "$(out_get reason)" == *"mega-maxwell[bot]"* ]]
+
+      - name: Old version skips and fresh or stale settlement routes
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          echo '[]' > "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/old")"
+          expect_output action skip
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")"
+          expect_output action publish
+          expect_output commit "$(cat "$FIX/merge")"
+          expect_output pr_number 42
+          jq '.[0].body = "<!-- release-settle: v1.2.0 0000000000000000000000000000000000000000 -->"' \
+            "$FIX/settle.json" > "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")"
+          expect_output action refresh
+          [[ "$(out_get targets | jq -r '.[0].commit')" == "$(cat "$FIX/merge")" ]]
+
+      - name: Dispatch excludes tagged branches and filters versions
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          route settle main "$(cat "$FIX/candidate")" workflow_dispatch
+          expect_output action refresh
+          [[ "$(out_get targets | jq length)" == 1 ]]
+          [[ "$(out_get targets | jq -r '.[0].release_branch')" == release-v1.2.0 ]]
+          DISPATCH_VERSION=v1.1.0 route settle main "$(cat "$FIX/candidate")" workflow_dispatch
+          expect_output action skip
+          expect_output targets '[]'
+
+      - name: Lagging index uses merged PR fallback and malformed API fails
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          echo '[]' > "$FIX/pulls.json"
+          cp "$FIX/fallback-good.json" "$FIX/fallback.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")"
+          expect_output action publish
+          expect_output pr_number 42
+          [[ -s "$FIX/fallback-calls" ]]
+          echo '{"message":"API failure"}' > "$FIX/pulls.json"
+          if route settle release-v1.2.0 "$(cat "$FIX/merge")" > "$FIX/malformed.log" 2>&1; then
+            echo "non-array API response succeeded"; exit 1
+          fi
+          [[ ! -s "$OUT" ]]
+          grep -qF "pulls API must return arrays" "$FIX/malformed.log"
+          echo '[]' > "$FIX/fallback.json"
+
+      - name: Partial publication resumes and reports the actual tag commit
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          merge="$(cat "$FIX/merge")"
+          git -C "$REPO" tag -a v1.2.0 "$merge" -m seed
+          git -C "$REPO" tag v1.3.0 "$merge"
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.2.0 refs/tags/v1.3.0
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$merge"
+          expect_output action publish
+          : > "$OUT"
+          ( cd "$REPO" && env MERGE_SHA="$merge" PR_NUMBER=42 CHANGELOG=CHANGELOG.md \
+              GITHUB_OUTPUT="$OUT" bash "$SH/publish-guard.sh" )
+          expect_output tag_exists true
+          expect_output merge_sha "$merge"
+          # A different push must name the peeled commit, not the tag object.
+          echo '[]' > "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/old")" > "$FIX/tagged-skip.log"
+          expect_output action skip
+          [[ "$(out_get reason)" == *"merge commit $merge to finish publishing"* ]]
+          grep -qF "::warning::" "$FIX/tagged-skip.log"
+          # Lightweight tags use the unpeeled ref as the commit.
+          route settle release-v1.3.0 "$(cat "$FIX/old")"
+          expect_output action skip
+          tip="$(git -C "$REPO" rev-parse v1.3.0)"
+          [[ "$(out_get reason)" == *"merge commit $tip to finish publishing"* ]]
+          touch "$FIX/release-exists"
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$merge"
+          expect_output action skip
+          expect_output reason "v1.2.0 is already published"
+          [[ -s "$FIX/auth-calls" ]]
+          echo "all route decisions and publication resume assertions passed"
+
+      - name: Remove rehearsal repositories
+        if: always()
+        run: |
+          rm -rf "$REPO" "$REPO.git" "$SH" "$FIX" "$RUNNER_TEMP/route-bin"
+          rm -f "$OUT"
+
   # The generated parts of every action README (inputs, outputs, steps,
   # errors) and the catalogue come from action.yml; stale docs fail here.
   docs:

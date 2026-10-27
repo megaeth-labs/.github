@@ -154,7 +154,16 @@ class Route(unittest.TestCase):
                 result = self.decision(data, "skip")
                 self.assertIn("v1.2.0 is tagged but has no Release", result["reason"])
                 self.assertIn("re-run the release-settle run", result["reason"])
-                self.assertIn("<tag commit>", result["reason"])
+                self.assertIn("merge commit to finish publishing", result["reason"])
+                self.assertNotIn("<", result["reason"])
+
+    def test_tag_without_release_reason_names_existing_tag_commit(self):
+        data = self.fixture()
+        data.update(tag_exists=True, pulls=[], tag_commit="c" * 40)
+        result = self.decision(data, "skip")
+        self.assertIn(f"merge commit {'c' * 40} to finish publishing", result["reason"])
+        data["tag_commit"] = None
+        self.assertIn("merge commit to finish publishing", self.decision(data, "skip")["reason"])
 
     def test_unpublished_branch_refreshes_without_matching_pr(self):
         data = self.fixture()

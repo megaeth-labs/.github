@@ -1,0 +1,169 @@
+name: Release Route
+description: >-
+  Route a push or manual dispatch to cut, refresh, publish or skip using merged
+  release PR metadata. Read-only; uses the job token, not a release App secret.
+  Requires a checkout with full history and persist-credentials disabled.
+
+inputs:
+  kind:
+    description: "Release flow to route: candidate or settle."
+    required: true
+  github_token:
+    description: "Read-only job token with contents and pull-requests read."
+    default: ${{ github.token }}
+  pr_author:
+    description: "Expected author of candidate and settle PRs."
+    default: "mega-gutenberg[bot]"
+  version_file:
+    description: "File holding the release version."
+    required: true
+  version_pattern:
+    description: "Version file format: plain, toml or json."
+    default: plain
+  release_branch_prefix:
+    description: "Release branch prefix before X.Y.Z."
+    default: release-v
+  version:
+    description: "Optional version filter for manual dispatch."
+    default: ""
+
+outputs:
+  action:
+    description: "Next action: cut, refresh, publish or skip."
+    value: ${{ steps.route.outputs.action }}
+  reason:
+    description: "Why this action was selected."
+    value: ${{ steps.route.outputs.reason }}
+  version:
+    description: "Normalized release version, when routing one push."
+    value: ${{ steps.route.outputs.version }}
+  release_branch:
+    description: "Release branch for the pushed version."
+    value: ${{ steps.route.outputs.release_branch }}
+  commit:
+    description: "Pushed commit for cut, refresh or publish."
+    value: ${{ steps.route.outputs.commit }}
+  pr_number:
+    description: "Merged release PR number, when matched."
+    value: ${{ steps.route.outputs.pr_number }}
+  targets:
+    description: "Compact JSON array of refresh targets."
+    value: ${{ steps.route.outputs.targets }}
+
+runs:
+  using: composite
+  steps:
+    - name: Route
+      id: route
+      shell: bash
+      env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.github_token }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        KIND: ${{ inputs.kind }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        EXPECTED_AUTHOR: ${{ inputs.pr_author }}
+        FILE: ${{ inputs.version_file }}
+        PATTERN: ${{ inputs.version_pattern }}
+        PREFIX: ${{ inputs.release_branch_prefix }}
+        DISPATCH_VERSION: ${{ inputs.version }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
+        set -euo pipefail
+        if [[ "$(git rev-parse --is-shallow-repository)" == true ]]; then
+          echo "::error::release-route needs full history; check out with fetch-depth: 0"; exit 1
+        fi
+        git rev-parse --verify HEAD >/dev/null
+        default="${DEFAULT_BRANCH:-}"
+        if [[ -z "$default" ]]; then
+          default="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)"
+        fi
+        git fetch --quiet --tags origin
+        latest="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+        pulls='[]'; branches='[]'; parent=""; actual=""; tag_commit=""
+        tag_exists=false; release_exists=false
+        # Exit 2 means no matching tag, not a failed remote read.
+        has_tag() {
+          local status
+          if git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null; then
+            return 0
+          else
+            status=$?
+            [[ "$status" == 2 ]] || exit "$status"
+            return 1
+          fi
+        }
+        read_version() {
+          git show "$1:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN"
+        }
+        if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+          parent="$(git rev-parse --verify "$GITHUB_SHA^" 2>/dev/null || true)"
+          pulls="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" |
+            jq -ces 'if all(.[]; type == "array") then add else error("pulls API must return arrays") end')"
+          actual="$(read_version "$GITHUB_SHA" 2>/dev/null || true)"
+          if [[ "$KIND" == settle && "$GITHUB_REF_NAME" == "$PREFIX"* ]]; then
+            version="$(python3 "$TOOLS" normalize "${GITHUB_REF_NAME#"$PREFIX"}")"
+            tag="v$version"
+            if has_tag "$tag"; then
+              tag_exists=true
+              tag_commit="$(git ls-remote origin "refs/tags/$tag^{}" | cut -f1)"
+              if [[ -z "$tag_commit" ]]; then
+                tag_commit="$(git ls-remote origin "refs/tags/$tag" | cut -f1)"
+              fi
+              if gh release view "$tag" --json tagName >/dev/null 2>&1; then release_exists=true; fi
+            fi
+            if [[ "$pulls" == '[]' ]]; then
+              pulls="$(gh pr list --state merged --base "$GITHUB_REF_NAME" \
+                --head "chore/release-settle-v$version" \
+                --json number,mergeCommit,headRefName,baseRefName,author,body,mergedAt |
+                jq -ce 'if type != "array" then error("pr list must return an array") else
+                  map({number, merge_commit_sha: .mergeCommit.oid, merged_at: .mergedAt,
+                    head: {ref: .headRefName}, base: {ref: .baseRefName},
+                    user: {login: .author.login}, body}) end')"
+            fi
+          fi
+        elif [[ "$KIND" == settle && "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+          heads="$(git ls-remote --heads origin "refs/heads/${PREFIX}*")"
+          while read -r tip ref; do
+            [[ -n "$tip" ]] || continue
+            branch="${ref#refs/heads/}"
+            version="$(python3 "$TOOLS" normalize "${branch#"$PREFIX"}")"
+            git fetch --quiet origin "$tip"
+            actual="$(read_version "$tip" 2>/dev/null || true)"
+            tagged=false
+            if has_tag "v$version"; then tagged=true; fi
+            branches="$(jq -c --arg name "$branch" --arg tip "$tip" --arg actual "$actual" \
+              --argjson tagged "$tagged" \
+              '. + [{name: $name, tip: $tip, version_at_tip: (if $actual == "" then null else $actual end), tag_exists: $tagged}]' <<< "$branches")"
+          done <<< "$heads"
+        fi
+        decision="$(jq -n --arg kind "$KIND" --arg event "$GITHUB_EVENT_NAME" \
+          --arg sha "$GITHUB_SHA" --arg first_parent "$parent" --arg ref_name "$GITHUB_REF_NAME" \
+          --arg default_branch "$default" --arg prefix "$PREFIX" --arg pr_author "$EXPECTED_AUTHOR" \
+          --arg version_at_sha "$actual" --arg latest_tag "$latest" --arg dispatch_version "$DISPATCH_VERSION" \
+          --arg tag_commit "$tag_commit" --argjson pulls "$pulls" --argjson branches "$branches" \
+          --argjson tag_exists "$tag_exists" --argjson release_exists "$release_exists" \
+          '{kind: $kind, event: $event, sha: $sha, first_parent: $first_parent,
+            ref_name: $ref_name, default_branch: $default_branch, prefix: $prefix, pr_author: $pr_author,
+            version_at_sha: (if $version_at_sha == "" then null else $version_at_sha end),
+            latest_tag: $latest_tag, dispatch_version: $dispatch_version,
+            tag_commit: (if $tag_commit == "" then null else $tag_commit end),
+            pulls: $pulls, branches: $branches, tag_exists: $tag_exists, release_exists: $release_exists}' |
+          python3 "$TOOLS" route)"
+        # Multiline output framing also keeps API-supplied reasons from becoming output keys.
+        while read -r key; do
+          delimiter="route_$(openssl rand -hex 16)"
+          {
+            echo "$key<<$delimiter"
+            jq -r --arg key "$key" '.[$key] | if type == "array" then tojson elif . == null then "" else . end' <<< "$decision"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+        done < <(jq -r 'keys[]' <<< "$decision")
+        action="$(jq -r .action <<< "$decision")"
+        reason="$(jq -r .reason <<< "$decision")"
+        if [[ "$action" == skip && "$tag_exists" == true && "$release_exists" == false ]]; then
+          echo "::warning::$reason"
+        fi
+        echo "::notice title=Release route::$action: $reason"
+        GITHUB_AUTH_COMMAND

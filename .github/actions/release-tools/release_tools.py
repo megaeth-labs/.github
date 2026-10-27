@@ -132,7 +132,8 @@ def route(data: dict) -> dict:
         ):
             result["reason"] = (
                 f"v{version} is tagged but has no Release: re-run the release-settle run "
-                "for the settle PR's merge commit <tag commit> to finish publishing"
+                "for the settle PR's merge commit"
+                f"{' ' + data['tag_commit'] if data.get('tag_commit') else ''} to finish publishing"
             )
             return result
         if pr:
