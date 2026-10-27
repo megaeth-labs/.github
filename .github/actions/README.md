@@ -9,6 +9,7 @@ a README whose input, output, step and error tables are generated from its
 <!-- generated: catalogue -->
 | Action | Family | Does |
 |---|---|---|
+| [`app-token-lint`](app-token-lint/README.md) | Standalone | Fail a workflow change that mints GitHub App tokens the wrong way. Maxwell (the CI app) may not request a `permission-<x>: write` other than pull-requests and issues; Gutenberg (the release app) may be minted only in a job of the `release` environment, or in a `publish` job when the token asks for exactly `permission-contents: read`; release workflows (those using the release-candidate, release-settle, release-publish or release-route actions, and on-release.yml) mint no Maxwell token, never name their own repository in a read-only dependency token, and never use `mega-maxwell[bot]` as a git identity or PR author filter; and `environment: release` appears only in release-candidate.yml, release-settle.yml and on-release.yml. Violations are reported as `::error file=<path>::<job>/<step>: <rule>: <message>`; unreadable or malformed YAML is an error too. No network. |
 | [`claude-interactive`](claude-interactive/README.md) | [Claude CI](CLAUDE-CI.md) | Run the interactive @claude handler with centralized MegaETH permissions. |
 | [`claude-issue-triage`](claude-issue-triage/README.md) | [Claude CI](CLAUDE-CI.md) | Run the centralized MegaETH Claude issue triage. |
 | [`claude-label-check`](claude-label-check/README.md) | [Claude CI](CLAUDE-CI.md) | Run the centralized MegaETH Claude pull request label check. |

@@ -49,6 +49,19 @@ jobs:
             -p 'test_*.py' \
             -v
 
+      - name: Test app-token-lint
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 -m unittest discover \
+            -s .github/scripts \
+            -p 'test_*.py' \
+            -v
+
+      - name: Lint workflow templates for App token usage
+        run: python3 .github/scripts/app_token_lint.py --repo my-repo workflow-templates/
+
   # release-verify-version is bash inside a composite action; drive it with
   # fake binaries and check each outcome the README promises.
   verify-version:

@@ -1,0 +1,40 @@
+name: App Token Lint
+description: >-
+  Fail a workflow change that mints GitHub App tokens the wrong way. Maxwell
+  (the CI app) may not request a `permission-<x>: write` other than
+  pull-requests and issues; Gutenberg (the release app) may be minted only in a
+  job of the `release` environment, or in a `publish` job when the token asks
+  for exactly `permission-contents: read`; release workflows (those using the
+  release-candidate, release-settle, release-publish or release-route actions,
+  and on-release.yml) mint no Maxwell token, never name their own repository
+  in a read-only dependency token, and never use `mega-maxwell[bot]` as a git
+  identity or PR author filter; and `environment: release` appears only in
+  release-candidate.yml, release-settle.yml and on-release.yml. Violations are
+  reported as `::error file=<path>::<job>/<step>: <rule>: <message>`; unreadable
+  or malformed YAML is an error too. No network.
+
+inputs:
+  paths:
+    description: >-
+      Workflow files or directories of them to lint, separated by whitespace
+      (no spaces inside a path). The repository name used by the own-repository
+      check comes from `GITHUB_REPOSITORY`.
+    required: false
+    default: .github/workflows
+
+runs:
+  using: composite
+  steps:
+    - name: Install PyYAML if missing
+      shell: bash
+      run: python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet pyyaml
+
+    - name: Lint App token usage
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        LINT_PATHS: ${{ inputs.paths }}
+      run: |
+        set -euo pipefail
+        read -r -d '' -a paths <<< "$LINT_PATHS" || true
+        python3 "$ACTION_PATH/../../scripts/app_token_lint.py" "${paths[@]}"
