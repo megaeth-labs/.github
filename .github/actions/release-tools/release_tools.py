@@ -5,6 +5,7 @@ Everything git- or GitHub-facing stays in the actions' bash steps; this module
 only transforms text so it can be unit-tested without a repository. stdlib only.
 
 Subcommands (see `main`):
+  route                                     -> stdin: routing JSON object; stdout: decision JSON object
   normalize   VERSION                       -> X.Y.Z on stdout, exit 1 if invalid
   is-greater  VERSION LATEST_TAG_OR_EMPTY   -> exit 0 if VERSION > LATEST, else 1
   read-file   PATH PATTERN                  -> version found in the file
@@ -73,6 +74,118 @@ def is_greater(version: str, latest: str) -> bool:
     if not latest.strip():
         return True
     return version_tuple(version) > version_tuple(latest)
+
+
+# --- release routing --------------------------------------------------------
+
+
+def route(data: dict) -> dict:
+    """Decide the next release action from an already collected snapshot."""
+    if not isinstance(data, dict):
+        raise ValueError("route input must be a JSON object")
+    kind, event, ref = (data.get(key, "") for key in ("kind", "event", "ref_name"))
+    prefix = data.get("prefix", "release-v")
+    sha = data.get("sha", "")
+    result = {
+        "action": "skip",
+        "reason": f"no route for kind={kind}, event={event}, ref={ref}",
+        "version": "",
+        "release_branch": "",
+        "commit": "",
+        "pr_number": None,
+        "targets": [],
+    }
+    if event == "push" and (
+        (kind == "candidate" and ref == data.get("default_branch"))
+        or (kind == "settle" and ref.startswith(prefix))
+    ):
+        candidate = kind == "candidate"
+        head_prefix = "chore/release-candidate-"
+        if not candidate:
+            version = normalize_version(ref[len(prefix):])
+            result.update(version=version, release_branch=ref, commit=sha)
+            if data.get("tag_exists") and data.get("release_exists"):
+                result["reason"] = f"v{version} is already published"
+                return result
+        pr = next((
+            pr for pr in data.get("pulls", [])
+            if pr.get("merged_at") and pr.get("merge_commit_sha") == sha
+            and pr.get("base", {}).get("ref") == ref
+            and (
+                pr.get("head", {}).get("ref", "").startswith(head_prefix)
+                if candidate else pr.get("head", {}).get("ref") == f"chore/release-settle-v{version}"
+            )
+        ), None)
+        fresh = False
+        marker = None
+        if pr and not candidate:
+            match = re.search(
+                rf"<!-- release-settle: v{re.escape(version)} ([0-9a-fA-F]{{40}}) -->",
+                pr.get("body") or "",
+            )
+            marker = match.group(1) if match else None
+            fresh = marker is not None and marker == data.get("first_parent")
+        author = pr.get("user", {}).get("login") if pr else None
+        expected_author = data.get("pr_author", "mega-gutenberg[bot]")
+        if not candidate and data.get("tag_exists") and not (
+            fresh and author == expected_author
+        ):
+            result["reason"] = (
+                f"v{version} is tagged but has no Release: re-run the release-settle run "
+                "for the settle PR's merge commit <tag commit> to finish publishing"
+            )
+            return result
+        if pr:
+            if author != expected_author:
+                result["reason"] = f"PR #{pr['number']} author {author} does not match {expected_author}"
+                return result
+            result["pr_number"] = pr["number"]
+            if candidate:
+                version = normalize_version(pr["head"]["ref"][len(head_prefix):])
+                result.update(
+                    action="cut", reason=f"merged candidate PR #{pr['number']}",
+                    version=version, release_branch=f"{prefix}{version}", commit=sha,
+                )
+                return result
+            if fresh:
+                result.update(action="publish", reason=f"merged fresh settle PR #{pr['number']}")
+                return result
+            result["reason"] = (
+                f"merged settle PR #{pr['number']} was stale (settled {marker}, "
+                f"tip was {data.get('first_parent')}); a fresh settle PR follows"
+            )
+        elif candidate:
+            result["reason"] = "no merged candidate PR matches this push"
+            return result
+        elif data.get("version_at_sha") != version:
+            result["reason"] = "the candidate has not landed on this branch yet"
+            return result
+        elif not is_greater(version, data.get("latest_tag", "")):
+            result["reason"] = f"v{version} is not greater than latest tag {data.get('latest_tag')}"
+            return result
+        else:
+            result["reason"] = f"refresh settle PR for v{version}"
+        result.update(action="refresh", targets=[
+            {"version": version, "release_branch": ref, "commit": sha},
+        ])
+    elif kind == "settle" and event == "workflow_dispatch":
+        selected = data.get("dispatch_version", "")
+        selected = normalize_version(selected) if selected else ""
+        for branch in data.get("branches", []):
+            if not branch["name"].startswith(prefix) or branch["tag_exists"]:
+                continue
+            version = normalize_version(branch["name"][len(prefix):])
+            if (branch["version_at_tip"] == version
+                    and is_greater(version, data.get("latest_tag", ""))
+                    and (not selected or version == selected)):
+                result["targets"].append({
+                    "version": version, "release_branch": branch["name"], "commit": branch["tip"],
+                })
+        result.update(
+            action="refresh" if result["targets"] else "skip",
+            reason="refresh eligible release branches" if result["targets"] else "no eligible release branches",
+        )
+    return result
 
 
 # --- version files ----------------------------------------------------------
@@ -224,6 +337,8 @@ def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="release_tools")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("route")
+
     s = sub.add_parser("normalize")
     s.add_argument("version")
 
@@ -261,7 +376,9 @@ def main(argv: list[str]) -> int:
 
     a = p.parse_args(argv)
     try:
-        if a.cmd == "normalize":
+        if a.cmd == "route":
+            print(json.dumps(route(json.load(sys.stdin))))
+        elif a.cmd == "normalize":
             print(normalize_version(a.version))
         elif a.cmd == "is-greater":
             return 0 if is_greater(a.version, a.latest) else 1
