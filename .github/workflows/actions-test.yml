@@ -465,6 +465,411 @@ jobs:
           [[ "$SKIP" == "false" && -z "$PR" ]] || { echo "skip-check=$SKIP pr_number=$PR"; exit 1; }
           echo "false outside a queue, as documented"
 
+  # Drive the shipped settle scripts against a real local remote. Only GitHub's
+  # PR API is faked; branch ancestry, conflicts, notes and recovery are real.
+  release-settle:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      TOOLS: ${{ github.workspace }}/.github/actions/release-tools/release_tools.py
+      ACTION: ${{ github.workspace }}/.github/actions/release-settle/action.yml
+      AUTH_WRAPPER: ${{ github.workspace }}/.github/actions/git-auth/with-github-auth.sh
+      GITHUB_AUTH_TOKEN: fixture-token
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Where the settle rehearsal lives
+        run: |
+          set -euo pipefail
+          {
+            echo "FIXTURE=$RUNNER_TEMP/release-settle"
+            echo "REPO=$RUNNER_TEMP/release-settle/repo"
+            echo "SH=$RUNNER_TEMP/release-settle/sh"
+            echo "OUT=$RUNNER_TEMP/release-settle/output"
+            echo "PR_STATE=$RUNNER_TEMP/release-settle/prs.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Extract the settle shell and its helpers
+        run: |
+          set -euo pipefail
+          mkdir -p "$SH" "$FIXTURE/bin"
+          python3 - "$ACTION" "$SH" <<'PY'
+          import pathlib, sys, yaml
+
+          action = yaml.safe_load(open(sys.argv[1]))
+          assert action["inputs"]["pr_author"]["default"] == "mega-gutenberg[bot]"
+          assert action["inputs"]["git_user_name"]["default"] == "mega-gutenberg[bot]"
+          assert action["inputs"]["git_user_email"]["default"] == "348780249+mega-gutenberg[bot]@users.noreply.github.com"
+          assert not {"settle_mode", "settlers", "github_token"} & action["inputs"].keys()
+          assert set(action["outputs"]) == {"version", "pr_url", "notes_file"}
+          want = {"Guard": "guard.sh", "Generate release notes": "notes.sh", "Ensure the settle PR": "ensure.sh"}
+          found = {s["name"]: s["run"] for s in action["runs"]["steps"] if s.get("name") in want}
+          assert found.keys() == want.keys(), f"missing shipped steps: {want.keys() - found.keys()}"
+          for name, script in found.items():
+              pathlib.Path(sys.argv[2], want[name]).write_text(script)
+              print(f"extracted {name!r}")
+          PY
+          cat > "$SH/helpers.sh" <<'SH'
+          export VERSION=1.1.0 BRANCH=release-v1.1.0 HEAD_BRANCH=chore/release-settle-v1.1.0
+          export GH_TOKEN=fixture-token PR_AUTHOR='mega-gutenberg[bot]' PR_LABELS='release, needs-ci'
+          export GITHUB_REPOSITORY=megaeth-labs/fake GITHUB_OUTPUT="$OUT"
+          export INPUT_VERSION=v1.1.0 BRANCH_IN='' PREFIX=release-v FILE=VERSION PATTERN=plain CHANGELOG=CHANGELOG.md
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
+          make_repo() {
+            git init --quiet --bare --initial-branch=main "$REPO.git"
+            git -C "$REPO.git" config receive.denyNonFastForwards true
+            git clone --quiet "$REPO.git" "$REPO"
+            git -C "$REPO" config user.name 'mega-gutenberg[bot]'
+            git -C "$REPO" config user.email '348780249+mega-gutenberg[bot]@users.noreply.github.com'
+            (
+              cd "$REPO"
+              printf '1.0.0\n' > VERSION
+              printf '# Changelog\n\n## v1.0.0 (2025-01-01)\n\n- shipped\n' > CHANGELOG.md
+              git add VERSION CHANGELOG.md
+              git commit --quiet -m 'feat: initial release'
+              git tag v1.0.0
+              git push --quiet origin main refs/tags/v1.0.0
+              git checkout --quiet -b "$BRANCH"
+              printf '1.1.0\n' > VERSION
+              printf '# Changelog\n\n## v1.1.0\n\n- candidate draft\n\n## v1.0.0 (2025-01-01)\n\n- shipped\n' > CHANGELOG.md
+              git add VERSION CHANGELOG.md
+              git commit --quiet -m 'chore(release): candidate v1.1.0'
+              git push --quiet origin "$BRANCH"
+            )
+            printf '{"pulls": [], "events": []}\n' > "$PR_STATE"
+          }
+
+          remote_head() {
+            git -C "$REPO" ls-remote --heads origin "refs/heads/$1" | cut -f1
+          }
+
+          settle() {
+            (
+              cd "$REPO"
+              export COMMIT="$1" RUNNER_TEMP="$FIXTURE"
+              : > "$OUT"
+              bash "$SH/guard.sh" || exit
+              grep -qxF "version=$VERSION" "$OUT"
+              grep -qxF "branch=$BRANCH" "$OUT"
+              export PREVIOUS=v1.0.0
+              bash "$SH/notes.sh" || exit
+              export NOTES="$FIXTURE/release-notes-v$VERSION.md"
+              bash "$SH/ensure.sh"
+            )
+          }
+
+          assert_pr() { # number, marker SHA
+            python3 - "$PR_STATE" "$1" "$2" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          pr = state["pulls"][int(sys.argv[2]) - 1]
+          assert pr["state"] == "open", pr
+          assert pr["author"]["login"] == "mega-gutenberg[bot]", pr
+          assert pr["headRefName"] == "chore/release-settle-v1.1.0", pr
+          assert pr["baseRefName"] == "release-v1.1.0", pr
+          assert pr["body"].count(f"<!-- release-settle: v1.1.0 {sys.argv[3]} -->") == 1, pr
+          assert pr["labels"] == ["release", "needs-ci"], pr
+          PY
+            [[ "${3:-}" == no-output ]] || grep -qxF "pr_url=https://example.invalid/pull/$1" "$OUT"
+          }
+
+          advance() {
+            git -C "$REPO" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+            printf '%s\n' "$1" >> "$REPO/fixes"
+            git -C "$REPO" add fixes
+            git -C "$REPO" commit --quiet -m "fix: $1"
+            git -C "$REPO" push --quiet origin "$BRANCH"
+          }
+
+          merge_settle() { # number, route fixture
+            git -C "$REPO" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+            git -C "$REPO" merge --quiet --no-ff --no-edit "origin/$HEAD_BRANCH"
+            git -C "$REPO" push --quiet origin "$BRANCH"
+            python3 - "$PR_STATE" "$1" "$2" "$REPO" <<'PY'
+          import json, pathlib, subprocess, sys
+          path = pathlib.Path(sys.argv[1])
+          state = json.loads(path.read_text())
+          pr = state["pulls"][int(sys.argv[2]) - 1]
+          sha = subprocess.check_output(["git", "-C", sys.argv[4], "rev-parse", "HEAD"], text=True).strip()
+          parent = subprocess.check_output(["git", "-C", sys.argv[4], "rev-parse", "HEAD^1"], text=True).strip()
+          pr["state"] = "merged"
+          path.write_text(json.dumps(state))
+          pull = {"number": pr["number"], "merged_at": "2026-01-01T00:00:00Z", "merge_commit_sha": sha,
+                  "head": {"ref": pr["headRefName"]}, "base": {"ref": pr["baseRefName"]},
+                  "user": pr["author"], "body": pr["body"]}
+          fixture = {"kind": "settle", "event": "push", "sha": sha, "first_parent": parent,
+                     "ref_name": pr["baseRefName"], "default_branch": "main", "prefix": "release-v",
+                     "pr_author": "mega-gutenberg[bot]", "pulls": [pull], "tag_exists": False,
+                     "release_exists": False, "version_at_sha": "1.1.0", "latest_tag": "v1.0.0",
+                     "branches": [], "dispatch_version": ""}
+          pathlib.Path(sys.argv[3]).write_text(json.dumps(fixture))
+          PY
+          }
+          SH
+
+      - name: Fake GitHub PR state and a fixed notes date
+        run: |
+          set -euo pipefail
+          cat > "$FIXTURE/bin/gh" <<'PY'
+          #!/usr/bin/env python3
+          import json, os, pathlib, subprocess, sys
+
+          path = pathlib.Path(os.environ["PR_STATE"])
+          state = json.loads(path.read_text())
+          args = sys.argv[1:]
+          def option(flag):
+              return args[args.index(flag) + 1]
+          def save(event):
+              state["events"].append(event)
+              path.write_text(json.dumps(state))
+
+          if args[:2] == ["pr", "list"]:
+              assert option("--state") == "open"
+              fields = option("--json").split(",")
+              pulls = [pr for pr in state["pulls"] if pr["state"] == "open"
+                       and pr["headRefName"] == option("--head") and pr["baseRefName"] == option("--base")]
+              print(json.dumps([{key: pr[key] for key in fields} for pr in pulls]))
+          elif args[:2] == ["pr", "create"]:
+              assert not any(pr["state"] == "open" and pr["headRefName"] == option("--head")
+                             and pr["baseRefName"] == option("--base") for pr in state["pulls"])
+              number = len(state["pulls"]) + 1
+              pr = {"number": number, "url": f"https://example.invalid/pull/{number}", "state": "open",
+                    "author": {"login": os.environ["PR_AUTHOR"]}, "headRefName": option("--head"),
+                    "baseRefName": option("--base"), "title": option("--title"),
+                    "body": pathlib.Path(option("--body-file")).read_text(),
+                    "labels": [args[i + 1] for i, arg in enumerate(args) if arg == "--label"]}
+              state["pulls"].append(pr)
+              save("create")
+              print(pr["url"])
+          elif args[:2] == ["pr", "edit"]:
+              if os.environ.get("FAIL_PR_EDIT") == "1":
+                  save("edit-failed")
+                  sys.exit("simulated gh pr edit failure")
+              pr = state["pulls"][int(args[2]) - 1]
+              assert pr["state"] == "open"
+              pr["body"] = pathlib.Path(option("--body-file")).read_text()
+              save("edit")
+              print(pr["url"])
+          elif args[:2] == ["pr", "close"]:
+              pr = state["pulls"][int(args[2]) - 1]
+              assert pr["state"] == "open"
+              pr["state"] = "closed"
+              pr["comment"] = option("--comment")
+              save("close")
+          elif args[:3] == ["api", "-X", "DELETE"]:
+              prefix = "repos/megaeth-labs/fake/git/refs/heads/"
+              assert len(args) == 4 and args[3].startswith(prefix), args
+              subprocess.run(["git", "push", "--quiet", "--delete", "origin", args[3][len(prefix):]], check=True)
+              save("delete")
+          else:
+              sys.exit(f"unexpected gh command: {args}")
+          PY
+          # Notes are unchanged across reruns even if a run crosses UTC midnight.
+          printf '#!/bin/bash\n[[ "$*" == "-u +%%F" ]] || exit 1\nprintf "2026-01-01\\n"\n' > "$FIXTURE/bin/date"
+          chmod +x "$FIXTURE/bin/gh" "$FIXTURE/bin/date"
+          echo "$FIXTURE/bin" >> "$GITHUB_PATH"
+
+      - name: Create then refresh then no-op without rewriting history
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          make_repo
+          tip="$(remote_head "$BRANCH")"
+          # A leftover local branch must not prevent the action's checkout -B.
+          git -C "$REPO" branch "$HEAD_BRANCH" "$tip"
+          settle "$tip"
+          assert_pr 1 "$tip"
+          old="$(remote_head "$HEAD_BRANCH")"
+          [[ "$(git -C "$REPO" rev-parse "$old^1")" == "$tip" ]]
+          advance 'second fix'
+          tip="$(remote_head "$BRANCH")"
+          settle "$tip"
+          assert_pr 1 "$tip"
+          new="$(remote_head "$HEAD_BRANCH")"
+          git -C "$REPO" merge-base --is-ancestor "$old" "$new"
+          git -C "$REPO" merge-base --is-ancestor "$tip" "$new"
+          [[ "$(git -C "$REPO" rev-list --count --merges "$old..$new")" == 1 ]]
+          [[ "$(remote_head "$BRANCH")" == "$tip" ]]
+          git -C "$REPO" show "$new:CHANGELOG.md" | grep -qF 'second fix'
+          cp "$PR_STATE" "$FIXTURE/before-noop.json"
+          settle "$tip"
+          assert_pr 1 "$tip"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$new" ]]
+          cmp "$PR_STATE" "$FIXTURE/before-noop.json"
+          python3 - "$PR_STATE" <<'PY'
+          import json, sys
+          assert json.load(open(sys.argv[1]))["events"] == ["create", "edit"]
+          PY
+          echo "PASS create -> refresh -> no-op; old settle head $old is an ancestor of $new"
+
+      - name: Replace an open Maxwell-authored settle PR
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          python3 - "$PR_STATE" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          state = json.loads(path.read_text())
+          state["pulls"][0]["author"]["login"] = "mega-maxwell[bot]"
+          path.write_text(json.dumps(state))
+          PY
+          tip="$(remote_head "$BRANCH")"
+          settle "$tip"
+          assert_pr 2 "$tip"
+          new="$(remote_head "$HEAD_BRANCH")"
+          [[ "$(git -C "$REPO" rev-parse "$new^1")" == "$tip" ]]
+          python3 - "$PR_STATE" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          assert state["pulls"][0]["state"] == "closed"
+          assert state["pulls"][0]["comment"] == "Superseded: the settle PR is now maintained by mega-gutenberg."
+          assert state["events"][-3:] == ["close", "delete", "create"], state
+          PY
+          echo "PASS Maxwell PR closed and replaced, including orphan branch deletion"
+
+      - name: Resume a refresh after gh pr edit fails
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          old_tip="$(remote_head "$BRANCH")"
+          old_head="$(remote_head "$HEAD_BRANCH")"
+          advance 'retry fix'
+          tip="$(remote_head "$BRANCH")"
+          if FAIL_PR_EDIT=1 settle "$tip" > "$FIXTURE/edit-failed.log" 2>&1; then
+            echo "expected gh pr edit failure"; exit 1
+          fi
+          assert_pr 2 "$old_tip" no-output
+          pushed="$(remote_head "$HEAD_BRANCH")"
+          [[ "$pushed" != "$old_head" ]]
+          git -C "$REPO" merge-base --is-ancestor "$old_head" "$pushed"
+          git -C "$REPO" merge-base --is-ancestor "$tip" "$pushed"
+          settle "$tip"
+          assert_pr 2 "$tip"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$pushed" ]]
+          python3 - "$PR_STATE" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          assert len(state["pulls"]) == 2
+          assert state["events"][-2:] == ["edit-failed", "edit"]
+          PY
+          echo "PASS rerun repairs the stale marker without adding a commit or PR"
+
+      - name: Merge a refreshed settle PR whose marker update failed
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          old_tip="$(remote_head "$BRANCH")"
+          advance 'stale merge fix'
+          tip="$(remote_head "$BRANCH")"
+          if FAIL_PR_EDIT=1 settle "$tip" > "$FIXTURE/stale-edit-failed.log" 2>&1; then
+            echo "expected gh pr edit failure"; exit 1
+          fi
+          assert_pr 2 "$old_tip" no-output
+          pushed="$(remote_head "$HEAD_BRANCH")"
+          git -C "$REPO" merge-base --is-ancestor "$tip" "$pushed"
+          git -C "$REPO" show "$pushed:CHANGELOG.md" | grep -qF 'stale merge fix'
+          merge_settle 2 "$FIXTURE/stale-route.json"
+          merged="$(remote_head "$BRANCH")"
+          [[ "$(git -C "$REPO" rev-parse "$merged^1")" == "$tip" ]]
+          python3 - "$FIXTURE/stale-route.json" "$old_tip" <<'PY'
+          import json, sys
+          fixture = json.load(open(sys.argv[1]))
+          assert f"<!-- release-settle: v1.1.0 {sys.argv[2]} -->" in fixture["pulls"][0]["body"]
+          assert fixture["first_parent"] != sys.argv[2]
+          PY
+          echo "PASS stale marker retained after the refreshed notes merge at $merged"
+
+      - name: Route the stale merge to refresh
+        run: |
+          set -euo pipefail
+          python3 "$TOOLS" route < "$FIXTURE/stale-route.json" > "$FIXTURE/stale-decision.json"
+          python3 - "$FIXTURE/stale-decision.json" <<'PY'
+          import json, sys
+          decision = json.load(open(sys.argv[1]))
+          assert decision["action"] == "refresh", decision
+          assert decision["reason"], decision
+          print("PASS stale merge routes to refresh:", decision)
+          PY
+
+      - name: Record the replacement settlement with an empty commit
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          tip="$(remote_head "$BRANCH")"
+          settle "$tip"
+          assert_pr 3 "$tip"
+          head="$(remote_head "$HEAD_BRANCH")"
+          [[ "$head" != "$tip" ]]
+          [[ "$(git -C "$REPO" rev-parse "$head^1")" == "$tip" ]]
+          git -C "$REPO" diff --exit-code "$tip" "$head"
+          [[ "$(git -C "$REPO" show -s --format=%s "$head")" == "chore(release): settle v1.1.0" ]]
+          git -C "$REPO" show -s --format=%b "$head" | grep -qxF \
+            "Changelog already current at $tip; this PR records the settlement decision."
+          merge_settle 3 "$FIXTURE/fresh-route.json"
+          python3 - "$FIXTURE/fresh-route.json" "$PR_STATE" <<'PY'
+          import json, sys
+          fixture = json.load(open(sys.argv[1]))
+          assert f'<!-- release-settle: v1.1.0 {fixture["first_parent"]} -->' in fixture["pulls"][0]["body"]
+          state = json.load(open(sys.argv[2]))
+          assert len(state["pulls"]) == 3
+          assert state["events"][-2:] == ["delete", "create"]
+          assert not any(pr["state"] == "open" for pr in state["pulls"])
+          PY
+          [[ "$(git -C "$REPO" ls-remote --tags origin | wc -l)" == 1 ]]
+          echo "PASS empty settle commit, replacement marker and fresh merge; no release tag created"
+
+      - name: Route the replacement merge to publish
+        run: |
+          set -euo pipefail
+          python3 "$TOOLS" route < "$FIXTURE/fresh-route.json" > "$FIXTURE/fresh-decision.json"
+          python3 - "$FIXTURE/fresh-decision.json" <<'PY'
+          import json, sys
+          decision = json.load(open(sys.argv[1]))
+          assert decision["action"] == "publish", decision
+          assert decision["reason"], decision
+          print("PASS replacement merge routes to publish:", decision)
+          PY
+
+      - name: A conflicting changelog asks the maintainer to close the PR
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          export REPO="$FIXTURE/conflict" PR_STATE="$FIXTURE/conflict-prs.json"
+          make_repo
+          settle "$(remote_head "$BRANCH")"
+          before="$(remote_head "$HEAD_BRANCH")"
+          cp "$PR_STATE" "$FIXTURE/before-conflict.json"
+          git -C "$REPO" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+          printf '# Changelog\n\n## v1.1.0\n\n- maintainer changes the draft\n\n## v1.0.0 (2025-01-01)\n\n- shipped\n' > "$REPO/CHANGELOG.md"
+          git -C "$REPO" add CHANGELOG.md
+          git -C "$REPO" commit --quiet -m 'fix: conflicting changelog'
+          git -C "$REPO" push --quiet origin "$BRANCH"
+          if settle "$(remote_head "$BRANCH")" > "$FIXTURE/conflict.log" 2>&1; then
+            echo "expected a conflicting merge to fail"; exit 1
+          fi
+          cat "$FIXTURE/conflict.log"
+          grep -qF 'close the settle PR so the next run recreates it' "$FIXTURE/conflict.log"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$before" ]]
+          cmp "$PR_STATE" "$FIXTURE/before-conflict.json"
+          [[ -z "$(git -C "$REPO" status --porcelain)" ]]
+          if git -C "$REPO" rev-parse --verify MERGE_HEAD; then
+            echo "failed merge was not aborted"; exit 1
+          fi
+          echo "PASS conflicting CHANGELOG fails, aborts the merge and leaves remote refs and PR untouched"
+
+      - name: Remove settle rehearsal resources
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$FIXTURE"
+          [[ ! -e "$FIXTURE" ]]
+          echo "removed $FIXTURE (both throwaway remotes, clones, PR state and extracted scripts)"
+
   # release-candidate's propose shell runs at the start of every release in
   # every repository, and a real run needs an app token and a live remote.
   # Drive the shipped script instead — extracted from action.yml, never copied
