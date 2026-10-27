@@ -178,8 +178,10 @@ Step 1 then works differently, and steps 3 and 4 are unchanged:
   syncs the entry back from the tag the way it does after any release. The
   next version must still be newer than `v1.2.3`.
 
-The version must be newer than the newest `v*` tag in the repository, as
-usual. That covers two cases: an earlier commit on the current default
+The version must be newer than the newest `vX.Y.Z` tag in the repository, as
+usual (tags such as `v1.2.0-rc1` are not releases and are ignored). Publishing
+re-checks this when the settle PR merges, so a line that a newer release
+overtook while its settle PR was open is refused, never tagged. That covers two cases: an earlier commit on the current default
 branch, and a hotfix of the latest tag (new `release-vX.Y.Z` cut there,
 candidate PR aimed at that branch). It still does not patch an older line
 that a higher tag has already passed.

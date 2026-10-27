@@ -65,7 +65,9 @@ another directory or several, e.g. `paths: .github/workflows workflow-templates`
   workflows mint no Maxwell token and no read-only dependency token naming
   their own repository; **L4** release workflows never use `mega-maxwell[bot]`;
   **L5** `environment: release` only in `release-candidate.yml`,
-  `release-settle.yml` and `on-release.yml`.
+  `release-settle.yml` and `on-release.yml`; **L6** a Maxwell or Gutenberg
+  token, and any app token in a release job, requests at least one
+  `permission-<x>` (without one it gets every permission of the installation).
 - A token step is a step using `actions/create-github-app-token`; Maxwell is
   recognised by `MEGA_MAXWELL_`, `CI_APP_ID` or `MEGA_CI_APP_PK` in
   `client-id`, `app-id` or `private-key`, Gutenberg by `RELEASE_APP_`.

@@ -202,7 +202,7 @@ runs:
           exit 1
         fi
         git fetch --quiet --tags origin
-        latest="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+        latest="$(git tag -l 'v*' | python3 "$TOOLS" latest-tag)"
         if ! python3 "$TOOLS" is-greater "$VERSION" "$latest"; then
           echo "::error::$VERSION is not newer than the latest tag ${latest:-<none>}"
           exit 1
@@ -226,7 +226,7 @@ runs:
             # Settlement leaves the latest tag off trunk (bump + dated
             # changelog). A hotfix of that tag is still the current line,
             # not a random side branch.
-            latest="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+            latest="$(git tag -l 'v*' | python3 "$TOOLS" latest-tag)"
             on_release_line=0
             if [[ -n "$latest" ]]; then
               latest_sha="$(git rev-parse --verify --quiet "${latest}^{commit}" || true)"
@@ -415,7 +415,7 @@ runs:
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
-        latest="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+        latest="$(git tag -l 'v*' | python3 "$TOOLS" latest-tag)"
         # 1. Sync the previous release's entry from its tag. Settle stamped
         #    the date (and any drift) on the release branch and nothing
         #    back-merges it: this PR is where the default branch catches up.

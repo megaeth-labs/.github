@@ -146,7 +146,8 @@ run; `::warning::` and the route `skip` reason do not.
 | `no merged candidate PR matches this push` | A push to the default branch that is not the merge of a candidate PR. Normal for every other push. |
 | `PR #N author X does not match mega-gutenberg[bot]` | The PR was not opened by gutenberg (for example a hand-made or pre-migration PR). It never cuts or publishes. Close it and start the release again. |
 | `the candidate has not landed on this branch yet` | The release branch still has the old version. Nothing to do until the candidate PR merges into it. |
-| `vX.Y.Z is not greater than latest tag` | The branch is older than the latest tag. Not a release. |
+| `not refreshing a settle PR: vX.Y.Z is not newer than the latest published tag vA.B.C (rule: …)` | The branch is not newer than the latest `vX.Y.Z` tag. Not a release. |
+| `refusing to publish settle PR #N: vX.Y.Z is not newer than the latest published tag vA.B.C (rule: a version is published only when it is newer than every vX.Y.Z tag)` | An older line (a hotfix branch) was settled after a newer release was published. It is not tagged, so the newer Release stays latest. Cut the fix as a version above vA.B.C instead. |
 | `vX.Y.Z is already published` | The tag and the Release both exist. |
 | `merged settle PR #N was stale (settled …, tip was …); a fresh settle PR follows` | The branch moved after the settle PR was written. Review and merge the fresh PR. |
 | `vX.Y.Z is tagged but has no Release: re-run the release-settle run for the settle PR's merge commit … to finish publishing` (also a `::warning::`) | `publish` died between tag and Release. Re-run the failed run for that merge commit; it creates the missing Release. |
@@ -157,6 +158,7 @@ run; `::warning::` and the route `skip` reason do not.
 | Message | Meaning and action |
 |---|---|
 | `release-route needs full history; check out with fetch-depth: 0` | The route job's checkout is shallow. |
+| `cannot read the version file: FILE does not exist at … ` / `… does not parse with version_pattern '…'` | The route's `version_file` or `version_pattern` does not match the repository (or the settle step). The route fails, it does not skip: fix the workflow. |
 | `cut needs the commit and pr_number inputs (the release-route outputs)` | The `cut` job did not pass the route outputs. |
 | `candidate PR #N has not been merged; cut only runs for a merged candidate` | `cut` ran for a PR that was closed unmerged. |
 | `candidate PR #N targets '…', not the default branch '…'` | Only a candidate merged into the default branch is cut. |
@@ -170,6 +172,10 @@ run; `::warning::` and the route `skip` reason do not.
 | `settle PR body has no '<!-- release-settle: ... -->' marker; refusing to publish an unverifiable settlement` | The PR body was edited. Close it and let settle recreate it. |
 | `settle PR #N was opened by '…', not by 'mega-gutenberg[bot]' …; refusing to publish from it` | A hand-made settle PR never publishes. |
 | `tag vX.Y.Z already exists … and is not an unfinished release of …; a release is published once` | Publish refuses to retag. Investigate the existing tag. |
+| `Refusing to publish an older version::settle PR #N: vX.Y.Z is not newer than the latest published tag vA.B.C …` | Publish re-checks the route's order rule, in the guard and again right before the tag push. Nothing was tagged. |
+| `::warning title=Not the latest Release::vX.Y.Z is published without becoming latest …` | A newer Release was published while this one was in flight. The Release exists but GitHub's "latest" stays on the newer one. |
+| `release-vX.Y.Z moved to … after this refresh of … started …` | A refresh lost the race to a settle-PR merge or a newer push. It wrote nothing; the run for the new tip refreshes the settle PR. |
+| `::notice title=Already tagged::vX.Y.Z is already tagged, so this refresh … does not open or update a settle PR for it` | The release was published while this refresh ran. Nothing to do. |
 | `::warning::… lacks workflows that <default> has: … — a release-event workflow runs from the tagged commit's tree …` | The release branch is missing a workflow that the default branch has (usually `on-release.yml`). Add it to the branch through its own PR before merging the settle PR, or the Release publishes with nothing attached. |
 
 ### App-token lint errors
@@ -184,6 +190,7 @@ Each is reported as `::error file=<path>::<job>/<step>: <rule>: <message>`.
 | L3 | `read-only dependency token names the repository itself (…)` | Remove the repository from `repositories:`; the checkout uses the job token. |
 | L4 | `mega-maxwell[bot] is not a release identity` | Use `mega-gutenberg[bot]` as git identity and PR-author filter. |
 | L5 | ``environment `release` is only for release-candidate.yml, release-settle.yml and on-release.yml`` | Move the job, or use a different environment. |
+| L6 | `Maxwell token requests no permission-* inputs, so it gets every permission of the installation (contents write included); list the permissions it needs` (also for Gutenberg, and for any app token in a release job) | Add the `permission-<x>:` inputs the job needs. |
 | parse | `malformed YAML …`, `not a workflow: the document is not a mapping`, `no such file or directory`, `no workflow files (*.yml, *.yaml) found` | Fix the input; a file that cannot be read never lints clean. |
 
 ## App-token lint

@@ -157,6 +157,48 @@ class Render(unittest.TestCase):
         self.assertEqual(propose["with"]["dependency_token"], "${{ github.token }}")
         self.assertNotIn("dependency-token", text)
 
+    def test_bump_command_with_a_hash_is_kept_whole(self):
+        # Unquoted, ` # regenerate lock` would be a YAML comment and vanish.
+        for command in ("make bump # regenerate lock", "make bump: all", "'quoted' && echo \"x\"",
+                        "[ -f x ] || make", "@scripts/bump", "true", "123", "*glob"):
+            with self.subTest(command=command):
+                text = render("release-candidate.yml", (TEMPLATES / "release-candidate.yml").read_text(),
+                              self.args("--bump-command", command))
+                (propose,) = shared(yaml.safe_load(text), "propose", "release-candidate")
+                self.assertEqual(propose["with"]["bump_command"], command)
+                self.assertEqual(check("release-candidate.yml", text, {"bump_command": command}), [])
+
+    def test_plain_values_stay_plain(self):
+        text = render("release-candidate.yml", (TEMPLATES / "release-candidate.yml").read_text(),
+                      self.args("--bump-command", "cargo update --workspace"))
+        self.assertIn("          bump_command: cargo update --workspace\n", text)
+
+    def test_other_substituted_values_read_back_exactly(self):
+        args = self.args("--version-file", "crates/a #b/Cargo.toml", "--changelog-file", "docs/CHANGES: all.md",
+                         "--default-branch", "dev,next", "--bump-command", "x",
+                         "--dependency-repositories", "pstd #1")
+        for name in RELEASE_TEMPLATES:
+            text = render(name, (TEMPLATES / name).read_text(), args)
+            doc = yaml.safe_load(text)
+            self.assertEqual(check(name, text, copy_templates.expected_inputs(args)), [], name)
+            if name != "release-settle.yml":
+                self.assertEqual(doc[True]["push"]["branches"], ["dev,next"], name)
+        text = render("release-candidate.yml", (TEMPLATES / "release-candidate.yml").read_text(), args)
+        (token,) = [s for s in steps(yaml.safe_load(text), "propose") if s.get("id") == "dependency-token"]
+        self.assertEqual(token["with"]["repositories"], "pstd #1")
+
+    def test_check_reports_a_value_that_reads_back_differently(self):
+        text = render("release-candidate.yml", (TEMPLATES / "release-candidate.yml").read_text(),
+                      self.args("--bump-command", "make bump"))
+        problems = check("release-candidate.yml", text, {"bump_command": "make bump # regenerate lock"})
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("bump_command reads back as 'make bump', not 'make bump # regenerate lock'", problems[0])
+
+    def test_refuses_an_actions_ref_that_cannot_sit_in_uses(self):
+        for ref in ("main # v3", "a b", ""):
+            with self.subTest(ref=ref), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.args("--actions-ref", ref)
+
     def test_actions_ref_pins_every_shared_action(self):
         sha = "0" * 40
         for name in RELEASE_TEMPLATES:

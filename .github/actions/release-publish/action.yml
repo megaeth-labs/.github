@@ -11,7 +11,10 @@ description: >-
   skipped and the Release is still created. A tag at the commit with its
   Release already there is a retry of a finished run and exits 0 with a
   notice; a tag at any other commit refuses, because a release is published
-  once. A tag push or Release create that loses a race to a concurrent run of
+  once. A version that is not newer than every other `vX.Y.Z` tag (the rule
+  `release-route` applies) is refused before the tag, and the Release is
+  marked latest only when it is newer than the current latest Release. A
+  tag push or Release create that loses a race to a concurrent run of
   the same publish keeps the winner's, if it is at this commit. This is the only place in the release
   flow that creates a tag; merging the settle PR is the approval. The default
   branch's changelog catches up in the next release candidate PR — nothing is
@@ -178,6 +181,17 @@ runs:
         if [[ "$actual" != "$version" ]]; then
           echo "::error::$FILE at $MERGE_SHA says $actual, expected $version"; exit 1
         fi
+        # The rule release-route applies: only a version newer than every
+        # vX.Y.Z tag but its own is published, so an older line merged late
+        # (a v1.2.1 hotfix after v1.3.0) is never tagged or made the latest.
+        if [[ "$published" != true ]]; then
+          latest="$(git ls-remote --tags --refs origin 'refs/tags/v*' | cut -f2 | sed 's#^refs/tags/##' |
+            python3 "$TOOLS" latest-tag --exclude "$version")"
+          if ! refusal="$(python3 "$TOOLS" check-order "$version" "$latest")"; then
+            echo "::error title=Refusing to publish an older version::settle PR #$PR_NUMBER: $refusal"; exit 1
+          fi
+          echo "order check passed: v$version is newer than the latest tag ${latest:-<none>}"
+        fi
         notes="$RUNNER_TEMP/release-notes-v$version.md"
         git show "$MERGE_SHA:$CHANGELOG" > "$RUNNER_TEMP/changelog-at-merge.md"
         python3 "$TOOLS" changelog-extract "$RUNNER_TEMP/changelog-at-merge.md" "$version" > "$notes"
@@ -206,9 +220,17 @@ runs:
         GITHUB_AUTH_TOKEN: ${{ inputs.token }}
         TAG: ${{ steps.guard.outputs.tag }}
         MERGE_SHA: ${{ steps.guard.outputs.merge_sha }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
+        # Re-check the order now, right before the tag exists: another release
+        # line publishes under its own concurrency group and may have won.
+        latest="$(git ls-remote --tags --refs origin 'refs/tags/v*' | cut -f2 | sed 's#^refs/tags/##' |
+          python3 "$TOOLS" latest-tag --exclude "$TAG")"
+        if ! refusal="$(python3 "$TOOLS" check-order "$TAG" "$latest")"; then
+          echo "::error title=Refusing to publish an older version::not tagging $MERGE_SHA: $refusal (tagged since the guard ran)"; exit 1
+        fi
         git tag -a "$TAG" "$MERGE_SHA" -m "Release $TAG"
         if git push --quiet origin "refs/tags/$TAG"; then
           echo "tagged $MERGE_SHA as $TAG"
@@ -231,9 +253,29 @@ runs:
         GH_TOKEN: ${{ inputs.token }}
         TAG: ${{ steps.guard.outputs.tag }}
         NOTES: ${{ steps.guard.outputs.notes_file }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
-        if ! url="$(gh release create "$TAG" --verify-tag --latest --title "$TAG" --notes-file "$NOTES")"; then
+        # Mark the Release latest only if it is newer than the Release GitHub
+        # calls latest now (a concurrent publish of a newer line may have won).
+        if current="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>"$RUNNER_TEMP/latest-release.err")"; then
+          :
+        elif grep -qF "HTTP 404" "$RUNNER_TEMP/latest-release.err"; then
+          current=""
+        else
+          cat "$RUNNER_TEMP/latest-release.err" >&2
+          echo "::error::cannot read the latest Release to decide whether $TAG is the latest; re-run to resume"; exit 1
+        fi
+        # A latest Release whose tag is not vX.Y.Z cannot be ordered: ignore it.
+        current="$(python3 "$TOOLS" latest-tag <<< "$current")"
+        if refusal="$(python3 "$TOOLS" check-order "$TAG" "$current")"; then
+          latest_flag=--latest
+          echo "marking $TAG latest: newer than the latest Release ${current:-<none>} (rule: latest only when newer than the latest Release)"
+        else
+          latest_flag=--latest=false
+          echo "::warning title=Not the latest Release::$TAG is published without becoming latest: $refusal (rule: latest only when newer than the latest Release)"
+        fi
+        if ! url="$(gh release create "$TAG" --verify-tag "$latest_flag" --title "$TAG" --notes-file "$NOTES")"; then
           # A concurrent publish created it first; that Release is this one.
           url="$(gh release view "$TAG" --json url -q .url)" \
             || { echo "::error::could not create the Release for $TAG"; exit 1; }

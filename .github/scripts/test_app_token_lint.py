@@ -81,6 +81,32 @@ class L1Maxwell(unittest.TestCase):
         self.assertEqual(lint("ci.yml", workflow(job(app="other", permissions={"contents": "write"}))), [])
 
 
+class L6ExplicitPermissions(unittest.TestCase):
+    def test_maxwell_token_without_permissions_fails(self):
+        # create-github-app-token without permission-* returns the
+        # installation's full set, contents write included.
+        for app in ("maxwell", "legacy"):
+            with self.subTest(app=app):
+                lines = lint("ci.yml", workflow(job(app=app)))
+                self.assertEqual(rules(lines), [("L6", "build")])
+                self.assertTrue(lines[0].startswith("::error file=ci.yml::build/token: L6: Maxwell token requests no permission-* inputs"))
+
+    def test_gutenberg_token_without_permissions_fails_even_in_release(self):
+        text = workflow(job(app="gutenberg", environment="release", release_step=True))
+        self.assertEqual(rules(lint("release-settle.yml", text)), [("L6", "build")])
+
+    def test_any_app_token_in_a_release_job_needs_permissions(self):
+        self.assertEqual(rules(lint("ci.yml", workflow(job(app="other", release_step=True)))), [("L6", "build")])
+        text = workflow(job(app="other", environment="release"))
+        self.assertEqual(rules(lint("release-candidate.yml", text)), [("L6", "build")])
+
+    def test_other_app_outside_release_jobs_is_not_checked(self):
+        self.assertEqual(lint("ci.yml", workflow(job(app="other"))), [])
+
+    def test_a_single_read_permission_is_enough(self):
+        self.assertEqual(lint("ci.yml", workflow(job(permissions={"contents": "read"}))), [])
+
+
 class L2GutenbergEnvironment(unittest.TestCase):
     WRITE = {"contents": "write", "pull-requests": "write"}
 

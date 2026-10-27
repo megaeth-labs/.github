@@ -21,6 +21,49 @@ class Versions(unittest.TestCase):
         self.assertFalse(rt.is_greater("1.9.9", "v1.10.0"))
         self.assertFalse(rt.is_greater("2.2.0", "2.2.0"))
 
+    def test_latest_tag_ignores_tags_that_are_not_plain_releases(self):
+        # git's -v:refname puts v1.2.0-rc1 above v1.2.0; it is not a release.
+        tags = ["v1.2.0-rc1", "v1.2.0", "v1.10.0-beta", "vnext", "v1.9.0", "1.99.0", "v01.0.0", ""]
+        self.assertEqual(rt.latest_release_tag(tags),
+                         ("v1.9.0", ["v1.2.0-rc1", "v1.10.0-beta", "vnext", "1.99.0", "v01.0.0"]))
+        self.assertEqual(rt.latest_release_tag(["v1.2.0-rc1"]), ("", ["v1.2.0-rc1"]))
+        self.assertEqual(rt.latest_release_tag([]), ("", []))
+
+    def test_latest_tag_can_leave_out_the_version_being_published(self):
+        tags = ["v1.2.0", "v1.3.0", "v1.1.0"]
+        self.assertEqual(rt.latest_release_tag(tags, "1.3.0")[0], "v1.2.0")
+        self.assertEqual(rt.latest_release_tag(tags, "v1.2.0")[0], "v1.3.0")
+
+    def test_latest_tag_cli(self):
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdin", io.StringIO("v1.2.0\nv1.3.0-rc1\nv1.1.0\n")), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(rt.main(["latest-tag"]), 0)
+        self.assertEqual(out.getvalue(), "v1.2.0\n")
+        self.assertIn("ignoring tag 'v1.3.0-rc1'", err.getvalue())
+        out = io.StringIO()
+        with patch("sys.stdin", io.StringIO("v1.2.0\n")), contextlib.redirect_stdout(out):
+            self.assertEqual(rt.main(["latest-tag", "--exclude", "1.2.0"]), 0)
+        self.assertEqual(out.getvalue(), "\n")
+
+    def test_order_refusal_names_both_versions_and_the_rule(self):
+        self.assertIsNone(rt.order_refusal("1.3.0", "v1.2.0"))
+        self.assertIsNone(rt.order_refusal("1.3.0", ""))
+        for latest in ("v1.3.0", "v1.10.0"):
+            refusal = rt.order_refusal("1.3.0", latest)
+            self.assertIn("v1.3.0 is not newer than the latest published tag " + latest, refusal)
+            self.assertIn(rt.ORDER_RULE, refusal)
+        self.assertIn("'v1.4.0-rc1' is not vX.Y.Z", rt.order_refusal("1.3.0", "v1.4.0-rc1"))
+
+    def test_check_order_cli(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(rt.main(["check-order", "v1.2.1", "v1.3.0"]), 1)
+            self.assertEqual(rt.main(["check-order", "1.3.1", "v1.3.0"]), 0)
+            self.assertEqual(rt.main(["check-order", "1.0.0", ""]), 0)
+        self.assertEqual(out.getvalue().strip(),
+                         f"v1.2.1 is not newer than the latest published tag v1.3.0 ({rt.ORDER_RULE})")
+
 
 class Route(unittest.TestCase):
     SHA = "a" * 40
@@ -131,6 +174,36 @@ class Route(unittest.TestCase):
         data.update(tag_exists=True, release_exists=True, pulls=[])
         result = self.decision(data, "skip")
         self.assertIn("v1.2.0 is already published", result["reason"])
+
+    def test_fresh_merge_of_an_older_version_is_not_published(self):
+        # release-v1.2.1 (a hotfix line) is merged after v1.3.0 was published.
+        data = self.fixture()
+        data.update(latest_tag="v1.3.0")
+        for tag_exists in (False, True):
+            with self.subTest(tag_exists=tag_exists):
+                data["tag_exists"] = tag_exists
+                result = self.decision(data, "skip")
+                self.assertIn("refusing to publish settle PR #42", result["reason"])
+                self.assertIn("v1.2.0 is not newer than the latest published tag v1.3.0", result["reason"])
+                self.assertIn(rt.ORDER_RULE, result["reason"])
+
+    def test_fresh_merge_of_the_same_version_as_latest_is_not_published(self):
+        data = self.fixture()
+        data.update(latest_tag="v1.2.0")
+        self.assertIn("not newer than the latest published tag v1.2.0", self.decision(data, "skip")["reason"])
+
+    def test_unparsable_latest_tag_skips_instead_of_failing(self):
+        for pulls in ("fresh", "none"):
+            with self.subTest(pulls=pulls):
+                data = self.fixture()
+                data["latest_tag"] = "v1.3.0-rc1"
+                if pulls == "none":
+                    data["pulls"] = []
+                result = self.decision(data, "skip")
+                self.assertIn("'v1.3.0-rc1' is not vX.Y.Z", result["reason"])
+        data = self.dispatch_fixture()
+        data["latest_tag"] = "v1.3.0-rc1"
+        self.decision(data, "skip")
 
     def test_tag_without_release_fresh_merge_resumes_publish(self):
         data = self.fixture()

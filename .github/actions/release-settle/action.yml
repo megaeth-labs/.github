@@ -120,7 +120,7 @@ runs:
         if [[ "$actual" != "$version" ]]; then
           echo "::error::$FILE at $COMMIT says $actual, expected $version"; exit 1
         fi
-        latest="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+        latest="$(git tag -l 'v*' | python3 "$TOOLS" latest-tag)"
         if ! python3 "$TOOLS" is-greater "$version" "$latest"; then
           echo "::error::$version is not newer than the latest tag ${latest:-<none>}"; exit 1
         fi
@@ -204,6 +204,26 @@ runs:
         err="$RUNNER_TEMP/settle-gh-stderr.txt"
         stage="starting"
         trap 'echo "::error::settle PR not ensured; stopped while $stage"' ERR
+        # Refresh and publish queue separately, so since the Guard ran the
+        # settle PR may have been merged (the branch moved) and published (the
+        # tag exists). Checked again right before every remote write, so a
+        # late refresh never opens a settle PR for a released version.
+        still_unsettled() {
+          stage="re-checking that v$VERSION is untagged and $BRANCH is still at $COMMIT"
+          local status=0
+          git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null || status=$?
+          if [[ "$status" == 0 ]]; then
+            echo "::notice title=Already tagged::v$VERSION is already tagged, so this refresh of $COMMIT does not open or update a settle PR for it"
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$status" == 2 ]] || exit "$status"
+          tip="$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)"
+          if [[ "$tip" != "$COMMIT" ]]; then
+            echo "::error::$BRANCH moved to ${tip:-<deleted>} after this refresh of $COMMIT started (a settle PR merge or a new push); not touching the settle PR, the run for the new tip refreshes it"
+            exit 1
+          fi
+        }
 
         label_args=()
         IFS=',' read -ra labels <<<"$PR_LABELS"
@@ -278,6 +298,7 @@ runs:
               echo "::notice::settle PR is up to date: $pr_url"
               exit 0
             fi
+            still_unsettled
             if [[ "$changed" == true ]]; then
               # Only now, with the merge and the changelog both committed.
               stage="pushing $head"
@@ -298,6 +319,7 @@ runs:
             # visible yet; deleting the branch now would close that PR.
             echo "::error::$head was taken by a concurrent run but no open settle PR is visible yet; re-run this workflow"; exit 1
           fi
+          still_unsettled
           # A closed, merged, or superseded PR leaves no maintained history.
           if git ls-remote --exit-code --heads origin "refs/heads/$head" >/dev/null; then
             stage="deleting the stale $head"

@@ -38,6 +38,6 @@ Gutenberg is the release app (`vars.RELEASE_APP_CLIENT_ID`,
 `secrets.RELEASE_APP_PRIVATE_KEY`), minted only in a job of the `release`
 environment, where every write of a release is made. The
 [`app-token-lint`](.github/actions/app-token-lint/README.md) action enforces
-this on every workflow change (rules L1-L5, listed with their messages in the
+this on every workflow change (rules L1-L6, listed with their messages in the
 [runbook](docs/RELEASING.md#app-token-lint-errors)); run it locally with
 `python3 .github/scripts/app_token_lint.py --repo <repo> <workflows dir>`.

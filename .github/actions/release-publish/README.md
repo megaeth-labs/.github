@@ -3,7 +3,7 @@
 `uses: megaeth-labs/.github/.github/actions/release-publish@main`
 
 <!-- generated: description -->
-Publish a settled release. Runs on a push to `release-vX.Y.Z` (the consumer passes the `commit` and `pr_number` that `release-route` resolved for the push). Re-verifies the merged `chore/release-settle-vX.Y.Z` PR through the API — merged, merge commit equals the pushed commit, head/base names, author, and the settled-SHA marker against the merge commit's parent — then creates the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release with the changelog section as notes. A tag already at the commit without a Release (a run that died between the two steps) is resumed: the tag step is skipped and the Release is still created. A tag at the commit with its Release already there is a retry of a finished run and exits 0 with a notice; a tag at any other commit refuses, because a release is published once. A tag push or Release create that loses a race to a concurrent run of the same publish keeps the winner's, if it is at this commit. This is the only place in the release flow that creates a tag; merging the settle PR is the approval. The default branch's changelog catches up in the next release candidate PR — nothing is back-merged. The consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
+Publish a settled release. Runs on a push to `release-vX.Y.Z` (the consumer passes the `commit` and `pr_number` that `release-route` resolved for the push). Re-verifies the merged `chore/release-settle-vX.Y.Z` PR through the API — merged, merge commit equals the pushed commit, head/base names, author, and the settled-SHA marker against the merge commit's parent — then creates the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release with the changelog section as notes. A tag already at the commit without a Release (a run that died between the two steps) is resumed: the tag step is skipped and the Release is still created. A tag at the commit with its Release already there is a retry of a finished run and exits 0 with a notice; a tag at any other commit refuses, because a release is published once. A version that is not newer than every other `vX.Y.Z` tag (the rule `release-route` applies) is refused before the tag, and the Release is marked latest only when it is newer than the current latest Release. A tag push or Release create that loses a race to a concurrent run of the same publish keeps the winner's, if it is at this commit. This is the only place in the release flow that creates a tag; merging the settle PR is the approval. The default branch's changelog catches up in the next release candidate PR — nothing is back-merged. The consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 <!-- /generated -->
 
 Family: [Release pipeline](../RELEASE.md).
@@ -58,6 +58,7 @@ Family: [Release pipeline](../RELEASE.md).
 - `tag $tag already exists (at $(git rev-parse`
 - `$FILE at $MERGE_SHA says $actual, expected $version`
 - `could not push $TAG; the remote tag is at $(git rev-parse`
+- `cannot read the latest Release to decide whether $TAG is the latest; re-run to resume`
 - `could not create the Release for $TAG`
 <!-- /generated -->
 
@@ -84,8 +85,12 @@ In direct mode `release-settle` calls this action itself with `commit` and
   no-ops if it is already at this commit) at the merge commit
   in PR mode — refusing if the merge's first parent is not the settled SHA
   recorded in the PR, or the PR was not opened by `pr_author` — or at
-  `commit` in explicit mode; then publishes the GitHub Release, marked
-  latest, with the changelog section as notes.
+  `commit` in explicit mode; then publishes the GitHub Release with the
+  changelog section as notes, marked latest only when it is newer than the
+  current latest Release.
+- Refuses a version that is not newer than every other `vX.Y.Z` tag (the
+  rule `release-route` applies), in the guard and again right before the tag
+  push; tags that are not `vX.Y.Z` are ignored.
 - The tag push comes from the app token so `push: tags` and `release`
   workflows fire; the app must bypass the `v*` tag ruleset.
 - This workflow must exist on the release branch (it does when the branch

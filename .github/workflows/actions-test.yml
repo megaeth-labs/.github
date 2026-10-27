@@ -843,6 +843,48 @@ jobs:
           print("PASS replacement merge routes to publish:", decision)
           PY
 
+      # Refresh and publish run in different concurrency groups. A refresh
+      # whose Guard passed just before settle PR #3 was merged must not open a
+      # fourth settle PR (or delete the head branch) for a published version.
+      - name: A refresh that started before the merge opens no settle PR
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          merged="$(remote_head "$BRANCH")"
+          before="$(git -C "$REPO" rev-parse "$merged^1")"
+          head="$(remote_head "$HEAD_BRANCH")"
+          cp "$PR_STATE" "$FIXTURE/before-late.json"
+          late() { # <commit>: the steps after a Guard that already passed
+            (
+              cd "$REPO"
+              export COMMIT="$1" RUNNER_TEMP="$FIXTURE" PREVIOUS=v1.0.0
+              : > "$OUT"
+              bash "$SH/notes.sh" > /dev/null
+              export NOTES="$FIXTURE/release-notes-v$VERSION.md"
+              bash "$SH/ensure.sh"
+            )
+          }
+          # Merged, not yet tagged: the branch moved past the settled tip.
+          if late "$before" > "$FIXTURE/late.log" 2>&1; then
+            echo "a late refresh of the pre-merge tip succeeded"; cat "$FIXTURE/late.log"; exit 1
+          fi
+          grep -qF "$BRANCH moved to $merged after this refresh of $before started" "$FIXTURE/late.log" \
+            || { cat "$FIXTURE/late.log"; exit 1; }
+          cmp "$PR_STATE" "$FIXTURE/before-late.json"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$head" ]]
+          # Published: the tag exists, so even the current tip is not settled again.
+          git -C "$REPO" tag -a v1.1.0 "$merged" -m published
+          git -C "$REPO" push --quiet origin refs/tags/v1.1.0
+          late "$merged" > "$FIXTURE/late.log" 2>&1 || { cat "$FIXTURE/late.log"; exit 1; }
+          grep -qF "::notice title=Already tagged::v1.1.0 is already tagged, so this refresh of $merged does not open or update a settle PR for it" \
+            "$FIXTURE/late.log" || { cat "$FIXTURE/late.log"; exit 1; }
+          grep -qxF "pr_url=" "$OUT"
+          cmp "$PR_STATE" "$FIXTURE/before-late.json"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$head" ]]
+          git -C "$REPO" push --quiet origin :refs/tags/v1.1.0
+          git -C "$REPO" tag -d v1.1.0 > /dev/null
+          echo "PASS a late refresh neither deletes the head branch nor opens a settle PR"
+
       - name: A conflicting changelog asks the maintainer to close the PR
         run: |
           set -euo pipefail
@@ -1652,6 +1694,7 @@ jobs:
             : > "$OUT.release"
             ( cd "$REPO" && env \
                 GH_TOKEN=fake \
+                GITHUB_REPOSITORY=megaeth-labs/fake \
                 TAG="$(out_get tag)" \
                 NOTES="$(out_get notes_file)" \
                 GITHUB_OUTPUT="$OUT.release" \
@@ -1759,6 +1802,14 @@ jobs:
             cat "$f"
             exit 0
           fi
+          if [[ "${1:-}" == api && "${2:-}" == repos/*/releases/latest ]]; then
+            if [[ -s "$FIX/latest-release" ]]; then
+              cat "$FIX/latest-release"
+              exit 0
+            fi
+            echo "gh: Not Found (HTTP 404)" >&2
+            exit 1
+          fi
           if [[ "${1:-}" == release && "${2:-}" == view ]]; then
             if grep -qxF "${3:-}" "$RELEASES"; then
               echo "https://github.com/megaeth-labs/fake/releases/tag/$3"
@@ -1784,6 +1835,8 @@ jobs:
             [[ -s "$notes" ]] || { echo "gh: --notes-file '$notes' is missing or empty" >&2; exit 1; }
             echo "$*" >> "$ARGS"
             echo "$3" >> "$RELEASES"
+            # GitHub's "latest" moves only for a Release created with --latest.
+            if [[ " $* " == *" --latest "* ]]; then echo "$3" > "$FIX/latest-release"; fi
             echo "https://github.com/megaeth-labs/fake/releases/tag/$3"
             exit 0
           fi
@@ -1964,6 +2017,47 @@ jobs:
           fi
           grep -qF "not $(cat "$FIX/merge-121")" "$RUNNER_TEMP/race.log" || { cat "$RUNNER_TEMP/race.log"; exit 1; }
           echo "races at the same commit converge; a tag elsewhere still fails"
+
+      # v2.1.0 is tagged (above): a settle PR for an older line that is merged
+      # now must not be tagged, and must not take "latest" from a newer one.
+      - name: An older version merged after a newer one is refused, and only the newest is latest
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          created="$(grep -c . "$ARGS")"
+          settle 1.9.5 130
+          refuse 130 "v1.9.5 is not newer than the latest published tag v2.1.0"
+          # The guard refuses, not only the tag step's re-check behind it.
+          grep -qF "::error title=Refusing to publish an older version::settle PR #130: v1.9.5 is not newer than the latest published tag v2.1.0 (rule: a version is published only when it is newer than every vX.Y.Z tag)" \
+            "$RUNNER_TEMP/refused.log" || { cat "$RUNNER_TEMP/refused.log"; exit 1; }
+          grep -qxF "version=1.9.5" "$OUT" && { echo "the guard wrote outputs for a refused version"; exit 1; }
+          [[ -z "$(git ls-remote "$REPO.git" refs/tags/v1.9.5)" ]] || { echo "v1.9.5 was tagged"; exit 1; }
+          [[ "$(grep -c . "$ARGS")" == "$created" ]] || { echo "a Release was created for v1.9.5"; exit 1; }
+
+          # Two lines publish under their own concurrency groups. v3.0.0 passes
+          # its guard, then v3.1.0 is published before v3.0.0's tag step runs.
+          settle 3.0.0 131
+          guard 131
+          cp "$OUT" "$OUT.131"
+          settle 3.1.0 132
+          publish 132
+          grep -qF "release create v3.1.0 --verify-tag --latest --title v3.1.0 " "$ARGS" || { cat "$ARGS"; exit 1; }
+          [[ "$(cat "$FIX/latest-release")" == v3.1.0 ]]
+          cp "$OUT.131" "$OUT"
+          if tag_step > "$RUNNER_TEMP/late.log" 2>&1; then echo "a tag step after a newer tag succeeded"; exit 1; fi
+          grep -qF "v3.0.0 is not newer than the latest published tag v3.1.0" "$RUNNER_TEMP/late.log" \
+            || { cat "$RUNNER_TEMP/late.log"; exit 1; }
+          [[ -z "$(git ls-remote "$REPO.git" refs/tags/v3.0.0)" ]] || { echo "v3.0.0 was tagged"; exit 1; }
+
+          # Its tag got out before the newer Release (a run resumed late): the
+          # Release is still created, but it does not take "latest".
+          seed_tag v3.0.0 "$(cat "$FIX/merge-131")"
+          release_step > "$RUNNER_TEMP/late.log" 2>&1 || { cat "$RUNNER_TEMP/late.log"; exit 1; }
+          grep -qF "release create v3.0.0 --verify-tag --latest=false --title v3.0.0 " "$ARGS" || { cat "$ARGS"; exit 1; }
+          grep -qF "Not the latest Release::v3.0.0 is published without becoming latest" "$RUNNER_TEMP/late.log" \
+            || { cat "$RUNNER_TEMP/late.log"; exit 1; }
+          [[ "$(cat "$FIX/latest-release")" == v3.1.0 ]] || { echo "latest moved back to $(cat "$FIX/latest-release")"; exit 1; }
+          echo "v1.9.5 refused after v2.1.0; v3.0.0 not tagged after v3.1.0, and its late Release is not latest"
 
   release-route:
     runs-on: ubuntu-24.04
@@ -2215,14 +2309,82 @@ jobs:
           grep -qF "pulls API must return arrays" "$FIX/malformed.log"
           echo '[]' > "$FIX/fallback.json"
 
+      # git's -v:refname sorts v1.3.0-rc1 above every v1.2.x: it must not be
+      # taken for the latest release, or every route would fail on it.
+      - name: A tag that is not vX.Y.Z is ignored, not fatal
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          git -C "$REPO" tag v1.3.0-rc1 "$(cat "$FIX/old")"
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.3.0-rc1
+          [[ "$(git -C "$REPO" tag -l 'v*' --sort=-v:refname | head -n1)" == v1.3.0-rc1 ]]
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")" > "$FIX/rc.log" 2>&1 \
+            || { echo "an rc tag failed the route"; cat "$FIX/rc.log"; exit 1; }
+          expect_output action publish
+          grep -qF "ignoring tag 'v1.3.0-rc1'" "$FIX/rc.log" || { cat "$FIX/rc.log"; exit 1; }
+          jq '.[0].body = "<!-- release-settle: v1.2.0 0000000000000000000000000000000000000000 -->"' \
+            "$FIX/settle.json" > "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")"
+          expect_output action refresh
+          route settle main "$(cat "$FIX/candidate")" workflow_dispatch
+          expect_output action refresh
+          [[ "$(out_get targets | jq -r '.[0].release_branch')" == release-v1.2.0 ]]
+          echo "v1.3.0-rc1 is ignored: publish, refresh and dispatch all route"
+
+      # A hotfix line merged after a newer release would otherwise be tagged
+      # and made the latest Release.
+      - name: An older version merged after a newer release is not published
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          merge="$(cat "$FIX/merge")"
+          git -C "$REPO" tag v1.3.0 "$(cat "$FIX/old")"
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.3.0
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$merge"
+          expect_output action skip
+          expect_output reason "refusing to publish settle PR #42: v1.2.0 is not newer than the latest published tag v1.3.0 (rule: a version is published only when it is newer than every vX.Y.Z tag)"
+          : > "$OUT"
+          if ( cd "$REPO" && env GITHUB_REPOSITORY="$FAKE_REPOSITORY" MERGE_SHA="$merge" PR_NUMBER=42 \
+              CHANGELOG=CHANGELOG.md GITHUB_OUTPUT="$OUT" bash "$SH/publish-guard.sh" ) > "$FIX/older.log" 2>&1; then
+            echo "the publish guard accepted an older version"; cat "$FIX/older.log"; exit 1
+          fi
+          grep -qF "Refusing to publish an older version::settle PR #42: v1.2.0 is not newer than the latest published tag v1.3.0" "$FIX/older.log" \
+            || { cat "$FIX/older.log"; exit 1; }
+          [[ ! -s "$OUT" ]]
+          [[ -z "$(git ls-remote "$REPO.git" refs/tags/v1.2.0)" ]]
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin :refs/tags/v1.3.0
+          git -C "$REPO" tag -d v1.3.0 > /dev/null
+          echo "route and publish guard both refuse v1.2.0 after v1.3.0"
+
+      - name: An unreadable version file fails the route instead of skipping
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          echo '[]' > "$FIX/pulls.json"
+          for case in "MISSING plain does not exist" "VERSION toml does not parse"; do
+            read -r file pattern message <<< "$case"
+            for event in push workflow_dispatch; do
+              if FILE="$file" PATTERN="$pattern" route settle release-v1.2.0 "$(cat "$FIX/merge")" "$event" \
+                  > "$FIX/unreadable.log" 2>&1; then
+                echo "$event with $file/$pattern routed: $(out_get action) $(out_get reason)"; exit 1
+              fi
+              grep -qF "cannot read the version file: $file" "$FIX/unreadable.log" || { cat "$FIX/unreadable.log"; exit 1; }
+              grep -qF "$message" "$FIX/unreadable.log" || { cat "$FIX/unreadable.log"; exit 1; }
+              grep -qF "'$pattern'" "$FIX/unreadable.log" || { cat "$FIX/unreadable.log"; exit 1; }
+              [[ ! -s "$OUT" ]]
+            done
+          done
+          echo "a missing or unparsable version file fails push and dispatch routes, naming file and pattern"
+
       - name: Partial publication resumes and reports the actual tag commit
         run: |
           set -euo pipefail
           source "$SH/helpers.sh"
           merge="$(cat "$FIX/merge")"
           git -C "$REPO" tag -a v1.2.0 "$merge" -m seed
-          git -C "$REPO" tag v1.3.0 "$merge"
-          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.2.0 refs/tags/v1.3.0
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.2.0
           cp "$FIX/settle.json" "$FIX/pulls.json"
           route settle release-v1.2.0 "$merge"
           expect_output action publish
@@ -2231,6 +2393,8 @@ jobs:
               CHANGELOG=CHANGELOG.md GITHUB_OUTPUT="$OUT" bash "$SH/publish-guard.sh" )
           expect_output tag_exists true
           expect_output merge_sha "$merge"
+          git -C "$REPO" tag v1.3.0 "$merge"
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.3.0
           # A different push must name the peeled commit, not the tag object.
           echo '[]' > "$FIX/pulls.json"
           route settle release-v1.2.0 "$(cat "$FIX/old")" > "$FIX/tagged-skip.log"

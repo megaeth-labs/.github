@@ -23,6 +23,10 @@ Rules, each reported as `::error file=<path>::<job>/<step>: <rule>: <message>`:
       PR author filter.
   L5  `environment: release` may appear only in release-candidate.yml,
       release-settle.yml and on-release.yml.
+  L6  A Maxwell or Gutenberg token, and any app token in a release workflow or
+      a `release`-environment job, must request at least one `permission-<x>`:
+      without one, create-github-app-token returns every permission the
+      installation has, contents write included.
 
 A release workflow is one that uses megaeth-labs/.github's release-candidate,
 release-settle, release-publish or release-route action, or is on-release.yml.
@@ -146,7 +150,11 @@ def lint_job(job_id: str, job: dict, stem: str, release: bool, repo: str | None)
         with_ = step.get("with") if isinstance(step.get("with"), dict) else {}
         refs = " ".join(str(with_.get(k, "")) for k in ("client-id", "app-id", "private-key"))
         permissions = permissions_of(with_)
-        if any(m in refs for m in MAXWELL_MARKERS):
+        maxwell = any(m in refs for m in MAXWELL_MARKERS)
+        if not permissions and (maxwell or GUTENBERG_MARKER in refs or release or environment == "release"):
+            app = "Maxwell" if maxwell else "Gutenberg" if GUTENBERG_MARKER in refs else "app"
+            found.append((job_id, label, "L6", f"{app} token requests no permission-* inputs, so it gets every permission of the installation (contents write included); list the permissions it needs"))
+        if maxwell:
             for name, value in permissions.items():
                 if name not in MAXWELL_WRITABLE and (value.lower() == "write" or "${{" in value):
                     found.append((job_id, label, "L1", f"Maxwell token requests {name}: {value}; Maxwell may only write pull-requests and issues"))

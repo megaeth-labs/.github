@@ -57,6 +57,7 @@ Family: [Release pipeline](../RELEASE.md).
 - `$FILE at $COMMIT says $actual, expected $version`
 - `$version is not newer than the latest tag ${latest:-<none>}`
 - `settle PR not ensured; stopped while $stage`
+- `$BRANCH moved to ${tip:-<deleted>} after this refresh of $COMMIT started (a settle PR merge or a new push); not touching the settle PR, the run for the new tip refreshes it`
 - `could not merge $COMMIT into $head; close the settle PR so the next run recreates it`
 - `$head was taken by a concurrent run but no open settle PR is visible yet; re-run this workflow`
 - `settle PR not ensured after $attempt attempts of racing a concurrent run; re-run this workflow`

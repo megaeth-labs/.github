@@ -8,6 +8,10 @@ Subcommands (see `main`):
   route                                     -> stdin: routing JSON object; stdout: decision JSON object
   normalize   VERSION                       -> X.Y.Z on stdout, exit 1 if invalid
   is-greater  VERSION LATEST_TAG_OR_EMPTY   -> exit 0 if VERSION > LATEST, else 1
+  latest-tag  [--exclude VERSION]           -> stdin: tag names; stdout: the highest vX.Y.Z tag or "";
+                                               other tags (v1.2.0-rc1) are named on stderr and ignored
+  check-order VERSION LATEST_TAG_OR_EMPTY   -> exit 0 if VERSION may be published after LATEST, else
+                                               print the refusal on stdout and exit 1
   read-file   PATH PATTERN                  -> version found in the file
   bump-file   PATH PATTERN VERSION          -> rewrite in place, print old version
   notes       REPO VERSION DATE             -> stdin: "<sha>\t<subject>" lines; stdout: markdown
@@ -27,6 +31,10 @@ import sys
 from pathlib import Path
 
 SEMVER = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+# A tag this flow publishes: exactly vX.Y.Z. Anything else under v* (v1.2.0-rc1,
+# vnext) is not a release and never counts as the latest one.
+RELEASE_TAG = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+ORDER_RULE = "rule: a version is published only when it is newer than every vX.Y.Z tag"
 
 # Conventional Commits types, in the order they appear in the notes. Anything
 # not listed (or without a type) lands under "Other".
@@ -74,6 +82,40 @@ def is_greater(version: str, latest: str) -> bool:
     if not latest.strip():
         return True
     return version_tuple(version) > version_tuple(latest)
+
+
+def latest_release_tag(tags: list[str], exclude: str = "") -> tuple[str, list[str]]:
+    """(highest vX.Y.Z tag or "", tags ignored because they are not vX.Y.Z).
+
+    `exclude` (X.Y.Z or vX.Y.Z) leaves that version's own tag out, so a run
+    resuming its own half-finished publication compares against the others."""
+    skip = normalize_version(exclude) if exclude.strip() else ""
+    best, ignored = "", []
+    for raw in tags:
+        tag = raw.strip()
+        if not tag:
+            continue
+        if not RELEASE_TAG.match(tag):
+            ignored.append(tag)
+        elif normalize_version(tag) != skip and (not best or version_tuple(tag) > version_tuple(best)):
+            best = tag
+    return best, ignored
+
+
+def order_refusal(version: str, latest: str) -> str | None:
+    """Why `version` may not be published after `latest`, or None when it may.
+
+    One rule for release-route and release-publish: only a version newer than
+    the latest vX.Y.Z tag is published, so an older line merged late can never
+    become the newest Release."""
+    latest = latest.strip()
+    if not latest:
+        return None
+    if not RELEASE_TAG.match(latest):
+        return f"latest tag {latest!r} is not vX.Y.Z, so v{version} cannot be ordered against it ({ORDER_RULE})"
+    if not is_greater(version, latest):
+        return f"v{version} is not newer than the latest published tag {latest} ({ORDER_RULE})"
+    return None
 
 
 # --- release routing --------------------------------------------------------
@@ -179,6 +221,10 @@ def route(data: dict) -> dict:
                 )
                 return result
             if fresh:
+                refusal = order_refusal(version, _field(data, "latest_tag", ""))
+                if refusal:
+                    result["reason"] = f"refusing to publish settle PR #{pr['number']}: {refusal}"
+                    return result
                 result.update(action="publish", reason=f"merged fresh settle PR #{pr['number']}")
                 return result
             settled = f"settled {marker}" if marker else "no release-settle marker"
@@ -192,8 +238,8 @@ def route(data: dict) -> dict:
         elif data.get("version_at_sha") != version:
             result["reason"] = "the candidate has not landed on this branch yet"
             return result
-        elif not is_greater(version, _field(data, "latest_tag", "")):
-            result["reason"] = f"v{version} is not greater than latest tag {data.get('latest_tag')}"
+        elif refusal := order_refusal(version, _field(data, "latest_tag", "")):
+            result["reason"] = f"not refreshing a settle PR: {refusal}"
             return result
         else:
             result["reason"] = f"refresh settle PR for v{version}"
@@ -211,7 +257,7 @@ def route(data: dict) -> dict:
             if version is None:
                 continue
             if (branch.get("version_at_tip") == version
-                    and is_greater(version, _field(data, "latest_tag", ""))
+                    and order_refusal(version, _field(data, "latest_tag", "")) is None
                     and (not selected or version == selected)):
                 result["targets"].append({
                     "version": version, "release_branch": name, "commit": branch.get("tip") or "",
@@ -381,6 +427,13 @@ def main(argv: list[str]) -> int:
     s.add_argument("version")
     s.add_argument("latest")
 
+    s = sub.add_parser("latest-tag")
+    s.add_argument("--exclude", default="")
+
+    s = sub.add_parser("check-order")
+    s.add_argument("version")
+    s.add_argument("latest")
+
     s = sub.add_parser("read-file")
     s.add_argument("path")
     s.add_argument("pattern")
@@ -417,6 +470,16 @@ def main(argv: list[str]) -> int:
             print(normalize_version(a.version))
         elif a.cmd == "is-greater":
             return 0 if is_greater(a.version, a.latest) else 1
+        elif a.cmd == "latest-tag":
+            latest, ignored = latest_release_tag(sys.stdin.read().splitlines(), a.exclude)
+            for tag in ignored:
+                print(f"release_tools: ignoring tag {tag!r}: not vX.Y.Z, so never the latest release", file=sys.stderr)
+            print(latest)
+        elif a.cmd == "check-order":
+            refusal = order_refusal(normalize_version(a.version), a.latest)
+            if refusal:
+                print(refusal)
+                return 1
         elif a.cmd == "read-file":
             print(read_version_file(Path(a.path).read_text(), a.pattern))
         elif a.cmd == "bump-file":

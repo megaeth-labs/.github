@@ -80,7 +80,9 @@ runs:
           default="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)"
         fi
         git fetch --quiet --tags origin
-        latest="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+        # Only vX.Y.Z tags are releases; release_tools names and ignores the
+        # rest (v1.2.0-rc1), so such a tag can neither be "the latest" nor fail the route.
+        latest="$(git tag -l 'v*' | python3 "$TOOLS" latest-tag)"
         pulls='[]'; branches='[]'; parent=""; actual=""; tag_commit=""
         tag_exists=false; release_exists=false
         # Exit 2 means no matching tag, not a failed remote read.
@@ -94,18 +96,30 @@ runs:
             return 1
           fi
         }
-        read_version() {
-          git show "$1:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN"
+        # Sets $actual to the version at <commit>. A version file that is
+        # missing or does not parse is a configuration error, not a candidate
+        # that has not landed yet, so it fails the route instead of skipping.
+        read_version() { # <commit> <where>
+          local text
+          if ! text="$(git show "$1:$FILE" 2>/dev/null)"; then
+            echo "::error title=Release route::cannot read the version file: $FILE does not exist at $1 ($2); version_file '$FILE' and version_pattern '$PATTERN' must match the release-settle step"
+            exit 1
+          fi
+          if ! actual="$(python3 "$TOOLS" read-file /dev/stdin "$PATTERN" <<< "$text")"; then
+            echo "::error title=Release route::cannot read the version file: $FILE at $1 ($2) does not parse with version_pattern '$PATTERN'; version_file and version_pattern must match the release-settle step"
+            exit 1
+          fi
         }
         if [[ "$GITHUB_EVENT_NAME" == push ]]; then
           parent="$(git rev-parse --verify "$GITHUB_SHA^" 2>/dev/null || true)"
           pulls="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" |
             jq -ces 'if all(.[]; type == "array") then add else error("pulls API must return arrays") end')"
-          actual="$(read_version "$GITHUB_SHA" 2>/dev/null || true)"
           # route skips and names a prefix branch whose suffix is not X.Y.Z.
           if [[ "$KIND" == settle && "$GITHUB_REF_NAME" == "$PREFIX"* ]] &&
               version="$(python3 "$TOOLS" normalize "${GITHUB_REF_NAME#"$PREFIX"}" 2>/dev/null)"; then
             tag="v$version"
+            # This version's own tag (a publication resuming) is not "newer".
+            latest="$(git tag -l 'v*' | python3 "$TOOLS" latest-tag --exclude "$version")"
             if has_tag "$tag"; then
               tag_exists=true
               tag_commit="$(git ls-remote origin "refs/tags/$tag^{}" | cut -f1)"
@@ -113,6 +127,9 @@ runs:
                 tag_commit="$(git ls-remote origin "refs/tags/$tag" | cut -f1)"
               fi
               if gh release view "$tag" --json tagName >/dev/null 2>&1; then release_exists=true; fi
+            fi
+            if [[ "$release_exists" == false ]]; then
+              read_version "$GITHUB_SHA" "$GITHUB_REF_NAME"
             fi
             if [[ "$pulls" == '[]' ]]; then
               pulls="$(gh pr list --state merged --base "$GITHUB_REF_NAME" \
@@ -133,9 +150,8 @@ runs:
               echo "::notice title=Release route::skipping $branch: not $PREFIX<X.Y.Z>"; continue
             fi
             git fetch --quiet origin "$tip"
-            actual="$(read_version "$tip" 2>/dev/null || true)"
-            tagged=false
-            if has_tag "v$version"; then tagged=true; fi
+            tagged=false; actual=""
+            if has_tag "v$version"; then tagged=true; else read_version "$tip" "$branch"; fi
             branches="$(jq -c --arg name "$branch" --arg tip "$tip" --arg actual "$actual" \
               --argjson tagged "$tagged" \
               '. + [{name: $name, tip: $tip, version_at_tip: (if $actual == "" then null else $actual end), tag_exists: $tagged}]' <<< "$branches")"

@@ -15,10 +15,12 @@ an exact copy of the reference callers:
 
 Each substitution is anchored on exact template text and must match at least
 once, so a template edit that drops an anchor fails here instead of shipping
-an unfilled copy. The rendered files are then checked: no placeholder left,
-and every `with:` key given to a megaeth-labs/.github action is an input of
-that action (read from this checkout's action.yml) with every required input
-present.
+an unfilled copy. Values are written as YAML scalars, quoted when a plain
+scalar would change them (`make bump # regenerate` would otherwise lose its
+comment-like tail). The rendered files are then checked: no placeholder left,
+every `with:` key given to a megaeth-labs/.github action is an input of that
+action (read from this checkout's action.yml) with every required input
+present, and every substituted value reads back exactly as given.
 
 `--out` must not exist: the files are written to a fresh directory, never on
 top of an earlier render. Without `--out` a new temporary directory is used.
@@ -29,6 +31,7 @@ stdlib only, except PyYAML (present on GitHub-hosted runners). No network.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import tempfile
@@ -48,8 +51,31 @@ BUMP_EXAMPLE = re.compile(r"^ *# Anything else that must move with the version.*
 CANDIDATE_STEP = "      - uses: megaeth-labs/.github/.github/actions/release-candidate@main\n        with:\n          stage: propose\n"
 
 
+ACTIONS_REF = re.compile(r"[A-Za-z0-9._/-]+")
+
+
 class RenderError(Exception):
     pass
+
+
+def scalar(value: str, flow: bool = False) -> str:
+    """`value` as a YAML scalar after `key: ` (or inside `[...]` with `flow`):
+    plain when it reads back unchanged there, double-quoted otherwise."""
+    try:
+        plain = (yaml.safe_load(f"k: [{value}]") == {"k": [value]} if flow
+                 else yaml.safe_load(f"k: {value}") == {"k": value})
+    except yaml.YAMLError:
+        plain = False
+    return value if plain else json.dumps(value)
+
+
+def expected_inputs(args: argparse.Namespace) -> dict[str, str]:
+    """Inputs of the shared actions that the render fills, as they must read back."""
+    values = {"version_file": args.version_file, "version_pattern": args.version_pattern,
+              "changelog_file": args.changelog_file}
+    if args.bump_command:
+        values["bump_command"] = args.bump_command
+    return values
 
 
 def replace(text: str, old: str, new: str, name: str, what: str) -> str:
@@ -64,7 +90,7 @@ def pin(text: str, ref: str) -> str:
 
 def bump_block(bump_command: str, dependency_token: str) -> str:
     indent = " " * 10
-    return f"{indent}bump_command: {bump_command}\n{indent}dependency_token: {dependency_token}\n"
+    return f"{indent}bump_command: {scalar(bump_command)}\n{indent}dependency_token: {dependency_token}\n"
 
 
 def dependency_step(repositories: str) -> str:
@@ -76,22 +102,23 @@ def dependency_step(repositories: str) -> str:
         "          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}\n"
         "          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}\n"
         "          owner: megaeth-labs\n"
-        f"          repositories: {repositories}\n"
+        f"          repositories: {scalar(repositories)}\n"
         "          permission-contents: read\n\n"
     )
 
 
 def render(name: str, text: str, args: argparse.Namespace) -> str:
     if name != "release-settle.yml":  # settle runs on release-v* pushes only
-        text = replace(text, "$default-branch", args.default_branch, name, "default branch")
+        text = replace(text, "$default-branch", scalar(args.default_branch, flow=True), name, "default branch")
     if name == "app-token-lint.yml":
         return pin(text, args.actions_ref)
     text = replace(text, "repositories: ${{ github.event.repository.name }}",
-                   f"repositories: {args.repo}", name, "release token repository")
-    text = replace(text, "version_file: VERSION", f"version_file: {args.version_file}", name, "version file")
-    text = replace(text, "version_pattern: plain", f"version_pattern: {args.version_pattern}", name,
+                   f"repositories: {scalar(args.repo)}", name, "release token repository")
+    text = replace(text, "version_file: VERSION", f"version_file: {scalar(args.version_file)}", name,
+                   "version file")
+    text = replace(text, "version_pattern: plain", f"version_pattern: {scalar(args.version_pattern)}", name,
                    "version pattern")
-    text = replace(text, "changelog_file: CHANGELOG.md", f"changelog_file: {args.changelog_file}", name,
+    text = replace(text, "changelog_file: CHANGELOG.md", f"changelog_file: {scalar(args.changelog_file)}", name,
                    "changelog file")
     if name == "release-candidate.yml":
         match = BUMP_EXAMPLE.search(text)
@@ -115,8 +142,9 @@ def action_inputs(name: str) -> dict:
     return yaml.safe_load(path.read_text()).get("inputs") or {}
 
 
-def check(name: str, text: str) -> list[str]:
-    """Problems in one rendered workflow: placeholders left, unknown or missing action inputs."""
+def check(name: str, text: str, expected: dict[str, str] | None = None) -> list[str]:
+    """Problems in one rendered workflow: placeholders left, unknown or missing
+    action inputs, and (given `expected`) a filled input that reads back differently."""
     problems = [f"{name}: unfilled placeholder {p!r}" for p in PLACEHOLDERS if p in text]
     try:
         doc = yaml.safe_load(text)
@@ -133,6 +161,8 @@ def check(name: str, text: str) -> list[str]:
             problems += [f"{where}: {key!r} is not an input" for key in given if key not in inputs]
             problems += [f"{where}: required input {key!r} missing" for key, spec in inputs.items()
                          if (spec or {}).get("required") and key not in given]
+            problems += [f"{where}: {key} reads back as {given[key]!r}, not {value!r}"
+                         for key, value in (expected or {}).items() if key in given and given[key] != value]
     return problems
 
 
@@ -152,6 +182,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     for field in ("repo", "default_branch", "version_file", "version_pattern", "changelog_file", "actions_ref"):
         if not getattr(args, field).strip():
             parser.error(f"--{field.replace('_', '-')} must not be blank")
+    if not ACTIONS_REF.fullmatch(args.actions_ref):
+        parser.error("--actions-ref must be a branch, tag or SHA (letters, digits, . _ / -)")
     if args.dependency_repositories and not args.bump_command:
         parser.error("--dependency-repositories is only used by --bump-command")
     if args.repo in {r.strip() for r in args.dependency_repositories.split(",")}:
@@ -166,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         rendered = {name: render(name, (TEMPLATES / name).read_text(), args) for name in RELEASE_TEMPLATES}
-        problems = [p for name, text in rendered.items() for p in check(name, text)]
+        problems = [p for name, text in rendered.items() for p in check(name, text, expected_inputs(args))]
     except RenderError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
