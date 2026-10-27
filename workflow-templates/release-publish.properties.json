@@ -1,8 +1,0 @@
-{
-  "name": "Release Publish",
-  "description": "Tag and publish a settled release when its settle PR merges (PR-mode settlement only).",
-  "iconName": "octicon tag",
-  "categories": [
-    "Automation"
-  ]
-}

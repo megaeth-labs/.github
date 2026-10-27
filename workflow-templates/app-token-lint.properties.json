@@ -1,0 +1,8 @@
+{
+  "name": "App Token Lint",
+  "description": "Lint workflows for GitHub App token misuse: no CI-app token in release workflows, release-app tokens only in the release environment.",
+  "iconName": "octicon shield-check",
+  "categories": [
+    "Automation"
+  ]
+}

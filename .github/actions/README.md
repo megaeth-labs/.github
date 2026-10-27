@@ -67,4 +67,8 @@ actions share ([README](release-tools/README.md)).
 - A new action needs a directory with `action.yml`; the script creates its
   README skeleton, whose `Example` and `Notes` sections you then fill in.
 - Templates in `workflow-templates/` are the reference callers: keep them in
-  step with the actions they call.
+  step with the actions they call. `.github/scripts/copy_templates.py`
+  renders the release templates for one repository (version file and
+  pattern, bump command, private dependencies, default branch) into a fresh
+  directory and fails if a placeholder is left or a `with:` key is not an
+  input of the action it calls; its unit test runs in `actions-test.yml`.

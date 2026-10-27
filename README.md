@@ -19,6 +19,8 @@ by every repository, and the workflow templates that show up under
   [`merge-queue-skipper`](.github/actions/merge-queue-skipper/README.md),
   [`pr-lint`](.github/actions/pr-lint/README.md).
 - [`workflow-templates/`](workflow-templates/) — the reference callers.
+  [`.github/scripts/copy_templates.py`](.github/scripts/copy_templates.py)
+  renders the release templates with one repository's values filled in.
 - [`profile/`](profile/) — the organisation profile page.
 
 `actions-test.yml` is the only gate between a change here and every

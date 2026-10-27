@@ -1,6 +1,6 @@
 {
   "name": "Release Settle",
-  "description": "Settle a release candidate: the dispatch is the approval (release environment + admin check); notes, changelog commit, tag and GitHub Release follow.",
+  "description": "Settle a release candidate by PR: a push to release-v* refreshes the settle PR; merging it tags and publishes the GitHub Release. All writes use the release app (mega-gutenberg).",
   "iconName": "octicon tag",
   "categories": [
     "Automation"

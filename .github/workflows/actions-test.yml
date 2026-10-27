@@ -49,7 +49,7 @@ jobs:
             -p 'test_*.py' \
             -v
 
-      - name: Test app-token-lint
+      - name: Test app-token-lint and the template copy helper
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
