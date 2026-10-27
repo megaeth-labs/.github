@@ -8,6 +8,8 @@ by every repository, and the workflow templates that show up under
   shared actions, how to consume one, how to change one.
 - [`.github/actions/RELEASE.md`](.github/actions/RELEASE.md) — the release
   pipeline: candidate, settle, publish, publish targets.
+- [`docs/RELEASING.md`](docs/RELEASING.md) — operator runbook for the release
+  pipeline: the four flows, environments, dry run, troubleshooting.
 - [`.github/actions/CLAUDE-CI.md`](.github/actions/CLAUDE-CI.md) — the Claude
   checks: PR review, label check, issue triage, interactive.
 - `.github/actions/<action>/README.md` — one reference per action; the
@@ -19,8 +21,23 @@ by every repository, and the workflow templates that show up under
   [`merge-queue-skipper`](.github/actions/merge-queue-skipper/README.md),
   [`pr-lint`](.github/actions/pr-lint/README.md).
 - [`workflow-templates/`](workflow-templates/) — the reference callers.
+  [`.github/scripts/copy_templates.py`](.github/scripts/copy_templates.py)
+  renders the release templates with one repository's values filled in.
 - [`profile/`](profile/) — the organisation profile page.
 
 `actions-test.yml` is the only gate between a change here and every
 consumer's CI: unit tests of the helpers, an end-to-end drive of the actions
 that can run without a repository, and the documentation check.
+
+## App tokens: Maxwell and Gutenberg
+
+Two GitHub Apps mint tokens through `actions/create-github-app-token`.
+Maxwell is the CI app (`vars.MEGA_MAXWELL_CLIENT_ID`, `secrets.MEGA_MAXWELL_PK`):
+it may write only pull requests and issues and never touches a release.
+Gutenberg is the release app (`vars.RELEASE_APP_CLIENT_ID`,
+`secrets.RELEASE_APP_PRIVATE_KEY`), minted only in a job of the `release`
+environment, where every write of a release is made. The
+[`app-token-lint`](.github/actions/app-token-lint/README.md) action enforces
+this on every workflow change (rules L1-L6, listed with their messages in the
+[runbook](docs/RELEASING.md#app-token-lint-errors)); run it locally with
+`python3 .github/scripts/app_token_lint.py --repo <repo> <workflows dir>`.

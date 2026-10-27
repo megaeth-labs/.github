@@ -49,6 +49,19 @@ jobs:
             -p 'test_*.py' \
             -v
 
+      - name: Test app-token-lint and the template copy helper
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 -m unittest discover \
+            -s .github/scripts \
+            -p 'test_*.py' \
+            -v
+
+      - name: Lint workflow templates for App token usage
+        run: python3 .github/scripts/app_token_lint.py --repo my-repo workflow-templates/
+
   # release-verify-version is bash inside a composite action; drive it with
   # fake binaries and check each outcome the README promises.
   verify-version:
@@ -452,6 +465,461 @@ jobs:
           [[ "$SKIP" == "false" && -z "$PR" ]] || { echo "skip-check=$SKIP pr_number=$PR"; exit 1; }
           echo "false outside a queue, as documented"
 
+  # Drive the shipped settle scripts against a real local remote. Only GitHub's
+  # PR API is faked; branch ancestry, conflicts, notes and recovery are real.
+  release-settle:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      TOOLS: ${{ github.workspace }}/.github/actions/release-tools/release_tools.py
+      ACTION: ${{ github.workspace }}/.github/actions/release-settle/action.yml
+      AUTH_WRAPPER: ${{ github.workspace }}/.github/actions/git-auth/with-github-auth.sh
+      GITHUB_AUTH_TOKEN: fixture-token
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Where the settle rehearsal lives
+        run: |
+          set -euo pipefail
+          {
+            echo "FIXTURE=$RUNNER_TEMP/release-settle"
+            echo "REPO=$RUNNER_TEMP/release-settle/repo"
+            echo "SH=$RUNNER_TEMP/release-settle/sh"
+            echo "OUT=$RUNNER_TEMP/release-settle/output"
+            echo "PR_STATE=$RUNNER_TEMP/release-settle/prs.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Extract the settle shell and its helpers
+        run: |
+          set -euo pipefail
+          mkdir -p "$SH" "$FIXTURE/bin"
+          python3 - "$ACTION" "$SH" <<'PY'
+          import pathlib, sys, yaml
+
+          action = yaml.safe_load(open(sys.argv[1]))
+          assert action["inputs"]["pr_author"]["default"] == "mega-gutenberg[bot]"
+          assert action["inputs"]["git_user_name"]["default"] == "mega-gutenberg[bot]"
+          assert action["inputs"]["git_user_email"]["default"] == "348780249+mega-gutenberg[bot]@users.noreply.github.com"
+          assert not {"settle_mode", "settlers", "github_token"} & action["inputs"].keys()
+          assert set(action["outputs"]) == {"version", "pr_url", "notes_file"}
+          want = {"Guard": "guard.sh", "Generate release notes": "notes.sh", "Ensure the settle PR": "ensure.sh"}
+          found = {s["name"]: s["run"] for s in action["runs"]["steps"] if s.get("name") in want}
+          assert found.keys() == want.keys(), f"missing shipped steps: {want.keys() - found.keys()}"
+          for name, script in found.items():
+              pathlib.Path(sys.argv[2], want[name]).write_text(script)
+              print(f"extracted {name!r}")
+          PY
+          cat > "$SH/helpers.sh" <<'SH'
+          export VERSION=1.1.0 BRANCH=release-v1.1.0 HEAD_BRANCH=chore/release-settle-v1.1.0
+          export GH_TOKEN=fixture-token PR_AUTHOR='mega-gutenberg[bot]' PR_LABELS='release, needs-ci'
+          export GITHUB_REPOSITORY=megaeth-labs/fake GITHUB_OUTPUT="$OUT"
+          export INPUT_VERSION=v1.1.0 BRANCH_IN='' PREFIX=release-v FILE=VERSION PATTERN=plain CHANGELOG=CHANGELOG.md
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
+          make_repo() {
+            git init --quiet --bare --initial-branch=main "$REPO.git"
+            git -C "$REPO.git" config receive.denyNonFastForwards true
+            git clone --quiet "$REPO.git" "$REPO"
+            git -C "$REPO" config user.name 'mega-gutenberg[bot]'
+            git -C "$REPO" config user.email '348780249+mega-gutenberg[bot]@users.noreply.github.com'
+            (
+              cd "$REPO"
+              printf '1.0.0\n' > VERSION
+              printf '# Changelog\n\n## v1.0.0 (2025-01-01)\n\n- shipped\n' > CHANGELOG.md
+              git add VERSION CHANGELOG.md
+              git commit --quiet -m 'feat: initial release'
+              git tag v1.0.0
+              git push --quiet origin main refs/tags/v1.0.0
+              git checkout --quiet -b "$BRANCH"
+              printf '1.1.0\n' > VERSION
+              printf '# Changelog\n\n## v1.1.0\n\n- candidate draft\n\n## v1.0.0 (2025-01-01)\n\n- shipped\n' > CHANGELOG.md
+              git add VERSION CHANGELOG.md
+              git commit --quiet -m 'chore(release): candidate v1.1.0'
+              git push --quiet origin "$BRANCH"
+            )
+            printf '{"pulls": [], "events": []}\n' > "$PR_STATE"
+          }
+
+          remote_head() {
+            git -C "$REPO" ls-remote --heads origin "refs/heads/$1" | cut -f1
+          }
+
+          settle() {
+            (
+              cd "$REPO"
+              export COMMIT="$1" RUNNER_TEMP="$FIXTURE"
+              : > "$OUT"
+              bash "$SH/guard.sh" || exit
+              grep -qxF "version=$VERSION" "$OUT"
+              grep -qxF "branch=$BRANCH" "$OUT"
+              export PREVIOUS=v1.0.0
+              bash "$SH/notes.sh" || exit
+              export NOTES="$FIXTURE/release-notes-v$VERSION.md"
+              bash "$SH/ensure.sh"
+            )
+          }
+
+          assert_pr() { # number, marker SHA
+            python3 - "$PR_STATE" "$1" "$2" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          pr = state["pulls"][int(sys.argv[2]) - 1]
+          assert pr["state"] == "open", pr
+          assert pr["author"]["login"] == "mega-gutenberg[bot]", pr
+          assert pr["headRefName"] == "chore/release-settle-v1.1.0", pr
+          assert pr["baseRefName"] == "release-v1.1.0", pr
+          assert pr["body"].count(f"<!-- release-settle: v1.1.0 {sys.argv[3]} -->") == 1, pr
+          assert pr["labels"] == ["release", "needs-ci"], pr
+          PY
+            [[ "${3:-}" == no-output ]] || grep -qxF "pr_url=https://example.invalid/pull/$1" "$OUT"
+          }
+
+          advance() {
+            git -C "$REPO" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+            printf '%s\n' "$1" >> "$REPO/fixes"
+            git -C "$REPO" add fixes
+            git -C "$REPO" commit --quiet -m "fix: $1"
+            git -C "$REPO" push --quiet origin "$BRANCH"
+          }
+
+          merge_settle() { # number, route fixture
+            git -C "$REPO" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+            git -C "$REPO" merge --quiet --no-ff --no-edit "origin/$HEAD_BRANCH"
+            git -C "$REPO" push --quiet origin "$BRANCH"
+            python3 - "$PR_STATE" "$1" "$2" "$REPO" <<'PY'
+          import json, pathlib, subprocess, sys
+          path = pathlib.Path(sys.argv[1])
+          state = json.loads(path.read_text())
+          pr = state["pulls"][int(sys.argv[2]) - 1]
+          sha = subprocess.check_output(["git", "-C", sys.argv[4], "rev-parse", "HEAD"], text=True).strip()
+          parent = subprocess.check_output(["git", "-C", sys.argv[4], "rev-parse", "HEAD^1"], text=True).strip()
+          pr["state"] = "merged"
+          path.write_text(json.dumps(state))
+          pull = {"number": pr["number"], "merged_at": "2026-01-01T00:00:00Z", "merge_commit_sha": sha,
+                  "head": {"ref": pr["headRefName"]}, "base": {"ref": pr["baseRefName"]},
+                  "user": pr["author"], "body": pr["body"]}
+          fixture = {"kind": "settle", "event": "push", "sha": sha, "first_parent": parent,
+                     "ref_name": pr["baseRefName"], "default_branch": "main", "prefix": "release-v",
+                     "pr_author": "mega-gutenberg[bot]", "pulls": [pull], "tag_exists": False,
+                     "release_exists": False, "version_at_sha": "1.1.0", "latest_tag": "v1.0.0",
+                     "branches": [], "dispatch_version": ""}
+          pathlib.Path(sys.argv[3]).write_text(json.dumps(fixture))
+          PY
+          }
+          SH
+
+      - name: Fake GitHub PR state and a fixed notes date
+        run: |
+          set -euo pipefail
+          cat > "$FIXTURE/bin/gh" <<'PY'
+          #!/usr/bin/env python3
+          import json, os, pathlib, subprocess, sys
+
+          path = pathlib.Path(os.environ["PR_STATE"])
+          state = json.loads(path.read_text())
+          args = sys.argv[1:]
+          def option(flag):
+              return args[args.index(flag) + 1]
+          def save(event):
+              state["events"].append(event)
+              path.write_text(json.dumps(state))
+
+          if args[:2] == ["pr", "list"]:
+              assert option("--state") == "open"
+              fields = option("--json").split(",")
+              pulls = [pr for pr in state["pulls"] if pr["state"] == "open"
+                       and pr["headRefName"] == option("--head") and pr["baseRefName"] == option("--base")]
+              print(json.dumps([{key: pr[key] for key in fields} for pr in pulls]))
+          elif args[:2] == ["pr", "create"]:
+              assert not any(pr["state"] == "open" and pr["headRefName"] == option("--head")
+                             and pr["baseRefName"] == option("--base") for pr in state["pulls"])
+              number = len(state["pulls"]) + 1
+              pr = {"number": number, "url": f"https://example.invalid/pull/{number}", "state": "open",
+                    "author": {"login": os.environ["PR_AUTHOR"]}, "headRefName": option("--head"),
+                    "baseRefName": option("--base"), "title": option("--title"),
+                    "body": pathlib.Path(option("--body-file")).read_text(),
+                    "labels": [args[i + 1] for i, arg in enumerate(args) if arg == "--label"]}
+              state["pulls"].append(pr)
+              save("create")
+              print(pr["url"])
+          elif args[:2] == ["pr", "edit"]:
+              if os.environ.get("FAIL_PR_EDIT") == "1":
+                  save("edit-failed")
+                  sys.exit("simulated gh pr edit failure")
+              pr = state["pulls"][int(args[2]) - 1]
+              assert pr["state"] == "open"
+              if "--title" in args:
+                  pr["title"] = option("--title")
+              pr["body"] = pathlib.Path(option("--body-file")).read_text()
+              save("edit")
+              print(pr["url"])
+          elif args[:2] == ["pr", "close"]:
+              pr = state["pulls"][int(args[2]) - 1]
+              assert pr["state"] == "open"
+              pr["state"] = "closed"
+              pr["comment"] = option("--comment")
+              save("close")
+          elif args[:3] == ["api", "-X", "DELETE"]:
+              prefix = "repos/megaeth-labs/fake/git/refs/heads/"
+              assert len(args) == 4 and args[3].startswith(prefix), args
+              subprocess.run(["git", "push", "--quiet", "--delete", "origin", args[3][len(prefix):]], check=True)
+              save("delete")
+          else:
+              sys.exit(f"unexpected gh command: {args}")
+          PY
+          # Notes are unchanged across reruns even if a run crosses UTC midnight.
+          printf '#!/bin/bash\n[[ "$*" == "-u +%%F" ]] || exit 1\nprintf "2026-01-01\\n"\n' > "$FIXTURE/bin/date"
+          chmod +x "$FIXTURE/bin/gh" "$FIXTURE/bin/date"
+          echo "$FIXTURE/bin" >> "$GITHUB_PATH"
+
+      - name: Create then refresh then no-op without rewriting history
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          make_repo
+          tip="$(remote_head "$BRANCH")"
+          # A leftover local branch must not prevent the action's checkout -B.
+          git -C "$REPO" branch "$HEAD_BRANCH" "$tip"
+          settle "$tip"
+          assert_pr 1 "$tip"
+          old="$(remote_head "$HEAD_BRANCH")"
+          [[ "$(git -C "$REPO" rev-parse "$old^1")" == "$tip" ]]
+          advance 'second fix'
+          tip="$(remote_head "$BRANCH")"
+          settle "$tip"
+          assert_pr 1 "$tip"
+          # The refresh keeps the same PR: no second one is opened.
+          python3 - "$PR_STATE" <<'PY'
+          import json, sys
+          pulls = json.load(open(sys.argv[1]))["pulls"]
+          assert [pr["number"] for pr in pulls] == [1], pulls
+          PY
+          new="$(remote_head "$HEAD_BRANCH")"
+          git -C "$REPO" merge-base --is-ancestor "$old" "$new"
+          git -C "$REPO" merge-base --is-ancestor "$tip" "$new"
+          [[ "$(git -C "$REPO" rev-list --count --merges "$old..$new")" == 1 ]]
+          [[ "$(remote_head "$BRANCH")" == "$tip" ]]
+          git -C "$REPO" show "$new:CHANGELOG.md" | grep -qF 'second fix'
+          cp "$PR_STATE" "$FIXTURE/before-noop.json"
+          settle "$tip"
+          assert_pr 1 "$tip"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$new" ]]
+          cmp "$PR_STATE" "$FIXTURE/before-noop.json"
+          python3 - "$PR_STATE" <<'PY'
+          import json, sys
+          assert json.load(open(sys.argv[1]))["events"] == ["create", "edit"]
+          PY
+          echo "PASS create -> refresh -> no-op; old settle head $old is an ancestor of $new"
+
+      - name: Replace an open Maxwell-authored settle PR
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          python3 - "$PR_STATE" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          state = json.loads(path.read_text())
+          state["pulls"][0]["author"]["login"] = "mega-maxwell[bot]"
+          path.write_text(json.dumps(state))
+          PY
+          tip="$(remote_head "$BRANCH")"
+          settle "$tip"
+          assert_pr 2 "$tip"
+          new="$(remote_head "$HEAD_BRANCH")"
+          [[ "$(git -C "$REPO" rev-parse "$new^1")" == "$tip" ]]
+          python3 - "$PR_STATE" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          assert state["pulls"][0]["state"] == "closed"
+          assert state["pulls"][0]["comment"] == "Superseded: the settle PR is now maintained by mega-gutenberg."
+          assert state["events"][-3:] == ["close", "delete", "create"], state
+          PY
+          echo "PASS Maxwell PR closed and replaced, including orphan branch deletion"
+
+      - name: Resume a refresh after gh pr edit fails
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          old_tip="$(remote_head "$BRANCH")"
+          old_head="$(remote_head "$HEAD_BRANCH")"
+          advance 'retry fix'
+          tip="$(remote_head "$BRANCH")"
+          if FAIL_PR_EDIT=1 settle "$tip" > "$FIXTURE/edit-failed.log" 2>&1; then
+            echo "expected gh pr edit failure"; exit 1
+          fi
+          assert_pr 2 "$old_tip" no-output
+          pushed="$(remote_head "$HEAD_BRANCH")"
+          [[ "$pushed" != "$old_head" ]]
+          git -C "$REPO" merge-base --is-ancestor "$old_head" "$pushed"
+          git -C "$REPO" merge-base --is-ancestor "$tip" "$pushed"
+          settle "$tip"
+          assert_pr 2 "$tip"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$pushed" ]]
+          python3 - "$PR_STATE" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          assert len(state["pulls"]) == 2
+          assert state["events"][-2:] == ["edit-failed", "edit"]
+          PY
+          echo "PASS rerun repairs the stale marker without adding a commit or PR"
+
+      - name: Merge a refreshed settle PR whose marker update failed
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          old_tip="$(remote_head "$BRANCH")"
+          advance 'stale merge fix'
+          tip="$(remote_head "$BRANCH")"
+          if FAIL_PR_EDIT=1 settle "$tip" > "$FIXTURE/stale-edit-failed.log" 2>&1; then
+            echo "expected gh pr edit failure"; exit 1
+          fi
+          assert_pr 2 "$old_tip" no-output
+          pushed="$(remote_head "$HEAD_BRANCH")"
+          git -C "$REPO" merge-base --is-ancestor "$tip" "$pushed"
+          git -C "$REPO" show "$pushed:CHANGELOG.md" | grep -qF 'stale merge fix'
+          merge_settle 2 "$FIXTURE/stale-route.json"
+          merged="$(remote_head "$BRANCH")"
+          [[ "$(git -C "$REPO" rev-parse "$merged^1")" == "$tip" ]]
+          python3 - "$FIXTURE/stale-route.json" "$old_tip" <<'PY'
+          import json, sys
+          fixture = json.load(open(sys.argv[1]))
+          assert f"<!-- release-settle: v1.1.0 {sys.argv[2]} -->" in fixture["pulls"][0]["body"]
+          assert fixture["first_parent"] != sys.argv[2]
+          PY
+          echo "PASS stale marker retained after the refreshed notes merge at $merged"
+
+      - name: Route the stale merge to refresh
+        run: |
+          set -euo pipefail
+          python3 "$TOOLS" route < "$FIXTURE/stale-route.json" > "$FIXTURE/stale-decision.json"
+          python3 - "$FIXTURE/stale-decision.json" <<'PY'
+          import json, sys
+          decision = json.load(open(sys.argv[1]))
+          assert decision["action"] == "refresh", decision
+          assert decision["reason"], decision
+          print("PASS stale merge routes to refresh:", decision)
+          PY
+
+      - name: Record the replacement settlement with an empty commit
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          tip="$(remote_head "$BRANCH")"
+          settle "$tip"
+          assert_pr 3 "$tip"
+          head="$(remote_head "$HEAD_BRANCH")"
+          [[ "$head" != "$tip" ]]
+          [[ "$(git -C "$REPO" rev-parse "$head^1")" == "$tip" ]]
+          git -C "$REPO" diff --exit-code "$tip" "$head"
+          [[ "$(git -C "$REPO" show -s --format=%s "$head")" == "chore(release): settle v1.1.0" ]]
+          git -C "$REPO" show -s --format=%b "$head" | grep -qxF \
+            "Changelog already current at $tip; this PR records the settlement decision."
+          merge_settle 3 "$FIXTURE/fresh-route.json"
+          python3 - "$FIXTURE/fresh-route.json" "$PR_STATE" <<'PY'
+          import json, sys
+          fixture = json.load(open(sys.argv[1]))
+          assert f'<!-- release-settle: v1.1.0 {fixture["first_parent"]} -->' in fixture["pulls"][0]["body"]
+          state = json.load(open(sys.argv[2]))
+          assert len(state["pulls"]) == 3
+          assert state["events"][-2:] == ["delete", "create"]
+          assert not any(pr["state"] == "open" for pr in state["pulls"])
+          PY
+          [[ "$(git -C "$REPO" ls-remote --tags origin | wc -l)" == 1 ]]
+          echo "PASS empty settle commit, replacement marker and fresh merge; no release tag created"
+
+      - name: Route the replacement merge to publish
+        run: |
+          set -euo pipefail
+          python3 "$TOOLS" route < "$FIXTURE/fresh-route.json" > "$FIXTURE/fresh-decision.json"
+          python3 - "$FIXTURE/fresh-decision.json" <<'PY'
+          import json, sys
+          decision = json.load(open(sys.argv[1]))
+          assert decision["action"] == "publish", decision
+          assert decision["reason"], decision
+          print("PASS replacement merge routes to publish:", decision)
+          PY
+
+      # Refresh and publish run in different concurrency groups. A refresh
+      # whose Guard passed just before settle PR #3 was merged must not open a
+      # fourth settle PR (or delete the head branch) for a published version.
+      - name: A refresh that started before the merge opens no settle PR
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          merged="$(remote_head "$BRANCH")"
+          before="$(git -C "$REPO" rev-parse "$merged^1")"
+          head="$(remote_head "$HEAD_BRANCH")"
+          cp "$PR_STATE" "$FIXTURE/before-late.json"
+          late() { # <commit>: the steps after a Guard that already passed
+            (
+              cd "$REPO"
+              export COMMIT="$1" RUNNER_TEMP="$FIXTURE" PREVIOUS=v1.0.0
+              : > "$OUT"
+              bash "$SH/notes.sh" > /dev/null
+              export NOTES="$FIXTURE/release-notes-v$VERSION.md"
+              bash "$SH/ensure.sh"
+            )
+          }
+          # Merged, not yet tagged: the branch moved past the settled tip.
+          if late "$before" > "$FIXTURE/late.log" 2>&1; then
+            echo "a late refresh of the pre-merge tip succeeded"; cat "$FIXTURE/late.log"; exit 1
+          fi
+          grep -qF "$BRANCH moved to $merged after this refresh of $before started" "$FIXTURE/late.log" \
+            || { cat "$FIXTURE/late.log"; exit 1; }
+          cmp "$PR_STATE" "$FIXTURE/before-late.json"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$head" ]]
+          # Published: the tag exists, so even the current tip is not settled again.
+          git -C "$REPO" tag -a v1.1.0 "$merged" -m published
+          git -C "$REPO" push --quiet origin refs/tags/v1.1.0
+          late "$merged" > "$FIXTURE/late.log" 2>&1 || { cat "$FIXTURE/late.log"; exit 1; }
+          grep -qF "::notice title=Already tagged::v1.1.0 is already tagged, so this refresh of $merged does not open or update a settle PR for it" \
+            "$FIXTURE/late.log" || { cat "$FIXTURE/late.log"; exit 1; }
+          grep -qxF "pr_url=" "$OUT"
+          cmp "$PR_STATE" "$FIXTURE/before-late.json"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$head" ]]
+          git -C "$REPO" push --quiet origin :refs/tags/v1.1.0
+          git -C "$REPO" tag -d v1.1.0 > /dev/null
+          echo "PASS a late refresh neither deletes the head branch nor opens a settle PR"
+
+      - name: A conflicting changelog asks the maintainer to close the PR
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          export REPO="$FIXTURE/conflict" PR_STATE="$FIXTURE/conflict-prs.json"
+          make_repo
+          settle "$(remote_head "$BRANCH")"
+          before="$(remote_head "$HEAD_BRANCH")"
+          cp "$PR_STATE" "$FIXTURE/before-conflict.json"
+          git -C "$REPO" checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+          printf '# Changelog\n\n## v1.1.0\n\n- maintainer changes the draft\n\n## v1.0.0 (2025-01-01)\n\n- shipped\n' > "$REPO/CHANGELOG.md"
+          git -C "$REPO" add CHANGELOG.md
+          git -C "$REPO" commit --quiet -m 'fix: conflicting changelog'
+          git -C "$REPO" push --quiet origin "$BRANCH"
+          if settle "$(remote_head "$BRANCH")" > "$FIXTURE/conflict.log" 2>&1; then
+            echo "expected a conflicting merge to fail"; exit 1
+          fi
+          cat "$FIXTURE/conflict.log"
+          grep -qF 'close the settle PR so the next run recreates it' "$FIXTURE/conflict.log"
+          [[ "$(remote_head "$HEAD_BRANCH")" == "$before" ]]
+          cmp "$PR_STATE" "$FIXTURE/before-conflict.json"
+          [[ -z "$(git -C "$REPO" status --porcelain)" ]]
+          if git -C "$REPO" rev-parse --verify MERGE_HEAD; then
+            echo "failed merge was not aborted"; exit 1
+          fi
+          echo "PASS conflicting CHANGELOG fails, aborts the merge and leaves remote refs and PR untouched"
+
+      - name: Remove settle rehearsal resources
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$FIXTURE"
+          [[ ! -e "$FIXTURE" ]]
+          echo "removed $FIXTURE (both throwaway remotes, clones, PR state and extracted scripts)"
+
   # release-candidate's propose shell runs at the start of every release in
   # every repository, and a real run needs an app token and a live remote.
   # Drive the shipped script instead — extracted from action.yml, never copied
@@ -494,7 +962,12 @@ jobs:
           want = {
               "Guard (propose)": "guard.sh",
               "Cut the release branch at the base commit (propose)": "cut-branch.sh",
+              "Carry the release workflows (propose)": "carry.sh",
+              "Run bump command": "bump.sh",
               "Draft changelog": "changelog.sh",
+              "Resolve version": "version.sh",
+              "Cut release branch": "cut.sh",
+              "Open candidate PR": "open-pr.sh",
           }
           steps = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"]
           found = {s["name"]: s["run"] for s in steps if s.get("name") in want}
@@ -504,6 +977,9 @@ jobs:
           for name, script in found.items():
               pathlib.Path(sys.argv[2], want[name]).write_text(script)
               print(f"extracted {name!r} -> {want[name]}")
+          # The carry step's shipped default is part of what is under test.
+          default = yaml.safe_load(open(sys.argv[1]))["inputs"]["release_workflows"]["default"]
+          pathlib.Path(sys.argv[2], "release_workflows.default").write_text(default)
           PY
           cat > "$SH/helpers.sh" <<'SH'
           # Run the guard the way the action's step does.
@@ -540,14 +1016,70 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           cat > "$RUNNER_TEMP/bin/gh" <<'SH'
           #!/usr/bin/env bash
-          # Only what the shell under test calls: the default branch, and
-          # creating a ref, which here is a push into the throwaway remote.
+          # Only what the shell under test calls: the default branch, pull
+          # requests (fake-pr.py, below), the repository's auto-delete setting,
+          # labels, and creating or deleting a ref, which here is a push into
+          # the throwaway remote and fails like GitHub's 422. A case injects a
+          # concurrent run by leaving a file: race-create (a sha the racer
+          # creates the ref at first), race-delete (the racer deletes it
+          # first), race-recreate (the racer keeps it and opens a PR),
+          # race-push (right after the delete the racer pushes its own commit,
+          # and opens a PR if the file says "with-pr"), fail-delete (the
+          # delete just fails).
           set -euo pipefail
           case "${1:-}" in
             repo)
               echo "main"
               ;;
+            pr)
+              shift
+              exec python3 "$RUNNER_TEMP/bin/fake-pr.py" "$@"
+              ;;
             api)
+              # A pull request read: the fixture the case wrote for that number.
+              if [[ "${2:-}" == repos/*/pulls/* ]]; then
+                cat "$RUNNER_TEMP/pr/${2##*/}.json"
+                exit 0
+              fi
+              if [[ "${2:-}" =~ ^repos/[^/]+/[^/]+$ ]]; then
+                cat "$RUNNER_TEMP/auto-delete" 2>/dev/null || echo false
+                exit 0
+              fi
+              if [[ "${2:-}" == -X && "${3:-}" == POST && "${4:-}" == repos/*/issues/*/labels ]]; then
+                n="${4%/labels}"; n="${n##*/}"; shift 4; labels=()
+                while [[ $# -gt 0 ]]; do
+                  [[ "$1" == -f ]] && labels+=("${2#labels[]=}")
+                  shift 2
+                done
+                exec python3 "$RUNNER_TEMP/bin/fake-pr.py" label "$n" "${labels[@]}"
+              fi
+              if [[ "${2:-}" == -X && "${3:-}" == DELETE ]]; then
+                ref="refs/${4#repos/*/git/refs/}"
+                if [[ -e "$RUNNER_TEMP/race-delete" ]]; then
+                  rm "$RUNNER_TEMP/race-delete"; git push --quiet origin ":$ref"
+                fi
+                if [[ -e "$RUNNER_TEMP/race-recreate" ]]; then
+                  rm "$RUNNER_TEMP/race-recreate"
+                  python3 "$RUNNER_TEMP/bin/fake-pr.py" racer "${ref#refs/heads/}" >/dev/null
+                  echo "gh: Reference update failed (HTTP 422)" >&2; exit 1
+                fi
+                if [[ -e "$RUNNER_TEMP/fail-delete" ]]; then
+                  echo "gh: Server Error (HTTP 500)" >&2; exit 1
+                fi
+                if ! git ls-remote --exit-code origin "$ref" >/dev/null; then
+                  echo "gh: Reference does not exist (HTTP 422)" >&2; exit 1
+                fi
+                git push --quiet origin ":$ref"
+                if [[ -e "$RUNNER_TEMP/race-push" ]]; then
+                  racer="$(git commit-tree "HEAD^{tree}" -p HEAD~1 -m "chore(release): a concurrent candidate")"
+                  git push --quiet origin "$racer:$ref"
+                  if [[ "$(cat "$RUNNER_TEMP/race-push")" == with-pr ]]; then
+                    python3 "$RUNNER_TEMP/bin/fake-pr.py" racer "${ref#refs/heads/}" >/dev/null
+                  fi
+                  rm "$RUNNER_TEMP/race-push"
+                fi
+                exit 0
+              fi
               ref=""; sha=""
               while [[ $# -gt 0 ]]; do
                 if [[ "$1" == "-f" ]]; then
@@ -561,12 +1093,84 @@ jobs:
                 fi
               done
               if [[ -n "$ref" && -n "$sha" ]]; then
+                if [[ -e "$RUNNER_TEMP/race-create" ]]; then
+                  git push --quiet origin "$(cat "$RUNNER_TEMP/race-create"):$ref"
+                  rm "$RUNNER_TEMP/race-create"
+                fi
+                if git ls-remote --exit-code origin "$ref" >/dev/null; then
+                  echo "gh: Reference already exists (HTTP 422)" >&2; exit 1
+                fi
                 git push --quiet origin "$sha:$ref"
               fi
               ;;
           esac
           SH
           chmod +x "$RUNNER_TEMP/bin/gh"
+          # Pull requests live in $RUNNER_TEMP/prs/<n>.json. race-close: a
+          # concurrent run closes the PR first, and this close fails. race-pr:
+          # a concurrent run opens the PR first, and this create fails.
+          cat > "$RUNNER_TEMP/bin/fake-pr.py" <<'PY'
+          import json, os, pathlib, subprocess, sys
+
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          store = temp / "prs"
+          store.mkdir(exist_ok=True)
+
+          def load():
+              return {int(f.stem): json.loads(f.read_text()) for f in store.glob("*.json")}
+
+          def save(pr):
+              (store / f"{pr['number']}.json").write_text(json.dumps(pr))
+
+          def new(head, base, title, body, by):
+              n = max(load(), default=99) + 1
+              pr = {"number": n, "url": f"https://github.com/megaeth-labs/fake/pull/{n}", "head": head,
+                    "base": base, "title": title, "body": body, "author": by, "state": "OPEN",
+                    "labels": [], "comments": []}
+              save(pr)
+              return pr
+
+          def opt(args, name):
+              return args[args.index(name) + 1] if name in args else None
+
+          def race(name):
+              f = temp / name
+              if f.exists():
+                  f.unlink()
+                  return True
+              return False
+
+          cmd, args = sys.argv[1], sys.argv[2:]
+          if cmd == "list":
+              head, state = opt(args, "--head"), (opt(args, "--state") or "open").upper()
+              print(json.dumps([{"number": p["number"], "url": p["url"], "isCrossRepository": False}
+                                for p in load().values() if p["head"] == head and p["state"] == state]))
+          elif cmd == "close":
+              pr = load()[int(args[0])]
+              if race("race-close"):
+                  pr["state"] = "CLOSED"; save(pr)
+              if pr["state"] != "OPEN":
+                  sys.exit(f"Pull request #{pr['number']} is already closed")
+              pr["state"] = "CLOSED"; pr["comments"].append(opt(args, "--comment")); save(pr)
+          elif cmd == "create":
+              head, base = opt(args, "--head"), opt(args, "--base")
+              if race("race-pr"):
+                  new(head, base, "a concurrent candidate", "", "mega-gutenberg[bot]")
+              if any(p["head"] == head and p["state"] == "OPEN" for p in load().values()):
+                  sys.exit(f"a pull request for branch \"{head}\" into branch \"{base}\" already exists")
+              if subprocess.run(["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{head}"],
+                                capture_output=True).returncode != 0:
+                  sys.exit("pull request create failed: Head sha can't be blank, Head ref must be a branch")
+              print(new(head, base, opt(args, "--title"), pathlib.Path(opt(args, "--body-file")).read_text(),
+                        "mega-gutenberg[bot]")["url"])
+          elif cmd == "label":
+              pr = load()[int(args[0])]
+              pr["labels"] += args[1:]; save(pr)
+          elif cmd == "racer":
+              print(new(args[0], "main", "a concurrent candidate", "", "mega-gutenberg[bot]")["url"])
+          else:
+              sys.exit(f"fake gh pr: {cmd} is not faked")
+          PY
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: A repository shaped like a settled release line
@@ -726,6 +1330,1309 @@ jobs:
           [[ "$(git -C "$REPO" rev-parse HEAD)" == "$tip" ]] \
             || { echo "HEAD was reset to the base commit, dropping hotfix commits"; exit 1; }
           echo "propose sits on $tip, not $base"
+
+      # Workflows run from the pushed ref's tree, so a release branch cut at an
+      # older base commit must be given the default branch's release workflows
+      # in the candidate commit. The fixture's base tree is pre-migration: an old
+      # release-settle.yml, a release-publish.yml and an on-release.yml whose
+      # dist-docs job writes with a Maxwell token and commits as Maxwell. (The
+      # fixtures use literal secret names, not expressions: this script is
+      # itself a workflow, and `${{ }}` in it would be expanded.)
+      - name: The release workflows are carried onto a base_commit candidate
+        run: |
+          set -euo pipefail
+          CREPO="$RUNNER_TEMP/carry"
+          LINT="$GITHUB_WORKSPACE/.github/scripts/app_token_lint.py"
+          wf=.github/workflows
+          TOKEN_ACTION=actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+          git init --quiet --bare "$CREPO.git"
+          git clone --quiet "$CREPO.git" "$CREPO" 2>/dev/null
+          cd "$CREPO"
+          mkdir -p "$wf"
+          echo 1.0.0 > VERSION
+          cat > "$wf/release-settle.yml" <<YML
+          name: release-settle
+          on:
+            workflow_dispatch:
+          jobs:
+            settle:
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: $TOKEN_ACTION # v3
+                  id: token
+                  with:
+                    client-id: MEGA_MAXWELL_CLIENT_ID
+                    private-key: MEGA_MAXWELL_PK
+                    permission-contents: write
+                - uses: megaeth-labs/.github/.github/actions/release-settle@main
+                  with:
+                    token: from-the-step
+          YML
+          cat > "$wf/on-release.yml" <<YML
+          name: on-release
+          on:
+            release:
+              types: [published]
+          jobs:
+            dist-docs:
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: $TOKEN_ACTION # v3
+                  id: token
+                  with:
+                    client-id: MEGA_MAXWELL_CLIENT_ID
+                    private-key: MEGA_MAXWELL_PK
+                    repositories: dist-docs
+                    permission-contents: write
+                - run: |
+                    git config user.name "mega-maxwell[bot]"
+                    git config user.email "290560214+mega-maxwell[bot]@users.noreply.github.com"
+          YML
+          printf 'name: release-publish\non: workflow_dispatch\njobs:\n  publish:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo old publish\n' > "$wf/release-publish.yml"
+          printf 'name: daily-audit\non: workflow_dispatch\njobs:\n  audit:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo audit\n' > "$wf/daily-audit.yml"
+          git add -A && git commit --quiet -m "feat: pre-migration release workflows"
+          git rev-parse HEAD > "$RUNNER_TEMP/carry-base"
+          # The default branch has moved on: migrated workflows, no release-publish.
+          cat > "$wf/release-settle.yml" <<YML
+          name: release-settle
+          on:
+            workflow_dispatch:
+          jobs:
+            settle:
+              runs-on: ubuntu-24.04
+              environment: release
+              steps:
+                - uses: $TOKEN_ACTION # v3
+                  id: release-token
+                  with:
+                    client-id: RELEASE_APP_CLIENT_ID
+                    private-key: RELEASE_APP_PRIVATE_KEY
+                    permission-contents: write
+                - uses: megaeth-labs/.github/.github/actions/release-settle@main
+                  with:
+                    token: from-the-step
+          YML
+          cat > "$wf/on-release.yml" <<YML
+          name: on-release
+          on:
+            release:
+              types: [published]
+          jobs:
+            dist-docs:
+              runs-on: ubuntu-24.04
+              environment: release
+              steps:
+                - uses: $TOKEN_ACTION # v3
+                  id: release-token
+                  with:
+                    client-id: RELEASE_APP_CLIENT_ID
+                    private-key: RELEASE_APP_PRIVATE_KEY
+                    repositories: dist-docs
+                    permission-contents: write
+                - run: |
+                    git config user.name "mega-gutenberg[bot]"
+                    git config user.email "348780249+mega-gutenberg[bot]@users.noreply.github.com"
+          YML
+          git rm --quiet "$wf/release-publish.yml"
+          git add -A && git commit --quiet -m "feat: migrate the release workflows"
+          git push --quiet -u origin main
+          base="$(cat "$RUNNER_TEMP/carry-base")"
+
+          # Stale state: the base tree really is pre-migration, and the lint says so.
+          mkdir -p "$RUNNER_TEMP/carry-base-tree" "$RUNNER_TEMP/carry-candidate-tree"
+          git archive "$base" "$wf" | tar -x -C "$RUNNER_TEMP/carry-base-tree"
+          [[ -f "$RUNNER_TEMP/carry-base-tree/$wf/release-publish.yml" ]] \
+            || { echo "the base tree has no release-publish.yml"; exit 1; }
+          rc=0
+          python3 "$LINT" --repo fake "$RUNNER_TEMP/carry-base-tree/$wf/release-settle.yml" \
+            "$RUNNER_TEMP/carry-base-tree/$wf/on-release.yml" > "$RUNNER_TEMP/lint-base.log" 2>&1 || rc=$?
+          [[ "$rc" -eq 1 ]] || { echo "the lint exits $rc on the base tree, not 1"; cat "$RUNNER_TEMP/lint-base.log"; exit 1; }
+
+          # Propose: cut the branch at the base, carry the workflows. The
+          # checkout is dirty (an untracked file) the way a real job's is.
+          : > "$OUT"
+          env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake GITHUB_OUTPUT="$OUT" \
+            BRANCH=release-v1.1.0 BASE="$base" bash "$SH/cut-branch.sh"
+          echo scratch > scratch.txt
+          env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake \
+            RELEASE_WORKFLOWS="$(cat "$SH/release_workflows.default")" bash "$SH/carry.sh" \
+            | tee "$RUNNER_TEMP/carry.log"
+          git add "$wf" && git commit --quiet -m "chore(release): candidate v1.1.0"
+          candidate="$(git rev-parse HEAD)"
+
+          # The candidate commit's tree, not the log, is the evidence.
+          for f in release-settle.yml on-release.yml; do
+            git show "$candidate:$wf/$f" > "$RUNNER_TEMP/got"
+            git show "origin/main:$wf/$f" > "$RUNNER_TEMP/want"
+            cmp "$RUNNER_TEMP/got" "$RUNNER_TEMP/want" \
+              || { echo "$f is not the default branch's, byte for byte"; exit 1; }
+          done
+          if git cat-file -e "$candidate:$wf/release-publish.yml" 2>/dev/null; then
+            echo "release-publish.yml is still in the candidate tree"; exit 1
+          fi
+          [[ "$(git diff --name-only "$base" "$candidate" | sort | tr '\n' ' ')" \
+              == "$wf/on-release.yml $wf/release-publish.yml $wf/release-settle.yml " ]] \
+            || { echo "the candidate changed more than the release workflows:"; git diff --name-only "$base" "$candidate"; exit 1; }
+          [[ "$(git status --porcelain)" == "?? scratch.txt" ]] \
+            || { echo "the carry touched the rest of the checkout:"; git status --porcelain; exit 1; }
+          git archive "$candidate" "$wf" | tar -x -C "$RUNNER_TEMP/carry-candidate-tree"
+          python3 "$LINT" --repo fake "$RUNNER_TEMP/carry-candidate-tree/$wf/release-settle.yml" \
+            "$RUNNER_TEMP/carry-candidate-tree/$wf/on-release.yml"
+          [[ "$(git ls-remote --heads origin refs/heads/release-v1.1.0 | cut -f1)" == "$base" ]] \
+            || { echo "the release branch is not at the base commit"; exit 1; }
+
+          # Re-running the carry on the candidate changes nothing; an absent
+          # path is skipped, not an error.
+          env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake \
+            RELEASE_WORKFLOWS="$(cat "$SH/release_workflows.default")"$'\n'"$wf/not-there.yml" \
+            bash "$SH/carry.sh" | tee "$RUNNER_TEMP/carry2.log"
+          grep -qF "skipped $wf/not-there.yml" "$RUNNER_TEMP/carry2.log" \
+            || { echo "an absent path was not reported as skipped"; exit 1; }
+          [[ "$(git status --porcelain)" == "?? scratch.txt" ]] \
+            || { echo "a second carry changed the tree"; git status --porcelain; exit 1; }
+          echo "candidate $candidate carries the default branch's release workflows"
+
+      - name: The bump command never runs with the release token
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/carry"
+          marker="$RUNNER_TEMP/bump-ran"
+          rm -f "$marker"
+          bump() { # <dependency token>
+            env GITHUB_AUTH_TOKEN="$1" DEPENDENCY_TOKEN="$1" GH_TOKEN=fake \
+              OLD_VERSION=0.9.0 NEW_VERSION=1.0.0 BUMP_COMMAND="touch '$marker'" \
+              FILE=VERSION PATTERN=plain TOOLS="$TOOLS" bash "$SH/bump.sh"
+          }
+          if bump "" > "$RUNNER_TEMP/bump.log" 2>&1; then
+            echo "the bump command ran without a dependency token"; cat "$RUNNER_TEMP/bump.log"; exit 1
+          fi
+          grep -qF "bump_command needs a separate dependency_token" "$RUNNER_TEMP/bump.log" \
+            || { echo "refused, but not for the missing dependency token:"; cat "$RUNNER_TEMP/bump.log"; exit 1; }
+          [[ ! -e "$marker" ]] || { echo "the bump command ran before the refusal"; exit 1; }
+          bump dependency-token
+          [[ -e "$marker" ]] || { echo "the bump command did not run with a dependency token"; exit 1; }
+          echo "refused without a dependency token, runs with one"
+
+      # `cut` runs on the push that merged the candidate. It re-reads the PR
+      # through the API (fixtures here) and trusts nothing from the event.
+      - name: Cut refuses what is not a merged candidate and creates the branch for one
+        run: |
+          set -euo pipefail
+          UP="$RUNNER_TEMP/cut"
+          git init --quiet --bare "$UP.git"
+          git clone --quiet "$UP.git" "$UP" 2>/dev/null
+          cd "$UP"
+          echo 1.0.0 > VERSION
+          git add -A && git commit --quiet -m "feat: first"
+          echo 1.3.0 > VERSION
+          git add -A && git commit --quiet -m "chore(release): candidate v1.3.0 (#7)"
+          git push --quiet -u origin main
+          merge="$(git rev-parse HEAD)"
+          earlier="$(git rev-parse HEAD~1)"
+          mkdir -p "$RUNNER_TEMP/pr"
+          pr() { # <number> <merged_at|null> <merge sha> <head ref> <base ref> <author>
+            python3 - "$@" "$RUNNER_TEMP/pr" <<'PY'
+          import json, sys
+          number, merged_at, sha, head, base, login, out = sys.argv[1:]
+          doc = {
+              "number": int(number),
+              "merged_at": None if merged_at == "null" else merged_at,
+              "merge_commit_sha": sha,
+              "head": {"ref": head},
+              "base": {"ref": base},
+              "user": {"login": login},
+          }
+          json.dump(doc, open(f"{out}/{number}.json", "w"))
+          PY
+          }
+          run_cut() { # <pr number> <commit>
+            : > "$OUT"
+            ( cd "$UP" && env \
+                GH_TOKEN=fake \
+                GITHUB_REPOSITORY=megaeth-labs/fake \
+                GITHUB_OUTPUT="$OUT" \
+                VERSION=1.3.0 \
+                PREFIX=release-v \
+                FILE=VERSION \
+                PATTERN=plain \
+                COMMIT="$2" \
+                PR_NUMBER="$1" \
+                EXPECTED_AUTHOR='mega-gutenberg[bot]' \
+                TOOLS="$TOOLS" \
+                bash "$SH/cut.sh" ) > "$RUNNER_TEMP/cut.log" 2>&1
+          }
+          branch_at() { git -C "$UP" ls-remote --heads origin refs/heads/release-v1.3.0 | cut -f1; }
+          refuse_cut() { # <pr number> <commit> <message fragment>
+            if run_cut "$1" "$2"; then
+              echo "expected a refusal for PR $1"; cat "$RUNNER_TEMP/cut.log"; exit 1
+            fi
+            grep -qF "$3" "$RUNNER_TEMP/cut.log" \
+              || { echo "PR $1 refused, but not for '$3':"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+            [[ -z "$(branch_at)" ]] || { echo "a refused cut still created release-v1.3.0"; exit 1; }
+          }
+          candidate=chore/release-candidate-1.3.0
+          merged=2026-01-01T00:00:00Z
+          bot='mega-gutenberg[bot]'
+          pr 12 "$merged" "$merge" "$candidate" main 'mega-maxwell[bot]'
+          pr 13 null "$merge" "$candidate" main "$bot"
+          pr 14 "$merged" "$earlier" "$candidate" main "$bot"
+          pr 15 "$merged" "$merge" "$candidate" release-v1.2.0 "$bot"
+          pr 16 "$merged" "$merge" feature/x main "$bot"
+          pr 17 "$merged" "$earlier" "$candidate" main "$bot"
+          refuse_cut 12 "$merge" "not by 'mega-gutenberg[bot]'"
+          refuse_cut 13 "$merge" "has not been merged"
+          refuse_cut 14 "$merge" "not the pushed commit"
+          refuse_cut 15 "$merge" "not the default branch 'main'"
+          refuse_cut 16 "$merge" "is not a chore/release-candidate-* branch"
+          refuse_cut 17 "$earlier" "says 1.0.0, expected 1.3.0"
+          refuse_cut "" "$merge" "cut needs the commit and pr_number inputs"
+          refuse_cut 11 "" "cut needs the commit and pr_number inputs"
+
+          # The version comes from the PR's head ref, read through the API.
+          pr 11 "$merged" "$merge" "$candidate" main "$bot"
+          : > "$OUT"
+          env STAGE=cut PR_NUMBER=11 INPUT_VERSION= GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake \
+            GITHUB_OUTPUT="$OUT" TOOLS="$TOOLS" bash "$SH/version.sh"
+          expect_out() { grep -qxF "$1" "$OUT" || { echo "no '$1' in the step output:"; cat "$OUT"; exit 1; }; }
+          expect_out "version=1.3.0"
+
+          run_cut 11 "$merge" || { cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          expect_out "release_branch=release-v1.3.0"
+          [[ "$(branch_at)" == "$merge" ]] \
+            || { echo "release-v1.3.0 is not at the merge commit: '$(branch_at)'"; exit 1; }
+          echo "release-v1.3.0 created at $merge"
+
+          # A retry of the cut that succeeded: the branch is already at the
+          # merge commit, so it is a no-op that says so and exits 0.
+          run_cut 11 "$merge" || { echo "a retried cut failed"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          expect_out "release_branch=release-v1.3.0"
+          grep -qF "release-v1.3.0 already exists at $merge" "$RUNNER_TEMP/cut.log" \
+            || { echo "the retry did not report the existing cut:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          [[ "$(branch_at)" == "$merge" ]] || { echo "the existing branch moved"; exit 1; }
+
+          # The branch at another commit is not this cut: refused, both SHAs
+          # named, and it is not moved.
+          git -C "$UP" push --quiet origin ":refs/heads/release-v1.3.0"
+          git -C "$UP" push --quiet origin "$earlier:refs/heads/release-v1.3.0"
+          if run_cut 11 "$merge"; then
+            echo "a cut over a branch at another commit succeeded"; cat "$RUNNER_TEMP/cut.log"; exit 1
+          fi
+          grep -qF "branch release-v1.3.0 already exists at $earlier, not at the candidate merge commit $merge" "$RUNNER_TEMP/cut.log" \
+            || { echo "refused, but without both SHAs:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          [[ "$(branch_at)" == "$earlier" ]] || { echo "the conflicting branch moved"; exit 1; }
+
+          # Two cuts race: the ref is absent when this one looks, a concurrent
+          # one creates it first and this create gets a 422. At the merge
+          # commit that is the same cut; anywhere else it is refused.
+          git -C "$UP" push --quiet origin ":refs/heads/release-v1.3.0"
+          echo "$merge" > "$RUNNER_TEMP/race-create"
+          run_cut 11 "$merge" || { echo "a cut that lost the race to the same cut failed"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          [[ ! -e "$RUNNER_TEMP/race-create" ]] || { echo "the race was not exercised"; exit 1; }
+          grep -qF "release-v1.3.0 already exists at $merge" "$RUNNER_TEMP/cut.log" \
+            || { echo "the lost race was not reported:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          [[ "$(branch_at)" == "$merge" ]] || { echo "release-v1.3.0 is not at the merge commit after the race"; exit 1; }
+          git -C "$UP" push --quiet origin ":refs/heads/release-v1.3.0"
+          echo "$earlier" > "$RUNNER_TEMP/race-create"
+          if run_cut 11 "$merge"; then
+            echo "a cut that lost the race to another commit succeeded"; cat "$RUNNER_TEMP/cut.log"; exit 1
+          fi
+          grep -qF "already exists at $earlier, not at the candidate merge commit $merge" "$RUNNER_TEMP/cut.log" \
+            || { echo "refused, but not for the racer's commit:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          echo "cut creates the branch for a merged gutenberg candidate, is a no-op when it is already there, and refuses the rest"
+
+      # propose never rewrites the candidate branch. A re-dispatch closes the
+      # open candidate PR, deletes the branch and pushes a fresh one as a new
+      # ref; the remote here refuses every non-fast-forward update, the way a
+      # ruleset that bans force pushes does, so a forced push anywhere in the
+      # step fails this case. Retries and concurrent runs, whoever got where
+      # first, converge on one branch and one open PR.
+      - name: A re-dispatched candidate supersedes the open one, and nothing is force-pushed
+        run: |
+          set -euo pipefail
+          C="$RUNNER_TEMP/candidate"
+          git init --quiet --bare "$C.git"
+          git -C "$C.git" config receive.denyNonFastForwards true
+          git clone --quiet "$C.git" "$C" 2>/dev/null
+          echo 1.2.0 > "$C/VERSION"
+          git -C "$C" add -A && git -C "$C" commit --quiet -m "feat: first"
+          git -C "$C" push --quiet origin HEAD:refs/heads/main
+          main="$(git -C "$C" rev-parse HEAD)"
+          head=chore/release-candidate-1.3.0
+          app='mega-gutenberg[bot]'
+          rm -rf "$RUNNER_TEMP/prs"
+          # Each propose commits at its own time, so every candidate is a
+          # different commit and an in-place update would be non-fast-forward.
+          tick=1700000000
+          propose() { # [VAR=value ...] — the bump, then the step, on a fresh checkout of main
+            tick=$((tick + 60))
+            export GIT_AUTHOR_DATE="@$tick +0000" GIT_COMMITTER_DATE="@$tick +0000"
+            git -C "$C" checkout --quiet -B main "$main"
+            echo "${BUMP_TO:-1.3.0}" > "$C/VERSION"
+            : > "$OUT"
+            ( cd "$C" && env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake GITHUB_OUTPUT="$OUT" \
+                VERSION=1.3.0 OLD_VERSION=1.2.0 RELEASE_BRANCH= BASE_COMMIT= PREFIX=release-v SYNCED=unchanged \
+                PR_LABELS="release, candidate" \
+                GIT_AUTHOR_NAME="$app" GIT_AUTHOR_EMAIL=app@example.invalid \
+                GIT_COMMITTER_NAME="$app" GIT_COMMITTER_EMAIL=app@example.invalid \
+                "$@" bash "$SH/open-pr.sh" ) > "$RUNNER_TEMP/open-pr.log" 2>&1
+          }
+          says() { grep -qF "$1" "$RUNNER_TEMP/open-pr.log" || { echo "no '$1' in:"; cat "$RUNNER_TEMP/open-pr.log"; exit 1; }; }
+          ok() { propose "$@" || { echo "propose failed:"; cat "$RUNNER_TEMP/open-pr.log"; exit 1; }; }
+          remote_head() { git -C "$C" ls-remote --heads origin "refs/heads/$head" | cut -f1; }
+          pr() { # <number> <field>
+            python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))[sys.argv[2]]; print(v if isinstance(v,str) else json.dumps(v))' \
+              "$RUNNER_TEMP/prs/$1.json" "$2"
+          }
+          open_prs() { python3 "$RUNNER_TEMP/bin/fake-pr.py" list --head "$head" --state open \
+            | python3 -c 'import json,sys; print(" ".join(str(p["number"]) for p in json.load(sys.stdin)))'; }
+          converged() { # <the one open PR> — one branch, one open PR, and the step reported it
+            [[ "$(open_prs)" == "$1" ]] || { echo "open candidate PRs: '$(open_prs)', expected '$1'"; exit 1; }
+            [[ -n "$(remote_head)" ]] || { echo "$head is missing"; exit 1; }
+            grep -qxF "pr_url=https://github.com/megaeth-labs/fake/pull/$1" "$OUT" \
+              || { echo "the step did not report PR $1:"; cat "$OUT"; exit 1; }
+          }
+
+          # The fixture remote really refuses a forced update.
+          git -C "$C" push --quiet origin "HEAD:refs/heads/probe"
+          if git -C "$C" push --quiet --force origin "$(git -C "$C" commit-tree "HEAD^{tree}" -m probe):refs/heads/probe" 2>/dev/null; then
+            echo "the fixture remote accepted a force push"; exit 1
+          fi
+          git -C "$C" push --quiet origin :refs/heads/probe
+
+          # A first propose: a new branch on main, one PR, opened by the app.
+          ok
+          converged 100
+          first="$(remote_head)"
+          [[ "$(git -C "$C" rev-parse "$first~1")" == "$main" ]] || { echo "the candidate is not on main"; exit 1; }
+          [[ "$(git -C "$C" log -1 --format='%an|%cn|%s' "$first")" == "$app|$app|chore(release): candidate v1.3.0" ]] \
+            || { echo "wrong commit: $(git -C "$C" log -1 --format='%an|%cn|%s' "$first")"; exit 1; }
+          [[ "$(git -C "$C" show "$first:VERSION")" == 1.3.0 ]] || { echo "the bump is not in the candidate"; exit 1; }
+          [[ "$(pr 100 base)" == main && "$(pr 100 author)" == "$app" ]] || { echo "PR 100 base/author is wrong"; exit 1; }
+          [[ "$(pr 100 labels)" == '["release", "candidate"]' ]] || { echo "PR 100 labels: $(pr 100 labels)"; exit 1; }
+          pr 100 body > "$RUNNER_TEMP/body"
+          grep -qxF '<!-- release-candidate: v1.3.0 -->' "$RUNNER_TEMP/body" || { echo "no marker:"; cat "$RUNNER_TEMP/body"; exit 1; }
+          grep -qF "Merging this PR creates the release branch \`release-v1.3.0\` at the merge commit." "$RUNNER_TEMP/body" \
+            || { cat "$RUNNER_TEMP/body"; exit 1; }
+          grep -qxF "previous release's entry synced from its tag: unchanged." "$RUNNER_TEMP/body" || { cat "$RUNNER_TEMP/body"; exit 1; }
+          says "pushed $head at $first as a new ref"
+          says "stays after the PR merges"
+
+          # A re-dispatch supersedes it: closed with a comment, the branch
+          # deleted and pushed again as a new ref, a fresh PR.
+          echo true > "$RUNNER_TEMP/auto-delete"
+          ok
+          converged 101
+          [[ "$(remote_head)" != "$first" ]] || { echo "the re-dispatch did not make a new candidate commit"; exit 1; }
+          [[ "$(pr 100 state)" == CLOSED ]] || { echo "the superseded PR is still open"; exit 1; }
+          grep -qF "Superseded: a fresh candidate for v1.3.0 replaces this PR" <<< "$(pr 100 comments)" \
+            || { echo "no supersede comment: $(pr 100 comments)"; exit 1; }
+          says "closed superseded candidate PR #100"
+          says "deleted the old $head"
+          says "deleted when the PR merges, by the repository's 'Automatically delete head branches' setting"
+          rm "$RUNNER_TEMP/auto-delete"
+
+          # A retry after a partial failure: the PR was closed, the branch is
+          # still there and has no PR (equally: pushed, then died before the PR).
+          python3 "$RUNNER_TEMP/bin/fake-pr.py" close 101 --comment "closed by hand"
+          ok
+          converged 102
+          says "deleted the old $head"
+
+          # The PR this run would close was closed by a concurrent run first.
+          : > "$RUNNER_TEMP/race-close"
+          ok
+          converged 103
+          says "candidate PR #102 was already closed"
+
+          # The branch was deleted by a concurrent run first.
+          : > "$RUNNER_TEMP/race-delete"
+          ok
+          converged 104
+          says "was already deleted"
+
+          # A concurrent run pushed its own branch right after the delete and
+          # opened its PR: this push is refused, its branch and PR stand.
+          echo with-pr > "$RUNNER_TEMP/race-push"
+          ok
+          converged 105
+          [[ ! -e "$RUNNER_TEMP/race-push" ]] || { echo "the race was not exercised"; exit 1; }
+          [[ "$(git -C "$C" log -1 --format=%s "$(remote_head)")" == "chore(release): a concurrent candidate" ]] \
+            || { echo "the concurrent run's branch was replaced"; exit 1; }
+          says "was created at $(remote_head) by a concurrent run"
+          says "candidate PR https://github.com/megaeth-labs/fake/pull/105 was opened by a concurrent run"
+
+          # The same, but the concurrent run died before its PR: this run opens it.
+          echo no-pr > "$RUNNER_TEMP/race-push"
+          ok
+          converged 106
+          [[ "$(git -C "$C" log -1 --format=%s "$(remote_head)")" == "chore(release): a concurrent candidate" ]] \
+            || { echo "the concurrent run's branch was replaced"; exit 1; }
+          says "opened candidate PR https://github.com/megaeth-labs/fake/pull/106"
+
+          # A concurrent run opened the PR between this push and this create.
+          : > "$RUNNER_TEMP/race-pr"
+          ok
+          converged 107
+          says "candidate PR https://github.com/megaeth-labs/fake/pull/107 was opened by a concurrent run"
+
+          # The delete lost to a concurrent run that kept the branch and opened
+          # a PR: nothing is pushed over it.
+          before="$(remote_head)"
+          : > "$RUNNER_TEMP/race-recreate"
+          ok
+          converged 108
+          [[ "$(remote_head)" == "$before" ]] || { echo "the concurrent run's branch moved"; exit 1; }
+          says "by a concurrent run; keeping it rather than replacing it"
+
+          # A delete that just fails, with no PR owning the branch, is an error.
+          python3 "$RUNNER_TEMP/bin/fake-pr.py" close 108 --comment "closed by hand"
+          : > "$RUNNER_TEMP/fail-delete"
+          if propose; then echo "a failed delete succeeded"; cat "$RUNNER_TEMP/open-pr.log"; exit 1; fi
+          says "could not delete $head, and no open PR owns it"
+          rm "$RUNNER_TEMP/fail-delete"
+          ok
+          converged 109
+
+          # Nothing to propose: no PR closed, nothing pushed.
+          before="$(remote_head)"
+          BUMP_TO=1.2.0 ok
+          says "no candidate PR opened, nothing pushed"
+          grep -qxF "pr_url=" "$OUT" || { cat "$OUT"; exit 1; }
+          [[ "$(open_prs)" == 109 && "$(remote_head)" == "$before" ]] || { echo "an empty propose touched the candidate"; exit 1; }
+
+          # A base_commit candidate targets the release branch.
+          ok RELEASE_BRANCH=release-v1.3.0 BASE_COMMIT="$main"
+          converged 110
+          [[ "$(pr 110 base)" == release-v1.3.0 ]] || { echo "PR 110 targets $(pr 110 base)"; exit 1; }
+          pr 110 body | grep -qF "Cut from \`$main\`, which is not the tip of the default branch: \`release-v1.3.0\` already exists" \
+            || { pr 110 body; exit 1; }
+          echo "every propose left one $head and one open PR, and the remote never took a forced update"
+
+  # release-publish re-verifies the merged settle PR through the API and tags
+  # the pushed commit. The three steps that do it are extracted by name and run
+  # against a throwaway bare remote, a fake gh that answers from fixtures and
+  # records what it was asked to create, and fixtures for each refusal.
+  release-publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      TOOLS: ${{ github.workspace }}/.github/actions/release-tools/release_tools.py
+      ACTION: ${{ github.workspace }}/.github/actions/release-publish/action.yml
+      AUTH_WRAPPER: ${{ github.workspace }}/.github/actions/git-auth/with-github-auth.sh
+      GITHUB_AUTH_TOKEN: fixture-token
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # `runner` is not a context a job-level `env:` may read, so the paths
+      # the steps below share are set here instead.
+      - name: Where the rehearsal lives
+        run: |
+          set -euo pipefail
+          {
+            echo "REPO=$RUNNER_TEMP/repo"
+            echo "SH=$RUNNER_TEMP/sh"
+            echo "OUT=$RUNNER_TEMP/step-output"
+            echo "FIX=$RUNNER_TEMP/fixtures"
+            echo "ARGS=$RUNNER_TEMP/fixtures/release-create-args"
+            echo "RELEASES=$RUNNER_TEMP/fixtures/releases"
+          } >> "$GITHUB_ENV"
+
+      - name: The shell under test, taken from the action
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          mkdir -p "$SH"
+          python3 - "$ACTION" "$SH" <<'PY'
+          import pathlib, sys, yaml
+
+          want = {
+              "Guard": "guard.sh",
+              "Create and push tag": "tag.sh",
+              "Publish GitHub Release": "release.sh",
+          }
+          steps = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"]
+          found = {s["name"]: s["run"] for s in steps if s.get("name") in want}
+          missing = sorted(set(want) - set(found))
+          if missing:
+              sys.exit(f"action.yml has no step named {missing}; this job drives them by name")
+          # The job below skips the tag step by this condition; if the action's
+          # changes, the rehearsal would no longer be rehearsing it.
+          cond = next(s for s in steps if s.get("name") == "Create and push tag").get("if")
+          if cond != "steps.guard.outputs.tag_exists != 'true'":
+              sys.exit(f"the tag step's condition is {cond!r}; update this job to match")
+          cond = next(s for s in steps if s.get("name") == "Publish GitHub Release").get("if")
+          if cond != "steps.guard.outputs.published != 'true'":
+              sys.exit(f"the Release step's condition is {cond!r}; update this job to match")
+          for name, script in found.items():
+              pathlib.Path(sys.argv[2], want[name]).write_text(script)
+              print(f"extracted {name!r} -> {want[name]}")
+          PY
+          cat > "$SH/helpers.sh" <<'SH'
+          out_get() { grep -m1 "^$1=" "$OUT" | cut -d= -f2-; }
+
+          expect_output() { # <exact line the guard should have written>
+            grep -qxF "$1" "$OUT" || { echo "no '$1' in the guard output:"; cat "$OUT"; exit 1; }
+          }
+
+          # The three steps, the way the action's steps run them.
+          guard() { # <pr> [expected author]
+            : > "$OUT"
+            ( cd "$REPO" && env \
+                GH_TOKEN=fake \
+                GITHUB_REPOSITORY=megaeth-labs/fake \
+                GITHUB_OUTPUT="$OUT" \
+                MERGE_SHA="$(cat "$FIX/merge-$1")" \
+                PR_NUMBER="$1" \
+                EXPECTED_AUTHOR="${2-mega-gutenberg[bot]}" \
+                PREFIX=release-v \
+                FILE=VERSION \
+                PATTERN=plain \
+                CHANGELOG=CHANGELOG.md \
+                bash "$SH/guard.sh" )
+          }
+
+          tag_step() {
+            ( cd "$REPO" && env \
+                TAG="$(out_get tag)" \
+                MERGE_SHA="$(out_get merge_sha)" \
+                bash "$SH/tag.sh" ) || return 1
+            touch "$FIX/tag-ran"
+          }
+
+          release_step() {
+            touch "$FIX/release-ran"
+            : > "$OUT.release"
+            ( cd "$REPO" && env \
+                GH_TOKEN=fake \
+                GITHUB_REPOSITORY=megaeth-labs/fake \
+                TAG="$(out_get tag)" \
+                NOTES="$(out_get notes_file)" \
+                GITHUB_OUTPUT="$OUT.release" \
+                bash "$SH/release.sh" )
+          }
+
+          # The action's step list: the tag step runs unless the guard says the
+          # tag is already at the commit, the Release step unless the guard
+          # found the Release too.
+          publish() { # <pr> [expected author]
+            rm -f "$FIX/tag-ran" "$FIX/release-ran"
+            guard "$@" || return 1
+            if [[ "$(out_get tag_exists)" != true ]]; then
+              tag_step || return 1
+            fi
+            if [[ "$(out_get published)" != true ]]; then
+              release_step || return 1
+            fi
+          }
+
+          refuse() { # <pr> <message fragment> [expected author]
+            local log="$RUNNER_TEMP/refused.log"
+            if publish "$1" "${3-mega-gutenberg[bot]}" > "$log" 2>&1; then
+              echo "expected a refusal for PR $1"; cat "$log"; exit 1
+            fi
+            grep -qF "$2" "$log" || { echo "refused, but not for '$2':"; cat "$log"; exit 1; }
+            [[ ! -e "$FIX/tag-ran" ]] || { echo "a refused publish still ran the tag step"; exit 1; }
+          }
+
+          # What the remote says, not what the logs say.
+          remote_commit() { # <tag> -> commit an annotated remote tag points at, or nothing
+            git ls-remote "$REPO.git" "refs/tags/$1^{}" | cut -f1
+          }
+          remote_tag_object() { # <tag>
+            git ls-remote "$REPO.git" "refs/tags/$1" | cut -f1
+          }
+          seed_tag() { # <tag> <sha>: an annotated tag already on the remote
+            git -C "$REPO" tag -a "$1" "$2" -m seed
+            git -C "$REPO" push --quiet origin "refs/tags/$1"
+            git -C "$REPO" tag -d "$1" > /dev/null
+          }
+
+          # A release branch: the settled commit, optionally a late commit on
+          # top (LATE=1), then the settle PR's merge commit. The PR fixture
+          # describes it; O_* variables bend one field of that fixture.
+          settle() { # <version> <pr>
+            local v="$1" pr="$2"
+            git -C "$REPO" checkout --quiet -B "release-v$v" "$(cat "$FIX/root")"
+            (
+              cd "$REPO"
+              echo "${WRONG_FILE:-$v}" > VERSION
+              printf '# Changelog\n\n## v%s (2024-02-01)\n\n- shipped in %s\n\n## v1.0.0 (2024-01-01)\n\n- shipped in 1.0.0\n' "$v" "$v" > CHANGELOG.md
+              git add -A && git commit --quiet -m "chore(release): changelog for v$v"
+              git rev-parse HEAD > "$FIX/settled-$pr"
+              if [[ "${LATE:-}" == 1 ]]; then
+                git commit --quiet --allow-empty -m "fix: landed after the settle PR opened"
+              fi
+              git commit --quiet --allow-empty -m "Merge settle PR #$pr"
+              git rev-parse HEAD > "$FIX/merge-$pr"
+              git push --quiet --force origin "release-v$v"
+              git checkout --quiet main
+            )
+            write_pr "$pr" "$v"
+          }
+
+          write_pr() { # <pr> <version>
+            python3 - "$FIX" "$1" "$2" <<'PY'
+          import json, os, pathlib, sys
+
+          fix, pr, v = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          env = os.environ.get
+          settled = env("O_SETTLED") or (fix / f"settled-{pr}").read_text().strip()
+          merge = env("O_MERGE_SHA") or (fix / f"merge-{pr}").read_text().strip()
+          body = f"Settle v{v}."
+          if env("O_MARKER") != "none":
+              body += f"\n\n<!-- release-settle: v{v} {settled} -->\n"
+          doc = {
+              "merged_at": None if env("O_UNMERGED") else "2024-02-02T00:00:00Z",
+              "merge_commit_sha": merge,
+              "head": {"ref": env("O_HEAD") or f"chore/release-settle-v{v}"},
+              "base": {"ref": env("O_BASE") or f"release-v{v}"},
+              "user": {"login": env("O_USER") or "mega-gutenberg[bot]"},
+              "body": body,
+          }
+          (fix / f"pr-{pr}.json").write_text(json.dumps(doc))
+          PY
+          }
+          SH
+
+      - name: A fake gh
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$FIX"
+          : > "$ARGS"
+          : > "$RELEASES"
+          cat > "$RUNNER_TEMP/bin/gh" <<'SH'
+          #!/usr/bin/env bash
+          # Only what the shell under test calls. The pull request comes from a
+          # fixture; a Release exists once `release create` has been asked for
+          # it, and what it was asked is recorded for the assertions.
+          set -euo pipefail
+          if [[ "${1:-}" == api && "${2:-}" == repos/*/pulls/* ]]; then
+            f="$FIX/pr-${2##*/}.json"
+            [[ -f "$f" ]] || { echo "gh: no fixture $f" >&2; exit 1; }
+            cat "$f"
+            exit 0
+          fi
+          if [[ "${1:-}" == api && "${2:-}" == repos/*/releases/latest ]]; then
+            if [[ -s "$FIX/latest-release" ]]; then
+              cat "$FIX/latest-release"
+              exit 0
+            fi
+            echo "gh: Not Found (HTTP 404)" >&2
+            exit 1
+          fi
+          if [[ "${1:-}" == release && "${2:-}" == view ]]; then
+            if grep -qxF "${3:-}" "$RELEASES"; then
+              echo "https://github.com/megaeth-labs/fake/releases/tag/$3"
+              exit 0
+            fi
+            echo "release not found" >&2
+            exit 1
+          fi
+          if [[ "${1:-}" == release && "${2:-}" == create ]]; then
+            if [[ -e "$FIX/fail-create" ]]; then
+              echo "gh: release create failed (injected)" >&2
+              exit 1
+            fi
+            if grep -qxF "${3:-}" "$RELEASES"; then
+              echo "HTTP 422: Validation Failed (Release.tag_name already_exists)" >&2
+              exit 1
+            fi
+            notes=""
+            args=("$@")
+            for ((i = 0; i < ${#args[@]}; i++)); do
+              if [[ "${args[i]}" == --notes-file ]]; then notes="${args[i + 1]}"; fi
+            done
+            [[ -s "$notes" ]] || { echo "gh: --notes-file '$notes' is missing or empty" >&2; exit 1; }
+            echo "$*" >> "$ARGS"
+            echo "$3" >> "$RELEASES"
+            # GitHub's "latest" moves only for a Release created with --latest.
+            if [[ " $* " == *" --latest "* ]]; then echo "$3" > "$FIX/latest-release"; fi
+            echo "https://github.com/megaeth-labs/fake/releases/tag/$3"
+            exit 0
+          fi
+          echo "gh: unexpected call: $*" >&2
+          exit 99
+          SH
+          chmod +x "$RUNNER_TEMP/bin/gh"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: A repository shaped like a trunk with a release line to cut
+        run: |
+          set -euo pipefail
+          git init --quiet --bare -b main "$REPO.git"
+          git clone --quiet "$REPO.git" "$REPO" 2>/dev/null
+          cd "$REPO"
+          # Local config only: the steps under test run with the global and
+          # system config blanked, as they do in the action.
+          git config user.name tester
+          git config user.email tester@example.invalid
+          git config commit.gpgsign false
+          git config tag.gpgsign false
+          echo 1.0.0 > VERSION
+          printf '# Changelog\n\n## v1.0.0 (2024-01-01)\n\n- shipped in 1.0.0\n' > CHANGELOG.md
+          git add -A && git commit --quiet -m "feat: the first release"
+          git push --quiet -u origin main
+          git rev-parse HEAD > "$FIX/root"
+
+      - name: A settled release is tagged at its merge commit and published
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 1.2.0 101
+          publish 101
+          merge="$(cat "$FIX/merge-101")"
+          expect_output "version=1.2.0"
+          expect_output "tag=v1.2.0"
+          expect_output "tag_exists=false"
+          [[ -e "$FIX/tag-ran" ]] || { echo "the tag step did not run"; exit 1; }
+          [[ "$(git --git-dir="$REPO.git" cat-file -t refs/tags/v1.2.0)" == tag ]] \
+            || { echo "v1.2.0 is not an annotated tag"; exit 1; }
+          [[ "$(remote_commit v1.2.0)" == "$merge" ]] \
+            || { echo "v1.2.0 does not point at the merge commit $merge"; exit 1; }
+          git --git-dir="$REPO.git" cat-file -p refs/tags/v1.2.0 | grep -qxF "Release v1.2.0" \
+            || { echo "the tag annotation changed"; exit 1; }
+          grep -qF "release create v1.2.0 --verify-tag --latest --title v1.2.0 --notes-file " "$ARGS" \
+            || { echo "the Release was not created for v1.2.0:"; cat "$ARGS"; exit 1; }
+          grep -qx "v1.2.0" "$RELEASES" || { echo "no Release v1.2.0"; exit 1; }
+          grep -qxF -- "- shipped in 1.2.0" "$RUNNER_TEMP/release-notes-v1.2.0.md" \
+            || { echo "the notes are not the changelog section"; exit 1; }
+          echo "v1.2.0 is an annotated tag at $merge and the Release was asked for with --verify-tag"
+
+      - name: A retry of a finished publish is a no-op
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          before="$(remote_tag_object v1.2.0)"
+          publish 101 > "$RUNNER_TEMP/retry.log" 2>&1 \
+            || { echo "a retry of a finished publish failed"; cat "$RUNNER_TEMP/retry.log"; exit 1; }
+          expect_output "tag_exists=true"
+          expect_output "published=true"
+          expect_output "release_url=https://github.com/megaeth-labs/fake/releases/tag/v1.2.0"
+          grep -qF "Already published" "$RUNNER_TEMP/retry.log" \
+            || { echo "the no-op was not reported:"; cat "$RUNNER_TEMP/retry.log"; exit 1; }
+          [[ ! -e "$FIX/tag-ran" && ! -e "$FIX/release-ran" ]] || { echo "a step ran on the retry"; exit 1; }
+          [[ "$(remote_tag_object v1.2.0)" == "$before" ]] || { echo "the tag moved"; exit 1; }
+          [[ "$(grep -c 'release create v1.2.0 ' "$ARGS")" == 1 ]] || { echo "a second Release was created"; exit 1; }
+          echo "tag and Release both at the commit: exit 0, notice, nothing changed"
+
+      - name: A run that died after the tag is resumed, not refused
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 1.3.0 102
+          merge="$(cat "$FIX/merge-102")"
+          # The Release call fails once: the tag is pushed, no Release exists.
+          : > "$FIX/fail-create"
+          if publish 102 > "$RUNNER_TEMP/first-run.log" 2>&1; then
+            echo "the first run should have failed at the Release"; exit 1
+          fi
+          rm "$FIX/fail-create"
+          [[ "$(remote_commit v1.3.0)" == "$merge" ]] \
+            || { echo "the interrupted run left no tag at the merge commit"; exit 1; }
+          ! grep -qx "v1.3.0" "$RELEASES" || { echo "a Release exists after the failed run"; exit 1; }
+          object="$(remote_tag_object v1.3.0)"
+          # Re-run: the tag is already there, so the tag step is skipped.
+          publish 102
+          expect_output "tag=v1.3.0"
+          expect_output "tag_exists=true"
+          [[ ! -e "$FIX/tag-ran" ]] || { echo "the tag step ran again"; exit 1; }
+          [[ "$(remote_tag_object v1.3.0)" == "$object" ]] || { echo "the tag was rewritten"; exit 1; }
+          grep -qF "release create v1.3.0 --verify-tag --latest --title v1.3.0 --notes-file " "$ARGS" \
+            || { echo "the Release was not created with the guard's tag:"; cat "$ARGS"; exit 1; }
+          grep -qx "v1.3.0" "$RELEASES" || { echo "no Release v1.3.0"; exit 1; }
+          echo "v1.3.0 resumed: tag step skipped, tag untouched, Release created"
+
+      - name: Anything that does not describe a settled release is refused
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+
+          settle 1.4.0 103
+          O_USER=someone-else write_pr 103 1.4.0
+          refuse 103 "was opened by 'someone-else'"
+
+          # A commit landed after the settle PR was opened: the merge commit's
+          # parent is no longer the settled one.
+          LATE=1 settle 1.5.0 104
+          refuse 104 "drifted"
+
+          settle 1.6.0 105
+          seed_tag v1.6.0 "$(cat "$FIX/settled-105")"
+          refuse 105 "a release is published once"
+          [[ "$(remote_commit v1.6.0)" == "$(cat "$FIX/settled-105")" ]] || { echo "the tag moved"; exit 1; }
+
+          WRONG_FILE=1.8.1 settle 1.8.0 107
+          refuse 107 "says 1.8.1, expected 1.8.0"
+
+          settle 1.9.0 108
+          O_UNMERGED=1 write_pr 108 1.9.0
+          refuse 108 "is not merged"
+
+          settle 1.9.1 109
+          O_MERGE_SHA="$(cat "$FIX/settled-109")" write_pr 109 1.9.1
+          refuse 109 "not the pushed commit"
+
+          settle 1.9.2 110
+          O_MARKER=none write_pr 110 1.9.2
+          refuse 110 "settle PR body has no"
+
+          settle 1.9.3 111
+          O_BASE=main write_pr 111 1.9.3
+          refuse 111 "merged into 'main'"
+
+          settle 1.9.4 112
+          O_HEAD=feature/x write_pr 112 1.9.4
+          refuse 112 "is not a settle PR"
+
+          # The remote and the recorded calls, not the messages, say that
+          # nothing was published: only the two good releases were created.
+          for v in 1.4.0 1.5.0 1.8.0 1.9.0 1.9.1 1.9.2 1.9.3 1.9.4; do
+            [[ -z "$(git ls-remote "$REPO.git" "refs/tags/v$v")" ]] \
+              || { echo "v$v was tagged although it was refused"; exit 1; }
+          done
+          [[ "$(grep -c . "$ARGS")" == 2 ]] \
+            || { echo "expected exactly the v1.2.0 and v1.3.0 Releases:"; cat "$ARGS"; exit 1; }
+          echo "nine refusals, no tag, no Release"
+
+      # Two publishes of the same merge race (a re-run while the first is still
+      # going): whichever pushes the tag or creates the Release second keeps
+      # the first one's, if it is at this commit.
+      - name: A publish that loses a race to its twin keeps the winner's tag and Release
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 2.0.0 120
+          merge="$(cat "$FIX/merge-120")"
+          guard 120
+          expect_output "tag_exists=false"
+          seed_tag v2.0.0 "$merge"          # the twin pushed first
+          object="$(remote_tag_object v2.0.0)"
+          tag_step > "$RUNNER_TEMP/race.log" 2>&1 \
+            || { echo "losing the tag race to the same commit failed"; cat "$RUNNER_TEMP/race.log"; exit 1; }
+          grep -qF "by a concurrent run" "$RUNNER_TEMP/race.log" || { cat "$RUNNER_TEMP/race.log"; exit 1; }
+          [[ "$(remote_tag_object v2.0.0)" == "$object" ]] || { echo "the twin's tag was replaced"; exit 1; }
+          echo v2.0.0 >> "$RELEASES"          # the twin created the Release first
+          release_step > "$RUNNER_TEMP/race.log" 2>&1 \
+            || { echo "losing the Release race failed"; cat "$RUNNER_TEMP/race.log"; exit 1; }
+          grep -qxF "url=https://github.com/megaeth-labs/fake/releases/tag/v2.0.0" "$OUT.release" \
+            || { echo "no url for the twin's Release:"; cat "$OUT.release"; exit 1; }
+          [[ "$(grep -c 'release create v2.0.0 ' "$ARGS")" == 0 ]] || { echo "a Release was recorded twice"; exit 1; }
+
+          # The twin's tag at another commit is not ours: the tag step fails.
+          settle 2.1.0 121
+          guard 121
+          seed_tag v2.1.0 "$(cat "$FIX/settled-121")"
+          if tag_step > "$RUNNER_TEMP/race.log" 2>&1; then
+            echo "a tag race lost to another commit succeeded"; exit 1
+          fi
+          grep -qF "not $(cat "$FIX/merge-121")" "$RUNNER_TEMP/race.log" || { cat "$RUNNER_TEMP/race.log"; exit 1; }
+          echo "races at the same commit converge; a tag elsewhere still fails"
+
+      # v2.1.0 is tagged (above): a settle PR for an older line that is merged
+      # now must not be tagged, and must not take "latest" from a newer one.
+      - name: An older version merged after a newer one is refused, and only the newest is latest
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          created="$(grep -c . "$ARGS")"
+          settle 1.9.5 130
+          refuse 130 "v1.9.5 is not newer than the latest published tag v2.1.0"
+          # The guard refuses, not only the tag step's re-check behind it.
+          grep -qF "::error title=Refusing to publish an older version::settle PR #130: v1.9.5 is not newer than the latest published tag v2.1.0 (rule: a version is published only when it is newer than every vX.Y.Z tag)" \
+            "$RUNNER_TEMP/refused.log" || { cat "$RUNNER_TEMP/refused.log"; exit 1; }
+          grep -qxF "version=1.9.5" "$OUT" && { echo "the guard wrote outputs for a refused version"; exit 1; }
+          [[ -z "$(git ls-remote "$REPO.git" refs/tags/v1.9.5)" ]] || { echo "v1.9.5 was tagged"; exit 1; }
+          [[ "$(grep -c . "$ARGS")" == "$created" ]] || { echo "a Release was created for v1.9.5"; exit 1; }
+
+          # Two lines publish under their own concurrency groups. v3.0.0 passes
+          # its guard, then v3.1.0 is published before v3.0.0's tag step runs.
+          settle 3.0.0 131
+          guard 131
+          cp "$OUT" "$OUT.131"
+          settle 3.1.0 132
+          publish 132
+          grep -qF "release create v3.1.0 --verify-tag --latest --title v3.1.0 " "$ARGS" || { cat "$ARGS"; exit 1; }
+          [[ "$(cat "$FIX/latest-release")" == v3.1.0 ]]
+          cp "$OUT.131" "$OUT"
+          if tag_step > "$RUNNER_TEMP/late.log" 2>&1; then echo "a tag step after a newer tag succeeded"; exit 1; fi
+          grep -qF "v3.0.0 is not newer than the latest published tag v3.1.0" "$RUNNER_TEMP/late.log" \
+            || { cat "$RUNNER_TEMP/late.log"; exit 1; }
+          [[ -z "$(git ls-remote "$REPO.git" refs/tags/v3.0.0)" ]] || { echo "v3.0.0 was tagged"; exit 1; }
+
+          # Its tag got out before the newer Release (a run resumed late): the
+          # Release is still created, but it does not take "latest".
+          seed_tag v3.0.0 "$(cat "$FIX/merge-131")"
+          release_step > "$RUNNER_TEMP/late.log" 2>&1 || { cat "$RUNNER_TEMP/late.log"; exit 1; }
+          grep -qF "release create v3.0.0 --verify-tag --latest=false --title v3.0.0 " "$ARGS" || { cat "$ARGS"; exit 1; }
+          grep -qF "Not the latest Release::v3.0.0 is published without becoming latest" "$RUNNER_TEMP/late.log" \
+            || { cat "$RUNNER_TEMP/late.log"; exit 1; }
+          [[ "$(cat "$FIX/latest-release")" == v3.1.0 ]] || { echo "latest moved back to $(cat "$FIX/latest-release")"; exit 1; }
+          echo "v1.9.5 refused after v2.1.0; v3.0.0 not tagged after v3.1.0, and its late Release is not latest"
+
+  release-route:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      TOOLS: ${{ github.workspace }}/.github/actions/release-tools/release_tools.py
+      ACTION: ${{ github.workspace }}/.github/actions/release-route/action.yml
+      PUBLISH_ACTION: ${{ github.workspace }}/.github/actions/release-publish/action.yml
+      AUTH_WRAPPER: ${{ github.workspace }}/.github/actions/git-auth/with-github-auth.sh
+      GITHUB_AUTH_TOKEN: fixture-token
+      GH_TOKEN: fixture-token
+      # GitHub ignores env: for its default GITHUB_* variables, so the runner's
+      # real GITHUB_REPOSITORY would reach the scripts; every invocation below
+      # passes this one explicitly instead.
+      FAKE_REPOSITORY: megaeth-labs/fake
+      EXPECTED_AUTHOR: mega-gutenberg[bot]
+      PREFIX: release-v
+      FILE: VERSION
+      PATTERN: plain
+      DISPATCH_VERSION: ""
+      DEFAULT_BRANCH: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Where the rehearsal lives
+        run: |
+          set -euo pipefail
+          {
+            echo "REPO=$RUNNER_TEMP/route-repo"
+            echo "SH=$RUNNER_TEMP/route-sh"
+            echo "FIX=$RUNNER_TEMP/route-fixtures"
+            echo "OUT=$RUNNER_TEMP/route-output"
+            echo "REAL_GIT=$(command -v git)"
+          } >> "$GITHUB_ENV"
+
+      - name: Extract shipped scripts and install fakes
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          mkdir -p "$SH" "$FIX" "$RUNNER_TEMP/route-bin"
+          python3 - <<'PY'
+          import os, pathlib, yaml
+
+          for action, name, dest in (("ACTION", "Route", "route.sh"),
+                                     ("PUBLISH_ACTION", "Guard", "publish-guard.sh")):
+              steps = yaml.safe_load(pathlib.Path(os.environ[action]).read_text())["runs"]["steps"]
+              script = next(s["run"] for s in steps if s.get("name") == name)
+              pathlib.Path(os.environ["SH"], dest).write_text(script)
+          PY
+          [[ "$(grep -c AUTH_WRAPPER "$ACTION")" -ge 2 ]]
+          cat > "$SH/helpers.sh" <<'SH'
+          route() { # <kind> <ref> <sha> [event]
+            : > "$OUT"
+            ( cd "$REPO" && env KIND="$1" GITHUB_REPOSITORY="$FAKE_REPOSITORY" GITHUB_REF_NAME="$2" \
+                GITHUB_SHA="$3" GITHUB_EVENT_NAME="${4:-push}" GITHUB_OUTPUT="$OUT" bash "$SH/route.sh" )
+          }
+          out_get() {
+            python3 - "$OUT" "$1" <<'PY'
+          import pathlib, sys
+          lines = iter(pathlib.Path(sys.argv[1]).read_text().splitlines())
+          values = {}
+          for line in lines:
+              if "<<" in line:
+                  key, end = line.split("<<", 1)
+                  parts = []
+                  for part in lines:
+                      if part == end:
+                          break
+                      parts.append(part)
+                  values[key] = "\n".join(parts)
+              else:
+                  key, value = line.split("=", 1)
+                  values[key] = value
+          print(values.get(sys.argv[2], ""), end="")
+          PY
+          }
+          expect_output() {
+            local actual
+            actual="$(out_get "$1")"
+            [[ "$actual" == "$2" ]] || { echo "expected $1=$2, got '$actual'"; cat "$OUT"; exit 1; }
+          }
+          SH
+          cat > "$RUNNER_TEMP/route-bin/git" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "${1:-}" == fetch || "${1:-}" == ls-remote ]]; then
+            [[ "${GITHUB_AUTH_TOKEN:-}" == fixture-token && -n "${GIT_ASKPASS:-}" \
+                && "${GIT_CONFIG_GLOBAL:-}" == /dev/null ]] \
+              || { echo "remote git bypassed auth wrapper" >&2; exit 97; }
+            echo "authenticated $1" >> "$FIX/auth-calls"
+          fi
+          exec "$REAL_GIT" "$@"
+          SH
+          cat > "$RUNNER_TEMP/route-bin/gh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ "$GH_TOKEN" == fixture-token ]]
+          # Calls without a repo argument resolve it from the checkout's remote.
+          [[ -z "${GH_REPO:-}" && "$(git config --get remote.origin.url)" == "https://github.com/$FAKE_REPOSITORY.git" ]] \
+            || { echo "gh would resolve a repository other than $FAKE_REPOSITORY" >&2; exit 98; }
+          case "$*" in
+            "repo view $FAKE_REPOSITORY "*) echo main ;;
+            api*"repos/$FAKE_REPOSITORY/commits/"*"/pulls")
+              cat "$FIX/pulls.json" ;;
+            api*"repos/$FAKE_REPOSITORY/pulls/42")
+              jq '.[0]' "$FIX/settle.json" ;;
+            "pr list "*)
+              echo fallback >> "$FIX/fallback-calls"
+              cat "$FIX/fallback.json" ;;
+            "release view "*)
+              [[ -e "$FIX/release-exists" ]] || exit 1
+              echo '{"tagName":"v1.2.0"}' ;;
+            *) echo "unexpected gh call: $*" >&2; exit 99 ;;
+          esac
+          SH
+          chmod +x "$RUNNER_TEMP/route-bin/"*
+          echo "$RUNNER_TEMP/route-bin" >> "$GITHUB_PATH"
+
+      - name: A local remote and merged PR fixtures
+        run: |
+          set -euo pipefail
+          git init --quiet --bare -b main "$REPO.git"
+          git clone --quiet "$REPO.git" "$REPO" 2>/dev/null
+          cd "$REPO"
+          git config user.name tester
+          git config user.email tester@example.invalid
+          git config commit.gpgsign false
+          git config tag.gpgsign false
+          echo 1.1.0 > VERSION
+          git add VERSION && git commit --quiet -m "feat: initial release"
+          git tag -a v1.1.0 -m seed
+          git push --quiet origin main --tags
+          git rev-parse HEAD > "$FIX/old"
+          git branch release-v1.2.0
+          git branch release-v1.1.0
+          echo 1.2.0 > VERSION
+          printf '# Changelog\n\n## v1.2.0 (2026-10-27)\n\n- shipped\n' > CHANGELOG.md
+          git add -A && git commit --quiet -m "chore(release): candidate v1.2.0"
+          git rev-parse HEAD > "$FIX/candidate"
+          git checkout --quiet release-v1.2.0
+          git merge --quiet --ff-only main
+          git rev-parse HEAD > "$FIX/parent"
+          git commit --quiet --allow-empty -m "Merge settle PR"
+          git rev-parse HEAD > "$FIX/merge"
+          git push --quiet origin main release-v1.2.0 release-v1.1.0 --tags
+          git checkout --quiet release-v1.2.0
+          # Local rewrite survives the real wrapper's blank global config.
+          # Without the wrapper the git shim refuses before touching HTTPS.
+          git config "url.file://$REPO.git.insteadOf" "https://github.com/$FAKE_REPOSITORY.git"
+          git remote set-url origin "https://github.com/$FAKE_REPOSITORY.git"
+          if git ls-remote origin > "$FIX/unwrapped.log" 2>&1; then
+            echo "unwrapped remote read succeeded"; exit 1
+          else
+            [[ "$?" == 97 ]]
+          fi
+          grep -qxF "remote git bypassed auth wrapper" "$FIX/unwrapped.log"
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          fix = pathlib.Path(os.environ["FIX"])
+          def sha(name):
+              return (fix / name).read_text().strip()
+          def pr(kind):
+              return {
+                  "number": 41 if kind == "candidate" else 42,
+                  "merged_at": "2026-10-27T00:00:00Z",
+                  "merge_commit_sha": sha(kind if kind == "candidate" else "merge"),
+                  "head": {"ref": f"chore/release-{kind}-v1.2.0"},
+                  "base": {"ref": "main" if kind == "candidate" else "release-v1.2.0"},
+                  "user": {"login": "mega-gutenberg[bot]"},
+                  "body": f"<!-- release-settle: v1.2.0 {sha('parent')} -->",
+              }
+          for kind in ("candidate", "settle"):
+              (fix / f"{kind}.json").write_text(json.dumps([pr(kind)]))
+          p = pr("settle")
+          fallback = [{"number": p["number"], "mergeCommit": {"oid": p["merge_commit_sha"]},
+                       "mergedAt": p["merged_at"], "headRefName": p["head"]["ref"],
+                       "baseRefName": p["base"]["ref"], "author": p["user"], "body": p["body"]}]
+          (fix / "fallback-good.json").write_text(json.dumps(fallback))
+          (fix / "fallback.json").write_text("[]")
+          PY
+
+      - name: Candidate cut and author mismatch
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          cp "$FIX/candidate.json" "$FIX/pulls.json"
+          route candidate main "$(cat "$FIX/candidate")"
+          expect_output action cut
+          expect_output version 1.2.0
+          expect_output release_branch release-v1.2.0
+          expect_output commit "$(cat "$FIX/candidate")"
+          expect_output pr_number 41
+          expect_output targets '[]'
+          jq '.[0].user.login = "mega-maxwell[bot]"' "$FIX/candidate.json" > "$FIX/pulls.json"
+          route candidate main "$(cat "$FIX/candidate")"
+          expect_output action skip
+          [[ "$(out_get reason)" == *"mega-maxwell[bot]"* ]]
+
+      - name: Old version skips and fresh or stale settlement routes
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          echo '[]' > "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/old")"
+          expect_output action skip
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")"
+          expect_output action publish
+          expect_output commit "$(cat "$FIX/merge")"
+          expect_output pr_number 42
+          jq '.[0].body = "<!-- release-settle: v1.2.0 0000000000000000000000000000000000000000 -->"' \
+            "$FIX/settle.json" > "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")"
+          expect_output action refresh
+          [[ "$(out_get targets | jq -r '.[0].commit')" == "$(cat "$FIX/merge")" ]]
+
+      - name: Dispatch excludes tagged branches and filters versions
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          route settle main "$(cat "$FIX/candidate")" workflow_dispatch
+          expect_output action refresh
+          [[ "$(out_get targets | jq length)" == 1 ]]
+          [[ "$(out_get targets | jq -r '.[0].release_branch')" == release-v1.2.0 ]]
+          DISPATCH_VERSION=v1.1.0 route settle main "$(cat "$FIX/candidate")" workflow_dispatch
+          expect_output action skip
+          expect_output targets '[]'
+
+      - name: Lagging index uses merged PR fallback and malformed API fails
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          echo '[]' > "$FIX/pulls.json"
+          cp "$FIX/fallback-good.json" "$FIX/fallback.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")"
+          expect_output action publish
+          expect_output pr_number 42
+          [[ -s "$FIX/fallback-calls" ]]
+          echo '{"message":"API failure"}' > "$FIX/pulls.json"
+          if route settle release-v1.2.0 "$(cat "$FIX/merge")" > "$FIX/malformed.log" 2>&1; then
+            echo "non-array API response succeeded"; exit 1
+          fi
+          [[ ! -s "$OUT" ]]
+          grep -qF "pulls API must return arrays" "$FIX/malformed.log"
+          echo '[]' > "$FIX/fallback.json"
+
+      # git's -v:refname sorts v1.3.0-rc1 above every v1.2.x: it must not be
+      # taken for the latest release, or every route would fail on it.
+      - name: A tag that is not vX.Y.Z is ignored, not fatal
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          git -C "$REPO" tag v1.3.0-rc1 "$(cat "$FIX/old")"
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.3.0-rc1
+          [[ "$(git -C "$REPO" tag -l 'v*' --sort=-v:refname | head -n1)" == v1.3.0-rc1 ]]
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")" > "$FIX/rc.log" 2>&1 \
+            || { echo "an rc tag failed the route"; cat "$FIX/rc.log"; exit 1; }
+          expect_output action publish
+          grep -qF "ignoring tag 'v1.3.0-rc1'" "$FIX/rc.log" || { cat "$FIX/rc.log"; exit 1; }
+          jq '.[0].body = "<!-- release-settle: v1.2.0 0000000000000000000000000000000000000000 -->"' \
+            "$FIX/settle.json" > "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/merge")"
+          expect_output action refresh
+          route settle main "$(cat "$FIX/candidate")" workflow_dispatch
+          expect_output action refresh
+          [[ "$(out_get targets | jq -r '.[0].release_branch')" == release-v1.2.0 ]]
+          echo "v1.3.0-rc1 is ignored: publish, refresh and dispatch all route"
+
+      # A hotfix line merged after a newer release would otherwise be tagged
+      # and made the latest Release.
+      - name: An older version merged after a newer release is not published
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          merge="$(cat "$FIX/merge")"
+          git -C "$REPO" tag v1.3.0 "$(cat "$FIX/old")"
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.3.0
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$merge"
+          expect_output action skip
+          expect_output reason "refusing to publish settle PR #42: v1.2.0 is not newer than the latest published tag v1.3.0 (rule: a version is published only when it is newer than every vX.Y.Z tag)"
+          : > "$OUT"
+          if ( cd "$REPO" && env GITHUB_REPOSITORY="$FAKE_REPOSITORY" MERGE_SHA="$merge" PR_NUMBER=42 \
+              CHANGELOG=CHANGELOG.md GITHUB_OUTPUT="$OUT" bash "$SH/publish-guard.sh" ) > "$FIX/older.log" 2>&1; then
+            echo "the publish guard accepted an older version"; cat "$FIX/older.log"; exit 1
+          fi
+          grep -qF "Refusing to publish an older version::settle PR #42: v1.2.0 is not newer than the latest published tag v1.3.0" "$FIX/older.log" \
+            || { cat "$FIX/older.log"; exit 1; }
+          [[ ! -s "$OUT" ]]
+          [[ -z "$(git ls-remote "$REPO.git" refs/tags/v1.2.0)" ]]
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin :refs/tags/v1.3.0
+          git -C "$REPO" tag -d v1.3.0 > /dev/null
+          echo "route and publish guard both refuse v1.2.0 after v1.3.0"
+
+      - name: An unreadable version file fails the route instead of skipping
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          echo '[]' > "$FIX/pulls.json"
+          for case in "MISSING plain does not exist" "VERSION toml does not parse"; do
+            read -r file pattern message <<< "$case"
+            for event in push workflow_dispatch; do
+              if FILE="$file" PATTERN="$pattern" route settle release-v1.2.0 "$(cat "$FIX/merge")" "$event" \
+                  > "$FIX/unreadable.log" 2>&1; then
+                echo "$event with $file/$pattern routed: $(out_get action) $(out_get reason)"; exit 1
+              fi
+              grep -qF "cannot read the version file: $file" "$FIX/unreadable.log" || { cat "$FIX/unreadable.log"; exit 1; }
+              grep -qF "$message" "$FIX/unreadable.log" || { cat "$FIX/unreadable.log"; exit 1; }
+              grep -qF "'$pattern'" "$FIX/unreadable.log" || { cat "$FIX/unreadable.log"; exit 1; }
+              [[ ! -s "$OUT" ]]
+            done
+          done
+          echo "a missing or unparsable version file fails push and dispatch routes, naming file and pattern"
+
+      - name: Partial publication resumes and reports the actual tag commit
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          merge="$(cat "$FIX/merge")"
+          git -C "$REPO" tag -a v1.2.0 "$merge" -m seed
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.2.0
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$merge"
+          expect_output action publish
+          : > "$OUT"
+          ( cd "$REPO" && env GITHUB_REPOSITORY="$FAKE_REPOSITORY" MERGE_SHA="$merge" PR_NUMBER=42 \
+              CHANGELOG=CHANGELOG.md GITHUB_OUTPUT="$OUT" bash "$SH/publish-guard.sh" )
+          expect_output tag_exists true
+          expect_output merge_sha "$merge"
+          git -C "$REPO" tag v1.3.0 "$merge"
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.3.0
+          # A different push must name the peeled commit, not the tag object.
+          echo '[]' > "$FIX/pulls.json"
+          route settle release-v1.2.0 "$(cat "$FIX/old")" > "$FIX/tagged-skip.log"
+          expect_output action skip
+          [[ "$(out_get reason)" == *"merge commit $merge to finish publishing"* ]]
+          grep -qF "::warning::" "$FIX/tagged-skip.log"
+          # Lightweight tags use the unpeeled ref as the commit.
+          route settle release-v1.3.0 "$(cat "$FIX/old")"
+          expect_output action skip
+          tip="$(git -C "$REPO" rev-parse v1.3.0)"
+          [[ "$(out_get reason)" == *"merge commit $tip to finish publishing"* ]]
+          touch "$FIX/release-exists"
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$merge"
+          expect_output action skip
+          expect_output reason "v1.2.0 is already published"
+          [[ -s "$FIX/auth-calls" ]]
+          echo "all route decisions and publication resume assertions passed"
+
+      - name: Remove rehearsal repositories
+        if: always()
+        run: |
+          rm -rf "$REPO" "$REPO.git" "$SH" "$FIX" "$RUNNER_TEMP/route-bin"
+          rm -f "$OUT"
 
   # The generated parts of every action README (inputs, outputs, steps,
   # errors) and the catalogue come from action.yml; stale docs fail here.

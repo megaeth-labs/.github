@@ -2,14 +2,22 @@ name: Release Candidate
 
 # Trunk-first release start. Dispatch with a version: the shared action bumps
 # the version file on the default branch, drafts the changelog entry, and
-# opens a candidate PR. When that
-# PR merges, the `cut` job creates `release-vX.Y.Z` at the merge commit. No
-# tag is created here — see release-settle / release-publish.
+# opens a candidate PR. When that PR merges, the push to the default branch
+# starts this workflow again: `route` recognises the merged candidate PR and
+# `cut` creates `release-vX.Y.Z` at the merge commit. No tag is created here;
+# see release-settle.
 #
 # To release a commit that is not the tip of the default branch, dispatch with
 # `base_commit` as well: `propose` creates `release-vX.Y.Z` at that commit and
 # aims the candidate PR at it, so that PR never touches the default branch and
-# the `cut` job below does not run.
+# `route` never selects `cut` for it.
+#
+# Every write is made by the release GitHub App (mega-gutenberg). Its token is
+# minted only in jobs that run in the `release` environment: create that
+# environment with a deployment policy of the default branch and `release-v*`
+# branches, and no required reviewers. The decision to release is made by
+# merging the candidate PR, not by a click on the run. `route` is read-only
+# and uses the job token.
 #
 # Guide: https://github.com/megaeth-labs/.github/blob/main/.github/actions/RELEASE.md
 
@@ -25,8 +33,7 @@ on:
         required: false
         type: string
         default: ""
-  pull_request:
-    types: [closed]
+  push:
     branches: [$default-branch]
 
 permissions:
@@ -36,20 +43,26 @@ jobs:
   propose:
     if: github.event_name == 'workflow_dispatch'
     # One proposal at a time: two dispatches would race on the candidate
-    # branch. Job-level, not workflow-level: every PR closing on the default
-    # branch also starts this workflow, and a workflow-wide group would let
-    # that noise evict a queued release run (one pending run per group).
+    # branch. Job-level, not workflow-level: every push to the default branch
+    # also starts this workflow, and a workflow-wide group would let that
+    # noise evict a queued release run (one pending run per group).
     # A skipped job holds no slot in a job-level group.
     concurrency:
       group: ${{ github.workflow }}-propose
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        id: app-token
+        id: release-token
         with:
-          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
-          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: megaeth-labs
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -59,7 +72,7 @@ jobs:
       - uses: megaeth-labs/.github/.github/actions/release-candidate@main
         with:
           stage: propose
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.release-token.outputs.token }}
           version: ${{ inputs.version }}
           base_commit: ${{ inputs.base_commit }}
           version_file: VERSION
@@ -67,29 +80,58 @@ jobs:
           changelog_file: CHANGELOG.md
           # Anything else that must move with the version, e.g. a lockfile:
           #   bump_command: cargo update --workspace
-          # (install the toolchain it needs in this job, before this step)
+          #   dependency_token: ${{ github.token }}
+          # (install the toolchain it needs in this job, before this step;
+          # dependency_token is what the bump command uses to read other
+          # repositories, and the job token reads this one)
 
-  # Only candidate PRs that targeted the default branch reach this job (the
-  # `branches:` filter above): one proposed with `base_commit` merges into the
-  # release branch propose already cut.
+  # Read-only: decides from the pushed commit whether it is a merged candidate
+  # PR that targeted the default branch. One proposed with `base_commit` merges
+  # into the release branch propose already cut, and routes to nothing here.
+  route:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.route.outputs.action }}
+      commit: ${{ steps.route.outputs.commit }}
+      pr_number: ${{ steps.route.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: route
+        uses: megaeth-labs/.github/.github/actions/release-route@main
+        with:
+          kind: candidate
+          version_file: VERSION
+          version_pattern: plain
+
   cut:
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.merged == true &&
-      startsWith(github.event.pull_request.head.ref, 'chore/release-candidate-') &&
-      github.event.pull_request.user.login == 'mega-maxwell[bot]'
-    # One cut at a time, never cancelled: pull_request.closed does not refire.
+    needs: route
+    if: needs.route.outputs.action == 'cut'
+    # One cut at a time, never cancelled: a push does not refire.
     # Job-level for the reason given on `propose`.
     concurrency:
       group: ${{ github.workflow }}-cut
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        id: app-token
+        id: release-token
         with:
-          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
-          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: megaeth-labs
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: read
+          permission-workflows: write
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -99,6 +141,8 @@ jobs:
       - uses: megaeth-labs/.github/.github/actions/release-candidate@main
         with:
           stage: cut
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.release-token.outputs.token }}
+          commit: ${{ needs.route.outputs.commit }}
+          pr_number: ${{ needs.route.outputs.pr_number }}
           version_file: VERSION
           version_pattern: plain

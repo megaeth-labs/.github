@@ -1,6 +1,6 @@
 {
   "name": "Release Candidate",
-  "description": "Start a release: bump the version on the default branch via PR, then cut release-vX.Y.Z on merge.",
+  "description": "Start a release: bump the version on the default branch via PR, then cut release-vX.Y.Z when it merges. All writes use the release app (mega-gutenberg).",
   "iconName": "octicon tag",
   "categories": [
     "Automation"

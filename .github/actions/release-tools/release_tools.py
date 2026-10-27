@@ -5,8 +5,13 @@ Everything git- or GitHub-facing stays in the actions' bash steps; this module
 only transforms text so it can be unit-tested without a repository. stdlib only.
 
 Subcommands (see `main`):
+  route                                     -> stdin: routing JSON object; stdout: decision JSON object
   normalize   VERSION                       -> X.Y.Z on stdout, exit 1 if invalid
   is-greater  VERSION LATEST_TAG_OR_EMPTY   -> exit 0 if VERSION > LATEST, else 1
+  latest-tag  [--exclude VERSION]           -> stdin: tag names; stdout: the highest vX.Y.Z tag or "";
+                                               other tags (v1.2.0-rc1) are named on stderr and ignored
+  check-order VERSION LATEST_TAG_OR_EMPTY   -> exit 0 if VERSION may be published after LATEST, else
+                                               print the refusal on stdout and exit 1
   read-file   PATH PATTERN                  -> version found in the file
   bump-file   PATH PATTERN VERSION          -> rewrite in place, print old version
   notes       REPO VERSION DATE             -> stdin: "<sha>\t<subject>" lines; stdout: markdown
@@ -26,6 +31,10 @@ import sys
 from pathlib import Path
 
 SEMVER = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+# A tag this flow publishes: exactly vX.Y.Z. Anything else under v* (v1.2.0-rc1,
+# vnext) is not a release and never counts as the latest one.
+RELEASE_TAG = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+ORDER_RULE = "rule: a version is published only when it is newer than every vX.Y.Z tag"
 
 # Conventional Commits types, in the order they appear in the notes. Anything
 # not listed (or without a type) lands under "Other".
@@ -73,6 +82,191 @@ def is_greater(version: str, latest: str) -> bool:
     if not latest.strip():
         return True
     return version_tuple(version) > version_tuple(latest)
+
+
+def latest_release_tag(tags: list[str], exclude: str = "") -> tuple[str, list[str]]:
+    """(highest vX.Y.Z tag or "", tags ignored because they are not vX.Y.Z).
+
+    `exclude` (X.Y.Z or vX.Y.Z) leaves that version's own tag out, so a run
+    resuming its own half-finished publication compares against the others."""
+    skip = normalize_version(exclude) if exclude.strip() else ""
+    best, ignored = "", []
+    for raw in tags:
+        tag = raw.strip()
+        if not tag:
+            continue
+        if not RELEASE_TAG.match(tag):
+            ignored.append(tag)
+        elif normalize_version(tag) != skip and (not best or version_tuple(tag) > version_tuple(best)):
+            best = tag
+    return best, ignored
+
+
+def order_refusal(version: str, latest: str) -> str | None:
+    """Why `version` may not be published after `latest`, or None when it may.
+
+    One rule for release-route and release-publish: only a version newer than
+    the latest vX.Y.Z tag is published, so an older line merged late can never
+    become the newest Release."""
+    latest = latest.strip()
+    if not latest:
+        return None
+    if not RELEASE_TAG.match(latest):
+        return f"latest tag {latest!r} is not vX.Y.Z, so v{version} cannot be ordered against it ({ORDER_RULE})"
+    if not is_greater(version, latest):
+        return f"v{version} is not newer than the latest published tag {latest} ({ORDER_RULE})"
+    return None
+
+
+# --- release routing --------------------------------------------------------
+
+
+def _field(data: dict, key: str, default):
+    """Return data[key], treating absent and JSON null alike; reject other types."""
+    value = data.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, type(default)):
+        raise ValueError(f"route field {key!r} must be {type(default).__name__}, got {value!r}")
+    return value
+
+
+def _items(data: dict, key: str) -> list[dict]:
+    items = _field(data, key, [])
+    if not all(isinstance(item, dict) for item in items):
+        raise ValueError(f"route field {key!r} must be a list of objects")
+    return items
+
+
+def _branch_version(branch: str, prefix: str) -> str | None:
+    """X.Y.Z for a release branch, None when the suffix is not a version."""
+    try:
+        return normalize_version(branch[len(prefix):])
+    except ValueError:
+        return None
+
+
+def route(data: dict) -> dict:
+    """Decide the next release action from an already collected snapshot."""
+    if not isinstance(data, dict):
+        raise ValueError("route input must be a JSON object")
+    kind, event, ref = (_field(data, key, "") for key in ("kind", "event", "ref_name"))
+    prefix = _field(data, "prefix", "release-v")
+    sha = _field(data, "sha", "")
+    result = {
+        "action": "skip",
+        "reason": f"no route for kind={kind}, event={event}, ref={ref}",
+        "version": "",
+        "release_branch": "",
+        "commit": "",
+        "pr_number": None,
+        "targets": [],
+    }
+    if event == "push" and (
+        (kind == "candidate" and ref == data.get("default_branch"))
+        or (kind == "settle" and ref.startswith(prefix))
+    ):
+        candidate = kind == "candidate"
+        head_prefix = "chore/release-candidate-"
+        if not candidate:
+            version = _branch_version(ref, prefix)
+            if version is None:
+                result["reason"] = (
+                    f"{ref} is not a release branch: {ref[len(prefix):]!r} after {prefix!r} is not X.Y.Z"
+                )
+                return result
+            result.update(version=version, release_branch=ref, commit=sha)
+            if data.get("tag_exists") and data.get("release_exists"):
+                result["reason"] = f"v{version} is already published"
+                return result
+        pr = next((
+            pr for pr in _items(data, "pulls")
+            if pr.get("merged_at") and pr.get("merge_commit_sha") == sha
+            and (pr.get("base") or {}).get("ref") == ref
+            and (
+                str((pr.get("head") or {}).get("ref") or "").startswith(head_prefix)
+                if candidate else (pr.get("head") or {}).get("ref") == f"chore/release-settle-v{version}"
+            )
+        ), None)
+        fresh = False
+        marker = None
+        if pr and not candidate:
+            match = re.search(
+                rf"<!-- release-settle: v{re.escape(version)} ([0-9a-fA-F]{{40}}) -->",
+                pr.get("body") or "",
+            )
+            marker = match.group(1) if match else None
+            fresh = marker is not None and marker == data.get("first_parent")
+        author = (pr.get("user") or {}).get("login") if pr else None
+        expected_author = _field(data, "pr_author", "mega-gutenberg[bot]")
+        if not candidate and data.get("tag_exists") and not (
+            fresh and author == expected_author
+        ):
+            result["reason"] = (
+                f"v{version} is tagged but has no Release: re-run the release-settle run "
+                "for the settle PR's merge commit"
+                f"{' ' + data['tag_commit'] if data.get('tag_commit') else ''} to finish publishing"
+            )
+            return result
+        if pr:
+            if author != expected_author:
+                result["reason"] = f"PR #{pr['number']} author {author} does not match {expected_author}"
+                return result
+            result["pr_number"] = pr["number"]
+            if candidate:
+                version = normalize_version(pr["head"]["ref"][len(head_prefix):])
+                result.update(
+                    action="cut", reason=f"merged candidate PR #{pr['number']}",
+                    version=version, release_branch=f"{prefix}{version}", commit=sha,
+                )
+                return result
+            if fresh:
+                refusal = order_refusal(version, _field(data, "latest_tag", ""))
+                if refusal:
+                    result["reason"] = f"refusing to publish settle PR #{pr['number']}: {refusal}"
+                    return result
+                result.update(action="publish", reason=f"merged fresh settle PR #{pr['number']}")
+                return result
+            settled = f"settled {marker}" if marker else "no release-settle marker"
+            result["reason"] = (
+                f"merged settle PR #{pr['number']} was stale ({settled}, "
+                f"tip was {data.get('first_parent') or 'unknown'}); a fresh settle PR follows"
+            )
+        elif candidate:
+            result["reason"] = "no merged candidate PR matches this push"
+            return result
+        elif data.get("version_at_sha") != version:
+            result["reason"] = "the candidate has not landed on this branch yet"
+            return result
+        elif refusal := order_refusal(version, _field(data, "latest_tag", "")):
+            result["reason"] = f"not refreshing a settle PR: {refusal}"
+            return result
+        else:
+            result["reason"] = f"refresh settle PR for v{version}"
+        result.update(action="refresh", targets=[
+            {"version": version, "release_branch": ref, "commit": sha},
+        ])
+    elif kind == "settle" and event == "workflow_dispatch":
+        selected = _field(data, "dispatch_version", "")
+        selected = normalize_version(selected) if selected else ""
+        for branch in _items(data, "branches"):
+            name = branch.get("name")
+            if not isinstance(name, str) or not name.startswith(prefix) or branch.get("tag_exists"):
+                continue
+            version = _branch_version(name, prefix)
+            if version is None:
+                continue
+            if (branch.get("version_at_tip") == version
+                    and order_refusal(version, _field(data, "latest_tag", "")) is None
+                    and (not selected or version == selected)):
+                result["targets"].append({
+                    "version": version, "release_branch": name, "commit": branch.get("tip") or "",
+                })
+        result.update(
+            action="refresh" if result["targets"] else "skip",
+            reason="refresh eligible release branches" if result["targets"] else "no eligible release branches",
+        )
+    return result
 
 
 # --- version files ----------------------------------------------------------
@@ -224,10 +418,19 @@ def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="release_tools")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("route")
+
     s = sub.add_parser("normalize")
     s.add_argument("version")
 
     s = sub.add_parser("is-greater")
+    s.add_argument("version")
+    s.add_argument("latest")
+
+    s = sub.add_parser("latest-tag")
+    s.add_argument("--exclude", default="")
+
+    s = sub.add_parser("check-order")
     s.add_argument("version")
     s.add_argument("latest")
 
@@ -261,10 +464,22 @@ def main(argv: list[str]) -> int:
 
     a = p.parse_args(argv)
     try:
-        if a.cmd == "normalize":
+        if a.cmd == "route":
+            print(json.dumps(route(json.load(sys.stdin))))
+        elif a.cmd == "normalize":
             print(normalize_version(a.version))
         elif a.cmd == "is-greater":
             return 0 if is_greater(a.version, a.latest) else 1
+        elif a.cmd == "latest-tag":
+            latest, ignored = latest_release_tag(sys.stdin.read().splitlines(), a.exclude)
+            for tag in ignored:
+                print(f"release_tools: ignoring tag {tag!r}: not vX.Y.Z, so never the latest release", file=sys.stderr)
+            print(latest)
+        elif a.cmd == "check-order":
+            refusal = order_refusal(normalize_version(a.version), a.latest)
+            if refusal:
+                print(refusal)
+                return 1
         elif a.cmd == "read-file":
             print(read_version_file(Path(a.path).read_text(), a.pattern))
         elif a.cmd == "bump-file":
@@ -299,7 +514,7 @@ def main(argv: list[str]) -> int:
                 print(f"no section for v{normalize_version(a.version)} in {a.path}", file=sys.stderr)
                 return 1
             print(body, end="")
-    except (ValueError, OSError) as e:
+    except (ValueError, OSError, TypeError, KeyError, AttributeError) as e:
         print(f"release_tools: {e}", file=sys.stderr)
         return 1
     return 0
