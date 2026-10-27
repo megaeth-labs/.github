@@ -56,7 +56,10 @@ Family: [Release pipeline](../RELEASE.md).
 - `$COMMIT is not the tip of $branch (tip is $tip). Settle the tip, or move the branch first.`
 - `$FILE at $COMMIT says $actual, expected $version`
 - `$version is not newer than the latest tag ${latest:-<none>}`
+- `settle PR not ensured; stopped while $stage`
 - `could not merge $COMMIT into $head; close the settle PR so the next run recreates it`
+- `$head was taken by a concurrent run but no open settle PR is visible yet; re-run this workflow`
+- `settle PR not ensured after $attempt attempts of racing a concurrent run; re-run this workflow`
 <!-- /generated -->
 
 ## Example
@@ -93,7 +96,15 @@ instead.
   additionally checks the dispatcher. The dated entry is committed straight
   onto the release branch (the app must bypass its ruleset) and
   `release-publish` runs in the same job with `commit` and `version` set.
-- `pr`: pushes `chore/release-settle-vX.Y.Z` and opens the settle PR. A
-  re-run closes the previous settle PR, deletes its branch and pushes a fresh
-  one; nothing is force-pushed.
+- `pr`: pushes `chore/release-settle-vX.Y.Z` and opens the settle PR,
+  titled `chore(release): settle vX.Y.Z — merging publishes the release`.
+  Its body opens with an `[!IMPORTANT]` alert saying that merging it settles
+  the release, followed by the `<!-- release-settle: vX.Y.Z <sha> -->`
+  marker that `release-route` and `release-publish` read. A new tip on the
+  release branch merges into the same PR and moves the marker; a re-run
+  with nothing new changes nothing. Only a PR that is closed, merged or not
+  authored by `pr_author` is replaced by a fresh branch. Nothing is
+  force-pushed, and the branch is pushed only after the merge and the
+  changelog commit both succeed. A run that loses a race with a concurrent
+  run refreshes the PR that run opened.
 - The full flow, installation and recovery: [RELEASE.md](../RELEASE.md).

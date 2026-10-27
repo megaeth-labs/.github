@@ -198,23 +198,12 @@ runs:
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         head="chore/release-settle-v$VERSION"
+        # Conventional (repos lint PR titles) and still says what merging does.
+        title="chore(release): settle v$VERSION — merging publishes the release"
         prs="$RUNNER_TEMP/settle-prs.json"
-        gh pr list --head "$head" --base "$BRANCH" --state open --json number,author,body,url > "$prs"
-        python3 - "$prs" "$VERSION" > "$RUNNER_TEMP/settle-prs.tsv" <<'PY'
-        import json, re, sys
-
-        for pr in json.load(open(sys.argv[1])):
-            marker = re.search(r"<!-- release-settle: v" + re.escape(sys.argv[2]) + r" ([0-9a-f]{40}) -->", pr["body"])
-            print(pr["number"], pr["author"]["login"], pr["url"], marker[1] if marker else "-", sep="\t")
-        PY
-        pr=""; pr_url=""; old_marker=""
-        while IFS=$'\t' read -r number author url marker; do
-          if [[ "$author" != "$PR_AUTHOR" ]]; then
-            gh pr close "$number" --comment "Superseded: the settle PR is now maintained by mega-gutenberg." >/dev/null
-          else
-            pr="$number"; pr_url="$url"; old_marker="$marker"
-          fi
-        done < "$RUNNER_TEMP/settle-prs.tsv"
+        err="$RUNNER_TEMP/settle-gh-stderr.txt"
+        stage="starting"
+        trap 'echo "::error::settle PR not ensured; stopped while $stage"' ERR
 
         label_args=()
         IFS=',' read -ra labels <<<"$PR_LABELS"
@@ -222,46 +211,103 @@ runs:
           l="${l// /}"
           [[ -n "$l" ]] && label_args+=(--label "$l")
         done
+        # Regenerated on every run, so the alert and the marker always name the
+        # commit this run settles. release-route and release-publish parse the
+        # marker line; keep its shape and keep it outside the alert.
         body="$RUNNER_TEMP/settle-pr-body.md"
         {
-          echo "Settle **v$VERSION** at \`$COMMIT\` (tip of \`$BRANCH\`)."
+          echo "> [!IMPORTANT]"
+          echo "> **Merging this PR settles \`v$VERSION\` — this is the release settlement.** The merge commit becomes the release: it is tagged \`v$VERSION\`, the GitHub Release is published from it, and the assets are built from it. Closing this PR settles nothing. A new commit on \`$BRANCH\` refreshes this PR and moves the settlement to that tip."
           echo
-          echo "Merging this PR is the settlement decision: \`release-publish\` will tag the merge commit as \`v$VERSION\` and publish the GitHub Release with the notes below. The default branch picks this entry up in the next release candidate PR. New commits on the release branch refresh this PR automatically; merging it is the settlement decision"
+          echo "Settles **v$VERSION** at \`$COMMIT\`, the tip of \`$BRANCH\`. The default branch picks this entry up in the next release candidate PR."
           echo
           echo "<!-- release-settle: v$VERSION $COMMIT -->"
           echo
           cat "$NOTES"
         } > "$body"
-        if [[ -n "$pr" ]]; then
-          git fetch --quiet origin "+refs/heads/$head:refs/remotes/origin/$head"
-          git checkout --quiet -B "$head" "origin/$head"
-          changed=false
-          if ! git merge-base --is-ancestor "$COMMIT" HEAD; then
-            if ! git merge --no-ff --no-edit "$COMMIT"; then
-              git merge --abort
-              echo "::error::could not merge $COMMIT into $head; close the settle PR so the next run recreates it"; exit 1
+
+        # Each pass re-reads the open PR. A pass that loses a race to a
+        # concurrent run (push rejected, or "already exists" from gh pr create)
+        # goes round again and takes the refresh path on the winner's PR.
+        ensured=false
+        for attempt in 1 2 3; do
+          stage="reading the open settle PR (attempt $attempt)"
+          gh pr list --head "$head" --base "$BRANCH" --state open --json number,author,body,title,url > "$prs"
+          python3 - "$prs" "$VERSION" "$title" > "$RUNNER_TEMP/settle-prs.tsv" <<'PY'
+        import json, re, sys
+
+        for pr in json.load(open(sys.argv[1])):
+            marker = re.search(r"<!-- release-settle: v" + re.escape(sys.argv[2]) + r" ([0-9a-f]{40}) -->", pr["body"])
+            title_ok = "yes" if pr.get("title") == sys.argv[3] else "no"
+            print(pr["number"], pr["author"]["login"], pr["url"], marker[1] if marker else "-", title_ok, sep="\t")
+        PY
+          pr=""; old_marker=""; old_title_ok=""
+          while IFS=$'\t' read -r number author url marker title_ok; do
+            if [[ "$author" != "$PR_AUTHOR" ]]; then
+              gh pr close "$number" --comment "Superseded: the settle PR is now maintained by mega-gutenberg." >/dev/null \
+                || echo "::warning::could not close #$number (closed by a concurrent run?)"
+            else
+              pr="$number"; pr_url="$url"; old_marker="$marker"; old_title_ok="$title_ok"
             fi
-            changed=true
+          done < "$RUNNER_TEMP/settle-prs.tsv"
+
+          if [[ -n "$pr" ]]; then
+            stage="checking out $head"
+            git fetch --quiet origin "+refs/heads/$head:refs/remotes/origin/$head"
+            # --force: a pass starts from the remote, not from whatever an
+            # earlier failed pass left in the work tree.
+            git checkout --quiet --force -B "$head" "origin/$head"
+            changed=false
+            if ! git merge-base --is-ancestor "$COMMIT" HEAD; then
+              stage="merging $COMMIT into $head (local only; nothing pushed)"
+              if ! git merge --no-ff --no-edit "$COMMIT"; then
+                git merge --abort
+                echo "::error::could not merge $COMMIT into $head; close the settle PR so the next run recreates it"; exit 1
+              fi
+              changed=true
+            fi
+            stage="committing the changelog on $head (local only; nothing pushed, a re-run starts over from the remote)"
+            what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
+            if ! git diff --quiet -- "$CHANGELOG"; then
+              git add "$CHANGELOG"
+              git commit --quiet -m "chore(release): refresh settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
+              changed=true
+            fi
+            if [[ "$changed" == false && "$old_marker" == "$COMMIT" && "$old_title_ok" == yes ]]; then
+              echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+              echo "::notice::settle PR is up to date: $pr_url"
+              exit 0
+            fi
+            if [[ "$changed" == true ]]; then
+              # Only now, with the merge and the changelog both committed.
+              stage="pushing $head"
+              if ! git push --quiet origin "$head"; then
+                echo "::warning::push of $head was rejected (moved by a concurrent run?); re-reading the PR"
+                continue
+              fi
+              echo "pushed $head at $(git rev-parse HEAD): $COMMIT merged and changelog committed"
+            fi
+            stage="updating #$pr (branch already pushed; a re-run only needs to repeat this)"
+            gh pr edit "$pr" --title "$title" --body-file "$body" >/dev/null
+            echo "refreshed #$pr: marker now settles $COMMIT"
+            ensured=true; break
           fi
-          what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
-          if ! git diff --quiet -- "$CHANGELOG"; then
-            git add "$CHANGELOG"
-            git commit --quiet -m "chore(release): refresh settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
-            changed=true
+
+          if (( attempt > 1 )); then
+            # A concurrent run pushed the settle branch but its PR is not
+            # visible yet; deleting the branch now would close that PR.
+            echo "::error::$head was taken by a concurrent run but no open settle PR is visible yet; re-run this workflow"; exit 1
           fi
-          if [[ "$changed" == false && "$old_marker" == "$COMMIT" ]]; then
-            echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
-            echo "::notice::settle PR is up to date: $pr_url"
-            exit 0
-          fi
-          git push --quiet origin "$head"
-          gh pr edit "$pr" --body-file "$body"
-        else
           # A closed, merged, or superseded PR leaves no maintained history.
           if git ls-remote --exit-code --heads origin "refs/heads/$head" >/dev/null; then
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$head" >/dev/null
+            stage="deleting the stale $head"
+            if ! gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$head" >/dev/null 2>"$err"; then
+              if ! grep -qE 'HTTP 4(04|22)' "$err"; then cat "$err" >&2; false; fi
+              echo "stale $head was already deleted"
+            fi
           fi
-          git checkout --quiet -B "$head" "$COMMIT"
+          stage="committing the settlement on a fresh $head (local only; nothing pushed)"
+          git checkout --quiet --force -B "$head" "$COMMIT"
           what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
           if git diff --quiet -- "$CHANGELOG"; then
             git commit --quiet --allow-empty -m "chore(release): settle v$VERSION" \
@@ -270,8 +316,22 @@ runs:
             git add "$CHANGELOG"
             git commit --quiet -m "chore(release): settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
           fi
-          git push --quiet origin "$head"
-          pr_url="$(gh pr create --base "$BRANCH" --head "$head" --title "chore(release): settle v$VERSION" --body-file "$body" "${label_args[@]}")"
+          stage="pushing a fresh $head"
+          if ! git push --quiet origin "$head"; then
+            echo "::warning::push of a fresh $head was rejected (created by a concurrent run?); re-reading the PR"
+            continue
+          fi
+          echo "pushed a fresh $head at $(git rev-parse HEAD)"
+          stage="opening the settle PR ($head already pushed; a re-run picks it up)"
+          if ! pr_url="$(gh pr create --base "$BRANCH" --head "$head" --title "$title" --body-file "$body" "${label_args[@]}" 2>"$err")"; then
+            if ! grep -qi 'already exists' "$err"; then cat "$err" >&2; false; fi
+            echo "::notice::a concurrent run opened the settle PR first; refreshing that one"
+            continue
+          fi
+          ensured=true; break
+        done
+        if [[ "$ensured" != true ]]; then
+          echo "::error::settle PR not ensured after $attempt attempts of racing a concurrent run; re-run this workflow"; exit 1
         fi
         echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
         echo "settle PR: $pr_url"

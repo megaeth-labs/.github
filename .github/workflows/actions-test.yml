@@ -652,6 +652,8 @@ jobs:
                   sys.exit("simulated gh pr edit failure")
               pr = state["pulls"][int(args[2]) - 1]
               assert pr["state"] == "open"
+              if "--title" in args:
+                  pr["title"] = option("--title")
               pr["body"] = pathlib.Path(option("--body-file")).read_text()
               save("edit")
               print(pr["url"])
@@ -690,6 +692,12 @@ jobs:
           tip="$(remote_head "$BRANCH")"
           settle "$tip"
           assert_pr 1 "$tip"
+          # The refresh keeps the same PR: no second one is opened.
+          python3 - "$PR_STATE" <<'PY'
+          import json, sys
+          pulls = json.load(open(sys.argv[1]))["pulls"]
+          assert [pr["number"] for pr in pulls] == [1], pulls
+          PY
           new="$(remote_head "$HEAD_BRANCH")"
           git -C "$REPO" merge-base --is-ancestor "$old" "$new"
           git -C "$REPO" merge-base --is-ancestor "$tip" "$new"
