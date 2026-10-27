@@ -4,13 +4,18 @@ description: >-
   default branch, drafts this release's changelog entry (dated at settle) from the
   commits since the previous tag, syncs the previous release's entry from its
   tag, and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`,
-  run when that PR merges, creates `release-vX.Y.Z` at the merge commit. No tag
+  run on the push that merged that PR (the consumer passes the `commit` and
+  `pr_number` outputs of `release-route`), re-reads the PR through the API,
+  refuses anything but a merged, gutenberg-authored candidate into the default
+  branch, and creates `release-vX.Y.Z` at the merge commit. No tag
   is created at either stage — tags come from release-publish, once, at
   settlement. `base_commit` releases a commit that is not the tip of the
-  default branch: `propose` cuts the release branch there itself and points the
-  candidate PR at it, leaving `cut` nothing to do. Run as a step in a job the
-  consumer owns; the consumer checks the repository out first
-  (`fetch-depth: 0`, `persist-credentials: false`).
+  default branch: `propose` cuts the release branch there itself, carries the
+  default branch's release workflows onto it, and points the candidate PR at
+  it; that PR merges into the release branch, so `cut` never runs for it. Run
+  as a step in a job the consumer owns, in `environment: release`; the
+  consumer checks the repository out first (`fetch-depth: 0`,
+  `persist-credentials: false`).
   Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
@@ -19,14 +24,39 @@ inputs:
     required: true
   token:
     description: >-
-      Token that authors the PR and creates the branch. Must be a GitHub App
-      installation token (e.g. the Maxwell app) so the PR triggers CI; the
-      job's GITHUB_TOKEN does not.
+      mega-gutenberg installation token (contents, pull-requests, workflows
+      write) minted in an `environment: release` job; it pushes the candidate
+      branch, opens the PR (so CI runs) and creates the release branch.
     required: true
   dependency_token:
-    description: Optional read-only token for bump_command's private dependencies; defaults to token.
+    description: >-
+      Read-only token for bump_command's private dependencies. Required when
+      bump_command is set; it never falls back to token, so the command does
+      not run with the release token.
     required: false
     default: ""
+  commit:
+    description: >-
+      The merge commit of the candidate PR (the `commit` output of
+      `release-route`). Required for `cut`; the release branch is created at it.
+    required: false
+    default: ""
+  pr_number:
+    description: >-
+      The candidate PR number (the `pr_number` output of `release-route`).
+      Required for `cut`; the PR is re-read through the API, not trusted from
+      the event.
+    required: false
+    default: ""
+  release_workflows:
+    description: >-
+      Newline- or space-separated workflow paths `propose` with `base_commit` copies from
+      the default branch onto the old tree (a path absent on the default branch
+      is skipped), and it deletes `.github/workflows/release-publish.yml`.
+      Workflows run from the pushed ref's tree, so a branch cut at an older
+      commit would otherwise run pre-migration release workflows.
+    required: false
+    default: ".github/workflows/release-settle.yml .github/workflows/on-release.yml"
   version:
     description: "Version to release, X.Y.Z or vX.Y.Z. Required for `propose`."
     required: false
@@ -87,15 +117,15 @@ inputs:
       `chore/release-candidate-*` branch from driving the cut. Empty disables
       the check.
     required: false
-    default: "mega-maxwell[bot]"
+    default: "mega-gutenberg[bot]"
   git_user_name:
     description: "Committer identity for the bump commit."
     required: false
-    default: "mega-maxwell[bot]"
+    default: "mega-gutenberg[bot]"
   git_user_email:
     description: "Committer email for the commits this action makes."
     required: false
-    default: "290560214+mega-maxwell[bot]@users.noreply.github.com"
+    default: "348780249+mega-gutenberg[bot]@users.noreply.github.com"
 
 outputs:
   version:
@@ -120,13 +150,20 @@ runs:
       env:
         STAGE: ${{ inputs.stage }}
         INPUT_VERSION: ${{ inputs.version }}
-        HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        GH_TOKEN: ${{ inputs.token }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         set -euo pipefail
         case "$STAGE" in
           propose) raw="$INPUT_VERSION" ;;
-          cut)     raw="${HEAD_REF#chore/release-candidate-}" ;;
+          cut)
+            if [[ -z "$PR_NUMBER" ]]; then
+              echo "::error::cut needs the pr_number input (the release-route output)"; exit 1
+            fi
+            head_ref="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["ref"])')"
+            raw="${head_ref#chore/release-candidate-}"
+            ;;
           *) echo "::error::stage must be propose or cut, got '$STAGE'"; exit 1 ;;
         esac
         version="$(python3 "$TOOLS" normalize "$raw")"
@@ -269,6 +306,42 @@ runs:
         echo "candidate PR will target $BRANCH at $checkout"
         GITHUB_AUTH_COMMAND
 
+    # Workflows run from the pushed ref's tree, so a release branch cut at an
+    # older base commit would run pre-migration release workflows, and the tag
+    # cut from it would carry a pre-migration on-release.yml. The candidate
+    # commit carries the default branch's copies, so merging it into the
+    # release branch migrates the branch.
+
+    - name: Carry the release workflows (propose)
+      if: inputs.stage == 'propose' && inputs.base_commit != ''
+      shell: bash
+      env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ inputs.token }}
+        RELEASE_WORKFLOWS: ${{ inputs.release_workflows }}
+      run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
+        set -euo pipefail
+        default="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)"
+        git fetch --quiet origin "+refs/heads/$default:refs/remotes/origin/$default"
+        set -f
+        for path in $RELEASE_WORKFLOWS; do
+          if git cat-file -e "origin/$default:$path" 2>/dev/null; then
+            git checkout --quiet "origin/$default" -- "$path"
+            echo "carried $path from $default"
+          else
+            echo "skipped $path: not on $default"
+          fi
+        done
+        set +f
+        if [[ -e .github/workflows/release-publish.yml ]]; then
+          git rm --quiet -f .github/workflows/release-publish.yml
+          echo "deleted .github/workflows/release-publish.yml"
+        fi
+        git status --short
+        GITHUB_AUTH_COMMAND
+
     - name: Bump version file
       if: inputs.stage == 'propose'
       id: bump
@@ -298,7 +371,8 @@ runs:
       shell: bash
       env:
         AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
-        GITHUB_AUTH_TOKEN: ${{ inputs.dependency_token || inputs.token }}
+        GITHUB_AUTH_TOKEN: ${{ inputs.dependency_token }}
+        DEPENDENCY_TOKEN: ${{ inputs.dependency_token }}
         OLD_VERSION: ${{ steps.bump.outputs.old }}
         NEW_VERSION: ${{ steps.version.outputs.version }}
         BUMP_COMMAND: ${{ inputs.bump_command }}
@@ -306,6 +380,10 @@ runs:
         PATTERN: ${{ inputs.version_pattern }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
+        if [[ -z "$DEPENDENCY_TOKEN" ]]; then
+          echo "::error::bump_command needs a separate dependency_token, so the command never runs with the release token"
+          exit 1
+        fi
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
         echo "bump command: $BUMP_COMMAND"
@@ -419,40 +497,51 @@ runs:
         PREFIX: ${{ inputs.release_branch_prefix }}
         FILE: ${{ inputs.version_file }}
         PATTERN: ${{ inputs.version_pattern }}
-        MERGED: ${{ github.event.pull_request.merged }}
-        MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        COMMIT: ${{ inputs.commit }}
+        PR_NUMBER: ${{ inputs.pr_number }}
         EXPECTED_AUTHOR: ${{ inputs.pr_author }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
-        if [[ "$MERGED" != "true" || -z "$MERGE_SHA" ]]; then
-          echo "::error::cut runs on a merged candidate PR (pull_request closed, merged == true)"; exit 1
+        if [[ -z "$COMMIT" || -z "$PR_NUMBER" ]]; then
+          echo "::error::cut needs the commit and pr_number inputs (the release-route outputs)"; exit 1
         fi
-        if [[ -n "$EXPECTED_AUTHOR" && "$PR_AUTHOR" != "$EXPECTED_AUTHOR" ]]; then
-          echo "::error::candidate PR #$PR_NUMBER was opened by '$PR_AUTHOR', not by '$EXPECTED_AUTHOR' (the identity propose runs under); refusing to cut a release branch from it"; exit 1
+        # The PR is re-read through the API: the push event says which commit
+        # landed, not whether it was a merged candidate.
+        pr_json="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+        pr_field() { python3 -c 'import functools,json,sys; v=functools.reduce(lambda d,k: d.get(k) if isinstance(d,dict) else None, sys.argv[1].split("."), json.load(sys.stdin)); print("" if v is None else v)' "$1" <<< "$pr_json"; }
+        merged_at="$(pr_field merged_at)"
+        merge_sha="$(pr_field merge_commit_sha)"
+        head_ref="$(pr_field head.ref)"
+        base_ref="$(pr_field base.ref)"
+        pr_author="$(pr_field user.login)"
+        if [[ -z "$merged_at" ]]; then
+          echo "::error::candidate PR #$PR_NUMBER has not been merged; cut only runs for a merged candidate"; exit 1
         fi
-        git fetch --quiet origin "$MERGE_SHA"
-        actual="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
+        if [[ "$merge_sha" != "$COMMIT" ]]; then
+          echo "::error::candidate PR #$PR_NUMBER merged as '$merge_sha', not the pushed commit '$COMMIT'; refusing to cut a release branch at it"; exit 1
+        fi
+        if [[ "$head_ref" != "chore/release-candidate-"* ]]; then
+          echo "::error::PR #$PR_NUMBER head '$head_ref' is not a chore/release-candidate-* branch"; exit 1
+        fi
+        default="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef -q .defaultBranchRef.name)"
+        if [[ "$base_ref" != "$default" ]]; then
+          echo "::error::candidate PR #$PR_NUMBER targets '$base_ref', not the default branch '$default'; a release branch is cut only from a candidate merged into the default branch"; exit 1
+        fi
+        if [[ -n "$EXPECTED_AUTHOR" && "$pr_author" != "$EXPECTED_AUTHOR" ]]; then
+          echo "::error::candidate PR #$PR_NUMBER was opened by '$pr_author', not by '$EXPECTED_AUTHOR' (the identity propose runs under); refusing to cut a release branch from it"; exit 1
+        fi
+        git fetch --quiet origin "$COMMIT"
+        actual="$(git show "$COMMIT:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
         if [[ "$actual" != "$VERSION" ]]; then
-          echo "::error::$FILE at $MERGE_SHA says $actual, expected $VERSION"; exit 1
+          echo "::error::$FILE at $COMMIT says $actual, expected $VERSION"; exit 1
         fi
         branch="${PREFIX}${VERSION}"
-        # A candidate that targeted the release branch was proposed with an
-        # explicit base commit: propose already cut the branch there, this
-        # merge landed the bump on it, and there is nothing left to create.
-        if [[ "$BASE_REF" == "$branch" ]]; then
-          echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "::notice title=Release branch already cut::$branch was created by propose at the requested base commit and this candidate merged into it"
-          exit 0
-        fi
         if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
           echo "::error::branch $branch already exists"; exit 1
         fi
-        gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$MERGE_SHA" >/dev/null
+        gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$COMMIT" >/dev/null
         echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
-        echo "created $branch at $MERGE_SHA"
+        echo "created $branch at $COMMIT"
         GITHUB_AUTH_COMMAND

@@ -507,7 +507,11 @@ jobs:
           want = {
               "Guard (propose)": "guard.sh",
               "Cut the release branch at the base commit (propose)": "cut-branch.sh",
+              "Carry the release workflows (propose)": "carry.sh",
+              "Run bump command": "bump.sh",
               "Draft changelog": "changelog.sh",
+              "Resolve version": "version.sh",
+              "Cut release branch": "cut.sh",
           }
           steps = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"]
           found = {s["name"]: s["run"] for s in steps if s.get("name") in want}
@@ -517,6 +521,9 @@ jobs:
           for name, script in found.items():
               pathlib.Path(sys.argv[2], want[name]).write_text(script)
               print(f"extracted {name!r} -> {want[name]}")
+          # The carry step's shipped default is part of what is under test.
+          default = yaml.safe_load(open(sys.argv[1]))["inputs"]["release_workflows"]["default"]
+          pathlib.Path(sys.argv[2], "release_workflows.default").write_text(default)
           PY
           cat > "$SH/helpers.sh" <<'SH'
           # Run the guard the way the action's step does.
@@ -561,6 +568,11 @@ jobs:
               echo "main"
               ;;
             api)
+              # A pull request read: the fixture the case wrote for that number.
+              if [[ "${2:-}" == repos/*/pulls/* ]]; then
+                cat "$RUNNER_TEMP/pr/${2##*/}.json"
+                exit 0
+              fi
               ref=""; sha=""
               while [[ $# -gt 0 ]]; do
                 if [[ "$1" == "-f" ]]; then
@@ -739,6 +751,287 @@ jobs:
           [[ "$(git -C "$REPO" rev-parse HEAD)" == "$tip" ]] \
             || { echo "HEAD was reset to the base commit, dropping hotfix commits"; exit 1; }
           echo "propose sits on $tip, not $base"
+
+      # Workflows run from the pushed ref's tree, so a release branch cut at an
+      # older base commit must be given the default branch's release workflows
+      # in the candidate commit. The fixture's base tree is pre-migration: an old
+      # release-settle.yml, a release-publish.yml and an on-release.yml whose
+      # dist-docs job writes with a Maxwell token and commits as Maxwell. (The
+      # fixtures use literal secret names, not expressions: this script is
+      # itself a workflow, and `${{ }}` in it would be expanded.)
+      - name: The release workflows are carried onto a base_commit candidate
+        run: |
+          set -euo pipefail
+          CREPO="$RUNNER_TEMP/carry"
+          LINT="$GITHUB_WORKSPACE/.github/scripts/app_token_lint.py"
+          wf=.github/workflows
+          TOKEN_ACTION=actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+          git init --quiet --bare "$CREPO.git"
+          git clone --quiet "$CREPO.git" "$CREPO" 2>/dev/null
+          cd "$CREPO"
+          mkdir -p "$wf"
+          echo 1.0.0 > VERSION
+          cat > "$wf/release-settle.yml" <<YML
+          name: release-settle
+          on:
+            workflow_dispatch:
+          jobs:
+            settle:
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: $TOKEN_ACTION # v3
+                  id: token
+                  with:
+                    client-id: MEGA_MAXWELL_CLIENT_ID
+                    private-key: MEGA_MAXWELL_PK
+                    permission-contents: write
+                - uses: megaeth-labs/.github/.github/actions/release-settle@main
+                  with:
+                    token: from-the-step
+          YML
+          cat > "$wf/on-release.yml" <<YML
+          name: on-release
+          on:
+            release:
+              types: [published]
+          jobs:
+            dist-docs:
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: $TOKEN_ACTION # v3
+                  id: token
+                  with:
+                    client-id: MEGA_MAXWELL_CLIENT_ID
+                    private-key: MEGA_MAXWELL_PK
+                    repositories: dist-docs
+                    permission-contents: write
+                - run: |
+                    git config user.name "mega-maxwell[bot]"
+                    git config user.email "290560214+mega-maxwell[bot]@users.noreply.github.com"
+          YML
+          printf 'name: release-publish\non: workflow_dispatch\njobs:\n  publish:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo old publish\n' > "$wf/release-publish.yml"
+          printf 'name: daily-audit\non: workflow_dispatch\njobs:\n  audit:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo audit\n' > "$wf/daily-audit.yml"
+          git add -A && git commit --quiet -m "feat: pre-migration release workflows"
+          git rev-parse HEAD > "$RUNNER_TEMP/carry-base"
+          # The default branch has moved on: migrated workflows, no release-publish.
+          cat > "$wf/release-settle.yml" <<YML
+          name: release-settle
+          on:
+            workflow_dispatch:
+          jobs:
+            settle:
+              runs-on: ubuntu-24.04
+              environment: release
+              steps:
+                - uses: $TOKEN_ACTION # v3
+                  id: release-token
+                  with:
+                    client-id: RELEASE_APP_CLIENT_ID
+                    private-key: RELEASE_APP_PRIVATE_KEY
+                    permission-contents: write
+                - uses: megaeth-labs/.github/.github/actions/release-settle@main
+                  with:
+                    token: from-the-step
+          YML
+          cat > "$wf/on-release.yml" <<YML
+          name: on-release
+          on:
+            release:
+              types: [published]
+          jobs:
+            dist-docs:
+              runs-on: ubuntu-24.04
+              environment: release
+              steps:
+                - uses: $TOKEN_ACTION # v3
+                  id: release-token
+                  with:
+                    client-id: RELEASE_APP_CLIENT_ID
+                    private-key: RELEASE_APP_PRIVATE_KEY
+                    repositories: dist-docs
+                    permission-contents: write
+                - run: |
+                    git config user.name "mega-gutenberg[bot]"
+                    git config user.email "348780249+mega-gutenberg[bot]@users.noreply.github.com"
+          YML
+          git rm --quiet "$wf/release-publish.yml"
+          git add -A && git commit --quiet -m "feat: migrate the release workflows"
+          git push --quiet -u origin main
+          base="$(cat "$RUNNER_TEMP/carry-base")"
+
+          # Stale state: the base tree really is pre-migration, and the lint says so.
+          mkdir -p "$RUNNER_TEMP/carry-base-tree" "$RUNNER_TEMP/carry-candidate-tree"
+          git archive "$base" "$wf" | tar -x -C "$RUNNER_TEMP/carry-base-tree"
+          [[ -f "$RUNNER_TEMP/carry-base-tree/$wf/release-publish.yml" ]] \
+            || { echo "the base tree has no release-publish.yml"; exit 1; }
+          rc=0
+          python3 "$LINT" --repo fake "$RUNNER_TEMP/carry-base-tree/$wf/release-settle.yml" \
+            "$RUNNER_TEMP/carry-base-tree/$wf/on-release.yml" > "$RUNNER_TEMP/lint-base.log" 2>&1 || rc=$?
+          [[ "$rc" -eq 1 ]] || { echo "the lint exits $rc on the base tree, not 1"; cat "$RUNNER_TEMP/lint-base.log"; exit 1; }
+
+          # Propose: cut the branch at the base, carry the workflows. The
+          # checkout is dirty (an untracked file) the way a real job's is.
+          : > "$OUT"
+          env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake GITHUB_OUTPUT="$OUT" \
+            BRANCH=release-v1.1.0 BASE="$base" bash "$SH/cut-branch.sh"
+          echo scratch > scratch.txt
+          env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake \
+            RELEASE_WORKFLOWS="$(cat "$SH/release_workflows.default")" bash "$SH/carry.sh" \
+            | tee "$RUNNER_TEMP/carry.log"
+          git add "$wf" && git commit --quiet -m "chore(release): candidate v1.1.0"
+          candidate="$(git rev-parse HEAD)"
+
+          # The candidate commit's tree, not the log, is the evidence.
+          for f in release-settle.yml on-release.yml; do
+            git show "$candidate:$wf/$f" > "$RUNNER_TEMP/got"
+            git show "origin/main:$wf/$f" > "$RUNNER_TEMP/want"
+            cmp "$RUNNER_TEMP/got" "$RUNNER_TEMP/want" \
+              || { echo "$f is not the default branch's, byte for byte"; exit 1; }
+          done
+          if git cat-file -e "$candidate:$wf/release-publish.yml" 2>/dev/null; then
+            echo "release-publish.yml is still in the candidate tree"; exit 1
+          fi
+          [[ "$(git diff --name-only "$base" "$candidate" | sort | tr '\n' ' ')" \
+              == "$wf/on-release.yml $wf/release-publish.yml $wf/release-settle.yml " ]] \
+            || { echo "the candidate changed more than the release workflows:"; git diff --name-only "$base" "$candidate"; exit 1; }
+          [[ "$(git status --porcelain)" == "?? scratch.txt" ]] \
+            || { echo "the carry touched the rest of the checkout:"; git status --porcelain; exit 1; }
+          git archive "$candidate" "$wf" | tar -x -C "$RUNNER_TEMP/carry-candidate-tree"
+          python3 "$LINT" --repo fake "$RUNNER_TEMP/carry-candidate-tree/$wf/release-settle.yml" \
+            "$RUNNER_TEMP/carry-candidate-tree/$wf/on-release.yml"
+          [[ "$(git ls-remote --heads origin refs/heads/release-v1.1.0 | cut -f1)" == "$base" ]] \
+            || { echo "the release branch is not at the base commit"; exit 1; }
+
+          # Re-running the carry on the candidate changes nothing; an absent
+          # path is skipped, not an error.
+          env GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake \
+            RELEASE_WORKFLOWS="$(cat "$SH/release_workflows.default")"$'\n'"$wf/not-there.yml" \
+            bash "$SH/carry.sh" | tee "$RUNNER_TEMP/carry2.log"
+          grep -qF "skipped $wf/not-there.yml" "$RUNNER_TEMP/carry2.log" \
+            || { echo "an absent path was not reported as skipped"; exit 1; }
+          [[ "$(git status --porcelain)" == "?? scratch.txt" ]] \
+            || { echo "a second carry changed the tree"; git status --porcelain; exit 1; }
+          echo "candidate $candidate carries the default branch's release workflows"
+
+      - name: The bump command never runs with the release token
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/carry"
+          marker="$RUNNER_TEMP/bump-ran"
+          rm -f "$marker"
+          bump() { # <dependency token>
+            env GITHUB_AUTH_TOKEN="$1" DEPENDENCY_TOKEN="$1" GH_TOKEN=fake \
+              OLD_VERSION=0.9.0 NEW_VERSION=1.0.0 BUMP_COMMAND="touch '$marker'" \
+              FILE=VERSION PATTERN=plain TOOLS="$TOOLS" bash "$SH/bump.sh"
+          }
+          if bump "" > "$RUNNER_TEMP/bump.log" 2>&1; then
+            echo "the bump command ran without a dependency token"; cat "$RUNNER_TEMP/bump.log"; exit 1
+          fi
+          grep -qF "bump_command needs a separate dependency_token" "$RUNNER_TEMP/bump.log" \
+            || { echo "refused, but not for the missing dependency token:"; cat "$RUNNER_TEMP/bump.log"; exit 1; }
+          [[ ! -e "$marker" ]] || { echo "the bump command ran before the refusal"; exit 1; }
+          bump dependency-token
+          [[ -e "$marker" ]] || { echo "the bump command did not run with a dependency token"; exit 1; }
+          echo "refused without a dependency token, runs with one"
+
+      # `cut` runs on the push that merged the candidate. It re-reads the PR
+      # through the API (fixtures here) and trusts nothing from the event.
+      - name: Cut refuses what is not a merged candidate and creates the branch for one
+        run: |
+          set -euo pipefail
+          UP="$RUNNER_TEMP/cut"
+          git init --quiet --bare "$UP.git"
+          git clone --quiet "$UP.git" "$UP" 2>/dev/null
+          cd "$UP"
+          echo 1.0.0 > VERSION
+          git add -A && git commit --quiet -m "feat: first"
+          echo 1.3.0 > VERSION
+          git add -A && git commit --quiet -m "chore(release): candidate v1.3.0 (#7)"
+          git push --quiet -u origin main
+          merge="$(git rev-parse HEAD)"
+          earlier="$(git rev-parse HEAD~1)"
+          mkdir -p "$RUNNER_TEMP/pr"
+          pr() { # <number> <merged_at|null> <merge sha> <head ref> <base ref> <author>
+            python3 - "$@" "$RUNNER_TEMP/pr" <<'PY'
+          import json, sys
+          number, merged_at, sha, head, base, login, out = sys.argv[1:]
+          doc = {
+              "number": int(number),
+              "merged_at": None if merged_at == "null" else merged_at,
+              "merge_commit_sha": sha,
+              "head": {"ref": head},
+              "base": {"ref": base},
+              "user": {"login": login},
+          }
+          json.dump(doc, open(f"{out}/{number}.json", "w"))
+          PY
+          }
+          run_cut() { # <pr number> <commit>
+            : > "$OUT"
+            ( cd "$UP" && env \
+                GH_TOKEN=fake \
+                GITHUB_REPOSITORY=megaeth-labs/fake \
+                GITHUB_OUTPUT="$OUT" \
+                VERSION=1.3.0 \
+                PREFIX=release-v \
+                FILE=VERSION \
+                PATTERN=plain \
+                COMMIT="$2" \
+                PR_NUMBER="$1" \
+                EXPECTED_AUTHOR='mega-gutenberg[bot]' \
+                TOOLS="$TOOLS" \
+                bash "$SH/cut.sh" ) > "$RUNNER_TEMP/cut.log" 2>&1
+          }
+          branch_at() { git -C "$UP" ls-remote --heads origin refs/heads/release-v1.3.0 | cut -f1; }
+          refuse_cut() { # <pr number> <commit> <message fragment>
+            if run_cut "$1" "$2"; then
+              echo "expected a refusal for PR $1"; cat "$RUNNER_TEMP/cut.log"; exit 1
+            fi
+            grep -qF "$3" "$RUNNER_TEMP/cut.log" \
+              || { echo "PR $1 refused, but not for '$3':"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+            [[ -z "$(branch_at)" ]] || { echo "a refused cut still created release-v1.3.0"; exit 1; }
+          }
+          candidate=chore/release-candidate-1.3.0
+          merged=2026-01-01T00:00:00Z
+          bot='mega-gutenberg[bot]'
+          pr 12 "$merged" "$merge" "$candidate" main 'mega-maxwell[bot]'
+          pr 13 null "$merge" "$candidate" main "$bot"
+          pr 14 "$merged" "$earlier" "$candidate" main "$bot"
+          pr 15 "$merged" "$merge" "$candidate" release-v1.2.0 "$bot"
+          pr 16 "$merged" "$merge" feature/x main "$bot"
+          pr 17 "$merged" "$earlier" "$candidate" main "$bot"
+          refuse_cut 12 "$merge" "not by 'mega-gutenberg[bot]'"
+          refuse_cut 13 "$merge" "has not been merged"
+          refuse_cut 14 "$merge" "not the pushed commit"
+          refuse_cut 15 "$merge" "not the default branch 'main'"
+          refuse_cut 16 "$merge" "is not a chore/release-candidate-* branch"
+          refuse_cut 17 "$earlier" "says 1.0.0, expected 1.3.0"
+          refuse_cut "" "$merge" "cut needs the commit and pr_number inputs"
+          refuse_cut 11 "" "cut needs the commit and pr_number inputs"
+
+          # The version comes from the PR's head ref, read through the API.
+          pr 11 "$merged" "$merge" "$candidate" main "$bot"
+          : > "$OUT"
+          env STAGE=cut PR_NUMBER=11 INPUT_VERSION= GH_TOKEN=fake GITHUB_REPOSITORY=megaeth-labs/fake \
+            GITHUB_OUTPUT="$OUT" TOOLS="$TOOLS" bash "$SH/version.sh"
+          expect_out() { grep -qxF "$1" "$OUT" || { echo "no '$1' in the step output:"; cat "$OUT"; exit 1; }; }
+          expect_out "version=1.3.0"
+
+          run_cut 11 "$merge" || { cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          expect_out "release_branch=release-v1.3.0"
+          [[ "$(branch_at)" == "$merge" ]] \
+            || { echo "release-v1.3.0 is not at the merge commit: '$(branch_at)'"; exit 1; }
+          echo "release-v1.3.0 created at $merge"
+
+          # Stale state: the branch is there now, and a second cut is refused
+          # without moving it.
+          if run_cut 11 "$merge"; then
+            echo "a second cut succeeded"; cat "$RUNNER_TEMP/cut.log"; exit 1
+          fi
+          grep -qF "branch release-v1.3.0 already exists" "$RUNNER_TEMP/cut.log" \
+            || { echo "refused, but not because the branch exists:"; cat "$RUNNER_TEMP/cut.log"; exit 1; }
+          [[ "$(branch_at)" == "$merge" ]] || { echo "the existing branch moved"; exit 1; }
+          echo "cut creates the branch for a merged gutenberg candidate and refuses the rest"
 
   # release-publish re-verifies the merged settle PR through the API and tags
   # the pushed commit. The three steps that do it are extracted by name and run
