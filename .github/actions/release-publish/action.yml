@@ -1,14 +1,17 @@
 name: Release Publish
 description: >-
-  Publish a settled release. Normally runs when a `chore/release-settle-vX.Y.Z`
-  PR merges into its release branch (or, with `commit` + `version` given, on
-  an explicit commit that `release-settle` in `direct` mode just made):
-  creates the annotated tag `vX.Y.Z` at the
-  merge commit (exactly once — refuses if it exists, or if the branch moved
-  after the settle PR was opened) and publishes the GitHub Release with the
-  changelog section as notes. This is the only place in the release flow that
-  creates a tag; merging the settle PR is the approval. The default branch's
-  changelog catches up in the next release candidate PR — nothing is
+  Publish a settled release. Runs on a push to `release-vX.Y.Z` (the consumer
+  passes the `commit` and `pr_number` that `release-route` resolved for the
+  push). Re-verifies the merged `chore/release-settle-vX.Y.Z` PR through the
+  API — merged, merge commit equals the pushed commit, head/base names, author,
+  and the settled-SHA marker against the merge commit's parent — then creates
+  the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release
+  with the changelog section as notes. A tag already at the commit without a
+  Release (a run that died between the two steps) is resumed: the tag step is
+  skipped and the Release is still created; any other existing tag refuses,
+  because a release is published once. This is the only place in the release
+  flow that creates a tag; merging the settle PR is the approval. The default
+  branch's changelog catches up in the next release candidate PR — nothing is
   back-merged. The consumer checks the repository out first
   (`fetch-depth: 0`, `persist-credentials: false`).
   Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
@@ -16,10 +19,9 @@ description: >-
 inputs:
   token:
     description: >-
-      GitHub App installation token (e.g. the Maxwell app). The tag push must
-      come from it so `push: tags` workflows (artifact builds) fire; the job's
-      GITHUB_TOKEN would not trigger them. Also needs to be a bypass actor on
-      the repository's tag ruleset.
+      mega-gutenberg installation token minted in an `environment: release`
+      job; gutenberg is the bypass actor on the `v*` tag ruleset, and a Release
+      it creates fires `release: published` workflows.
     required: true
   version_file:
     description: "File holding the version (VERSION, Cargo.toml, pyproject.toml, package.json); the same value as in release-candidate."
@@ -37,40 +39,34 @@ inputs:
     required: false
     default: release-v
   commit:
-    description: >-
-      Explicit commit to publish (full SHA), with `version`. Set by
-      `release-settle` in `direct` mode; leave empty when triggered by the
-      settle PR merging. The PR-specific guards (head/base names, author,
-      drift marker) do not apply in this mode.
-    required: false
-    default: ""
-  version:
-    description: "Version for the explicit-commit mode, X.Y.Z or vX.Y.Z."
-    required: false
-    default: ""
+    description: "The pushed commit to publish (full SHA), as resolved by `release-route`; it must be the settle PR's merge commit."
+    required: true
+  pr_number:
+    description: "Number of the merged settle PR for `commit`, as resolved by `release-route`."
+    required: true
   pr_author:
     description: >-
       Login the settle PR must have been opened by — the app identity
       `release-settle` runs under. Stops a hand-made `chore/release-settle-*`
       branch from reaching the tag step. Empty disables the check.
     required: false
-    default: "mega-maxwell[bot]"
+    default: "mega-gutenberg[bot]"
   git_user_name:
     description: "Committer identity for the commits this action makes."
     required: false
-    default: "mega-maxwell[bot]"
+    default: "mega-gutenberg[bot]"
   git_user_email:
     description: "Committer email for the commits this action makes."
     required: false
-    default: "290560214+mega-maxwell[bot]@users.noreply.github.com"
+    default: "348780249+mega-gutenberg[bot]@users.noreply.github.com"
 
 outputs:
   version:
     description: "The normalised version, X.Y.Z."
     value: ${{ steps.guard.outputs.version }}
   tag:
-    description: "The tag created, vX.Y.Z."
-    value: ${{ steps.tag.outputs.tag }}
+    description: "The tag published, vX.Y.Z (created now, or already at the commit from an interrupted run)."
+    value: ${{ steps.guard.outputs.tag }}
   release_url:
     description: "URL of the GitHub Release."
     value: ${{ steps.release.outputs.url }}
@@ -93,16 +89,10 @@ runs:
       env:
         AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
         GITHUB_AUTH_TOKEN: ${{ inputs.token }}
-        MERGED: ${{ github.event.pull_request.merged }}
-        HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        BASE_REF: ${{ github.event.pull_request.base.ref }}
-        MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-        PR_BODY: ${{ github.event.pull_request.body }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        GH_TOKEN: ${{ inputs.token }}
+        MERGE_SHA: ${{ inputs.commit }}
+        PR_NUMBER: ${{ inputs.pr_number }}
         EXPECTED_AUTHOR: ${{ inputs.pr_author }}
-        EXPLICIT_COMMIT: ${{ inputs.commit }}
-        EXPLICIT_VERSION: ${{ inputs.version }}
         PREFIX: ${{ inputs.release_branch_prefix }}
         FILE: ${{ inputs.version_file }}
         PATTERN: ${{ inputs.version_pattern }}
@@ -111,46 +101,68 @@ runs:
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
-        if [[ -n "$EXPLICIT_COMMIT" ]]; then
-          # Explicit-commit mode: release-settle (direct) made this commit a
-          # moment ago and authorised the actor; only the immutability and
-          # content checks below apply.
-          if [[ ! "$EXPLICIT_COMMIT" =~ ^[0-9a-f]{40}$ || -z "$EXPLICIT_VERSION" ]]; then
-            echo "::error::explicit mode needs a full 40-hex commit and a version"; exit 1
-          fi
-          version="$(python3 "$TOOLS" normalize "$EXPLICIT_VERSION")"
-          MERGE_SHA="$EXPLICIT_COMMIT"
-          git fetch --quiet --tags origin "$MERGE_SHA"
-        else
-          if [[ "$MERGED" != "true" || -z "$MERGE_SHA" ]]; then
-            echo "::error::publish runs on a merged settle PR (pull_request closed, merged == true)"; exit 1
-          fi
-          if [[ "$HEAD_REF" != chore/release-settle-v* ]]; then
-            echo "::error::head branch '$HEAD_REF' is not a settle PR"; exit 1
-          fi
-          if [[ -n "$EXPECTED_AUTHOR" && "$PR_AUTHOR" != "$EXPECTED_AUTHOR" ]]; then
-            echo "::error::settle PR #$PR_NUMBER was opened by '$PR_AUTHOR', not by '$EXPECTED_AUTHOR' (the identity release-settle runs under); refusing to publish from it"; exit 1
-          fi
-          version="$(python3 "$TOOLS" normalize "${HEAD_REF#chore/release-settle-}")"
-          if [[ "$BASE_REF" != "${PREFIX}${version}" ]]; then
-            echo "::error::settle PR for v$version merged into '$BASE_REF', expected ${PREFIX}${version}"; exit 1
-          fi
-          git fetch --quiet --tags origin "$MERGE_SHA"
-          # Drift guard: the settle PR recorded which commit was settled. The
-          # merge commit's parent is the release-branch tip at merge time; if
-          # anything landed after the settle PR was opened they differ, and the
-          # changelog no longer describes what is being tagged.
-          settled="$(grep -oE '<!-- release-settle: v[0-9.]+ [0-9a-f]{40} -->' <<<"$PR_BODY" | head -n1 | grep -oE '[0-9a-f]{40}' || true)"
-          if [[ -z "$settled" ]]; then
-            echo "::error::settle PR body has no '<!-- release-settle: ... -->' marker; refusing to publish an unverifiable settlement"; exit 1
-          fi
-          parent="$(git rev-parse "$MERGE_SHA^")"
-          if [[ "$parent" != "$settled" ]]; then
-            echo "::error::release branch drifted: settle PR settled $settled but the branch tip at merge was $parent. Re-run release-settle on the current tip."; exit 1
-          fi
+        if [[ ! "$MERGE_SHA" =~ ^[0-9a-f]{40}$ || ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+          echo "::error::publish needs a full 40-hex commit and a numeric pr_number (the release-route outputs)"; exit 1
         fi
-        if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
-          echo "::error::tag v$version already exists; a release is published once"; exit 1
+        # Nothing about the settle PR is taken from the triggering event: the
+        # push only says which commit landed. Everything below is read back
+        # from the API and the repository.
+        pr="$RUNNER_TEMP/settle-pr.json"
+        gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$pr"
+        pr_field() { # <dotted.path>
+          python3 -c 'import json, sys
+        d = json.load(open(sys.argv[1]))
+        for k in sys.argv[2].split("."):
+            d = (d or {}).get(k)
+        print("" if d is None else d, end="")' "$pr" "$1"
+        }
+        merged_at="$(pr_field merged_at)"
+        pr_merge_sha="$(pr_field merge_commit_sha)"
+        head_ref="$(pr_field head.ref)"
+        base_ref="$(pr_field base.ref)"
+        pr_author="$(pr_field user.login)"
+        pr_body="$(pr_field body)"
+        if [[ -z "$merged_at" ]]; then
+          echo "::error::settle PR #$PR_NUMBER is not merged; publish only follows a merged settle PR"; exit 1
+        fi
+        if [[ "$pr_merge_sha" != "$MERGE_SHA" ]]; then
+          echo "::error::settle PR #$PR_NUMBER merged as '$pr_merge_sha', not the pushed commit $MERGE_SHA"; exit 1
+        fi
+        if [[ "$head_ref" != chore/release-settle-v* ]]; then
+          echo "::error::head branch '$head_ref' is not a settle PR"; exit 1
+        fi
+        if [[ -n "$EXPECTED_AUTHOR" && "$pr_author" != "$EXPECTED_AUTHOR" ]]; then
+          echo "::error::settle PR #$PR_NUMBER was opened by '$pr_author', not by '$EXPECTED_AUTHOR' (the identity release-settle runs under); refusing to publish from it"; exit 1
+        fi
+        version="$(python3 "$TOOLS" normalize "${head_ref#chore/release-settle-}")"
+        if [[ "$base_ref" != "${PREFIX}${version}" ]]; then
+          echo "::error::settle PR for v$version merged into '$base_ref', expected ${PREFIX}${version}"; exit 1
+        fi
+        git fetch --quiet --tags origin "$MERGE_SHA"
+        # Drift guard: the settle PR recorded which commit was settled. The
+        # merge commit's parent is the release-branch tip at merge time; if
+        # anything landed after the settle PR was opened they differ, and the
+        # changelog no longer describes what is being tagged.
+        settled="$(grep -oE '<!-- release-settle: v[0-9.]+ [0-9a-f]{40} -->' <<<"$pr_body" | head -n1 | grep -oE '[0-9a-f]{40}' || true)"
+        if [[ -z "$settled" ]]; then
+          echo "::error::settle PR body has no '<!-- release-settle: ... -->' marker; refusing to publish an unverifiable settlement"; exit 1
+        fi
+        parent="$(git rev-parse "$MERGE_SHA^")"
+        if [[ "$parent" != "$settled" ]]; then
+          echo "::error::release branch drifted: settle PR settled $settled but the branch tip at merge was $parent. Re-run release-settle on the current tip."; exit 1
+        fi
+        # A release is published once. The one exception is a run that died
+        # after pushing the tag and before creating the Release: the tag is
+        # already at this commit and no Release exists, so resume from there.
+        tag="v$version"
+        tag_exists=false
+        if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+          git fetch --quiet --force origin "refs/tags/$tag:refs/tags/$tag"
+          if [[ "$(git rev-parse "$tag^{commit}")" == "$MERGE_SHA" ]] && ! gh release view "$tag" >/dev/null 2>&1; then
+            tag_exists=true
+          else
+            echo "::error::tag $tag already exists (at $(git rev-parse "$tag^{commit}")) and is not an unfinished release of $MERGE_SHA; a release is published once"; exit 1
+          fi
         fi
         actual="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
         if [[ "$actual" != "$version" ]]; then
@@ -161,28 +173,29 @@ runs:
         python3 "$TOOLS" changelog-extract "$RUNNER_TEMP/changelog-at-merge.md" "$version" > "$notes"
         {
           echo "version=$version"
+          echo "tag=$tag"
+          echo "tag_exists=$tag_exists"
           echo "merge_sha=$MERGE_SHA"
           echo "notes_file=$notes"
         } >> "$GITHUB_OUTPUT"
-        echo "publishing v$version at $MERGE_SHA"; echo "--- notes ---"; cat "$notes"
+        echo "publishing $tag at $MERGE_SHA (tag already there: $tag_exists)"; echo "--- notes ---"; cat "$notes"
         GITHUB_AUTH_COMMAND
 
     - name: Create and push tag
       id: tag
+      if: steps.guard.outputs.tag_exists != 'true'
       shell: bash
       env:
         AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
         GITHUB_AUTH_TOKEN: ${{ inputs.token }}
-        VERSION: ${{ steps.guard.outputs.version }}
+        TAG: ${{ steps.guard.outputs.tag }}
         MERGE_SHA: ${{ steps.guard.outputs.merge_sha }}
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
-        tag="v$VERSION"
-        git tag -a "$tag" "$MERGE_SHA" -m "Release $tag"
-        git push --quiet origin "refs/tags/$tag"
-        echo "tag=$tag" >> "$GITHUB_OUTPUT"
-        echo "tagged $MERGE_SHA as $tag"
+        git tag -a "$TAG" "$MERGE_SHA" -m "Release $TAG"
+        git push --quiet origin "refs/tags/$TAG"
+        echo "tagged $MERGE_SHA as $TAG"
         GITHUB_AUTH_COMMAND
 
     - name: Publish GitHub Release
@@ -190,7 +203,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
-        TAG: ${{ steps.tag.outputs.tag }}
+        TAG: ${{ steps.guard.outputs.tag }}
         NOTES: ${{ steps.guard.outputs.notes_file }}
       run: |
         set -euo pipefail

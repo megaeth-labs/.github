@@ -740,6 +740,368 @@ jobs:
             || { echo "HEAD was reset to the base commit, dropping hotfix commits"; exit 1; }
           echo "propose sits on $tip, not $base"
 
+  # release-publish re-verifies the merged settle PR through the API and tags
+  # the pushed commit. The three steps that do it are extracted by name and run
+  # against a throwaway bare remote, a fake gh that answers from fixtures and
+  # records what it was asked to create, and fixtures for each refusal.
+  release-publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      TOOLS: ${{ github.workspace }}/.github/actions/release-tools/release_tools.py
+      ACTION: ${{ github.workspace }}/.github/actions/release-publish/action.yml
+      AUTH_WRAPPER: ${{ github.workspace }}/.github/actions/git-auth/with-github-auth.sh
+      GITHUB_AUTH_TOKEN: fixture-token
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # `runner` is not a context a job-level `env:` may read, so the paths
+      # the steps below share are set here instead.
+      - name: Where the rehearsal lives
+        run: |
+          set -euo pipefail
+          {
+            echo "REPO=$RUNNER_TEMP/repo"
+            echo "SH=$RUNNER_TEMP/sh"
+            echo "OUT=$RUNNER_TEMP/step-output"
+            echo "FIX=$RUNNER_TEMP/fixtures"
+            echo "ARGS=$RUNNER_TEMP/fixtures/release-create-args"
+            echo "RELEASES=$RUNNER_TEMP/fixtures/releases"
+          } >> "$GITHUB_ENV"
+
+      - name: The shell under test, taken from the action
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          mkdir -p "$SH"
+          python3 - "$ACTION" "$SH" <<'PY'
+          import pathlib, sys, yaml
+
+          want = {
+              "Guard": "guard.sh",
+              "Create and push tag": "tag.sh",
+              "Publish GitHub Release": "release.sh",
+          }
+          steps = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"]
+          found = {s["name"]: s["run"] for s in steps if s.get("name") in want}
+          missing = sorted(set(want) - set(found))
+          if missing:
+              sys.exit(f"action.yml has no step named {missing}; this job drives them by name")
+          # The job below skips the tag step by this condition; if the action's
+          # changes, the rehearsal would no longer be rehearsing it.
+          cond = next(s for s in steps if s.get("name") == "Create and push tag").get("if")
+          if cond != "steps.guard.outputs.tag_exists != 'true'":
+              sys.exit(f"the tag step's condition is {cond!r}; update this job to match")
+          for name, script in found.items():
+              pathlib.Path(sys.argv[2], want[name]).write_text(script)
+              print(f"extracted {name!r} -> {want[name]}")
+          PY
+          cat > "$SH/helpers.sh" <<'SH'
+          out_get() { grep -m1 "^$1=" "$OUT" | cut -d= -f2-; }
+
+          expect_output() { # <exact line the guard should have written>
+            grep -qxF "$1" "$OUT" || { echo "no '$1' in the guard output:"; cat "$OUT"; exit 1; }
+          }
+
+          # The three steps, the way the action's steps run them.
+          guard() { # <pr> [expected author]
+            : > "$OUT"
+            ( cd "$REPO" && env \
+                GH_TOKEN=fake \
+                GITHUB_REPOSITORY=megaeth-labs/fake \
+                GITHUB_OUTPUT="$OUT" \
+                MERGE_SHA="$(cat "$FIX/merge-$1")" \
+                PR_NUMBER="$1" \
+                EXPECTED_AUTHOR="${2-mega-gutenberg[bot]}" \
+                PREFIX=release-v \
+                FILE=VERSION \
+                PATTERN=plain \
+                CHANGELOG=CHANGELOG.md \
+                bash "$SH/guard.sh" )
+          }
+
+          tag_step() {
+            ( cd "$REPO" && env \
+                TAG="$(out_get tag)" \
+                MERGE_SHA="$(out_get merge_sha)" \
+                bash "$SH/tag.sh" ) || return 1
+            touch "$FIX/tag-ran"
+          }
+
+          release_step() {
+            ( cd "$REPO" && env \
+                GH_TOKEN=fake \
+                TAG="$(out_get tag)" \
+                NOTES="$(out_get notes_file)" \
+                GITHUB_OUTPUT="$OUT.release" \
+                bash "$SH/release.sh" )
+          }
+
+          # The action's step list: the tag step runs unless the guard says the
+          # tag is already at the commit.
+          publish() { # <pr> [expected author]
+            rm -f "$FIX/tag-ran"
+            guard "$@" || return 1
+            if [[ "$(out_get tag_exists)" != true ]]; then
+              tag_step || return 1
+            fi
+            release_step
+          }
+
+          refuse() { # <pr> <message fragment> [expected author]
+            local log="$RUNNER_TEMP/refused.log"
+            if publish "$1" "${3-mega-gutenberg[bot]}" > "$log" 2>&1; then
+              echo "expected a refusal for PR $1"; cat "$log"; exit 1
+            fi
+            grep -qF "$2" "$log" || { echo "refused, but not for '$2':"; cat "$log"; exit 1; }
+            [[ ! -e "$FIX/tag-ran" ]] || { echo "a refused publish still ran the tag step"; exit 1; }
+          }
+
+          # What the remote says, not what the logs say.
+          remote_commit() { # <tag> -> commit an annotated remote tag points at, or nothing
+            git ls-remote "$REPO.git" "refs/tags/$1^{}" | cut -f1
+          }
+          remote_tag_object() { # <tag>
+            git ls-remote "$REPO.git" "refs/tags/$1" | cut -f1
+          }
+          seed_tag() { # <tag> <sha>: an annotated tag already on the remote
+            git -C "$REPO" tag -a "$1" "$2" -m seed
+            git -C "$REPO" push --quiet origin "refs/tags/$1"
+            git -C "$REPO" tag -d "$1" > /dev/null
+          }
+
+          # A release branch: the settled commit, optionally a late commit on
+          # top (LATE=1), then the settle PR's merge commit. The PR fixture
+          # describes it; O_* variables bend one field of that fixture.
+          settle() { # <version> <pr>
+            local v="$1" pr="$2"
+            git -C "$REPO" checkout --quiet -B "release-v$v" "$(cat "$FIX/root")"
+            (
+              cd "$REPO"
+              echo "${WRONG_FILE:-$v}" > VERSION
+              printf '# Changelog\n\n## v%s (2024-02-01)\n\n- shipped in %s\n\n## v1.0.0 (2024-01-01)\n\n- shipped in 1.0.0\n' "$v" "$v" > CHANGELOG.md
+              git add -A && git commit --quiet -m "chore(release): changelog for v$v"
+              git rev-parse HEAD > "$FIX/settled-$pr"
+              if [[ "${LATE:-}" == 1 ]]; then
+                git commit --quiet --allow-empty -m "fix: landed after the settle PR opened"
+              fi
+              git commit --quiet --allow-empty -m "Merge settle PR #$pr"
+              git rev-parse HEAD > "$FIX/merge-$pr"
+              git push --quiet --force origin "release-v$v"
+              git checkout --quiet main
+            )
+            write_pr "$pr" "$v"
+          }
+
+          write_pr() { # <pr> <version>
+            python3 - "$FIX" "$1" "$2" <<'PY'
+          import json, os, pathlib, sys
+
+          fix, pr, v = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          env = os.environ.get
+          settled = env("O_SETTLED") or (fix / f"settled-{pr}").read_text().strip()
+          merge = env("O_MERGE_SHA") or (fix / f"merge-{pr}").read_text().strip()
+          body = f"Settle v{v}."
+          if env("O_MARKER") != "none":
+              body += f"\n\n<!-- release-settle: v{v} {settled} -->\n"
+          doc = {
+              "merged_at": None if env("O_UNMERGED") else "2024-02-02T00:00:00Z",
+              "merge_commit_sha": merge,
+              "head": {"ref": env("O_HEAD") or f"chore/release-settle-v{v}"},
+              "base": {"ref": env("O_BASE") or f"release-v{v}"},
+              "user": {"login": env("O_USER") or "mega-gutenberg[bot]"},
+              "body": body,
+          }
+          (fix / f"pr-{pr}.json").write_text(json.dumps(doc))
+          PY
+          }
+          SH
+
+      - name: A fake gh
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$FIX"
+          : > "$ARGS"
+          : > "$RELEASES"
+          cat > "$RUNNER_TEMP/bin/gh" <<'SH'
+          #!/usr/bin/env bash
+          # Only what the shell under test calls. The pull request comes from a
+          # fixture; a Release exists once `release create` has been asked for
+          # it, and what it was asked is recorded for the assertions.
+          set -euo pipefail
+          if [[ "${1:-}" == api && "${2:-}" == repos/*/pulls/* ]]; then
+            f="$FIX/pr-${2##*/}.json"
+            [[ -f "$f" ]] || { echo "gh: no fixture $f" >&2; exit 1; }
+            cat "$f"
+            exit 0
+          fi
+          if [[ "${1:-}" == release && "${2:-}" == view ]]; then
+            grep -qxF "${3:-}" "$RELEASES" && exit 0
+            echo "release not found" >&2
+            exit 1
+          fi
+          if [[ "${1:-}" == release && "${2:-}" == create ]]; then
+            if [[ -e "$FIX/fail-create" ]]; then
+              echo "gh: release create failed (injected)" >&2
+              exit 1
+            fi
+            notes=""
+            args=("$@")
+            for ((i = 0; i < ${#args[@]}; i++)); do
+              if [[ "${args[i]}" == --notes-file ]]; then notes="${args[i + 1]}"; fi
+            done
+            [[ -s "$notes" ]] || { echo "gh: --notes-file '$notes' is missing or empty" >&2; exit 1; }
+            echo "$*" >> "$ARGS"
+            echo "$3" >> "$RELEASES"
+            echo "https://github.com/megaeth-labs/fake/releases/tag/$3"
+            exit 0
+          fi
+          echo "gh: unexpected call: $*" >&2
+          exit 99
+          SH
+          chmod +x "$RUNNER_TEMP/bin/gh"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: A repository shaped like a trunk with a release line to cut
+        run: |
+          set -euo pipefail
+          git init --quiet --bare -b main "$REPO.git"
+          git clone --quiet "$REPO.git" "$REPO" 2>/dev/null
+          cd "$REPO"
+          # Local config only: the steps under test run with the global and
+          # system config blanked, as they do in the action.
+          git config user.name tester
+          git config user.email tester@example.invalid
+          git config commit.gpgsign false
+          git config tag.gpgsign false
+          echo 1.0.0 > VERSION
+          printf '# Changelog\n\n## v1.0.0 (2024-01-01)\n\n- shipped in 1.0.0\n' > CHANGELOG.md
+          git add -A && git commit --quiet -m "feat: the first release"
+          git push --quiet -u origin main
+          git rev-parse HEAD > "$FIX/root"
+
+      - name: A settled release is tagged at its merge commit and published
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 1.2.0 101
+          publish 101
+          merge="$(cat "$FIX/merge-101")"
+          expect_output "version=1.2.0"
+          expect_output "tag=v1.2.0"
+          expect_output "tag_exists=false"
+          [[ -e "$FIX/tag-ran" ]] || { echo "the tag step did not run"; exit 1; }
+          [[ "$(git --git-dir="$REPO.git" cat-file -t refs/tags/v1.2.0)" == tag ]] \
+            || { echo "v1.2.0 is not an annotated tag"; exit 1; }
+          [[ "$(remote_commit v1.2.0)" == "$merge" ]] \
+            || { echo "v1.2.0 does not point at the merge commit $merge"; exit 1; }
+          git --git-dir="$REPO.git" cat-file -p refs/tags/v1.2.0 | grep -qxF "Release v1.2.0" \
+            || { echo "the tag annotation changed"; exit 1; }
+          grep -qF "release create v1.2.0 --verify-tag --latest --title v1.2.0 --notes-file " "$ARGS" \
+            || { echo "the Release was not created for v1.2.0:"; cat "$ARGS"; exit 1; }
+          grep -qx "v1.2.0" "$RELEASES" || { echo "no Release v1.2.0"; exit 1; }
+          grep -qxF -- "- shipped in 1.2.0" "$RUNNER_TEMP/release-notes-v1.2.0.md" \
+            || { echo "the notes are not the changelog section"; exit 1; }
+          echo "v1.2.0 is an annotated tag at $merge and the Release was asked for with --verify-tag"
+
+      - name: A published release is not published twice
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          before="$(remote_tag_object v1.2.0)"
+          refuse 101 "a release is published once"
+          [[ "$(remote_tag_object v1.2.0)" == "$before" ]] || { echo "the tag moved"; exit 1; }
+          [[ "$(grep -c 'release create v1.2.0 ' "$ARGS")" == 1 ]] || { echo "a second Release was created"; exit 1; }
+          echo "tag and Release both existing is refused, and nothing changed"
+
+      - name: A run that died after the tag is resumed, not refused
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 1.3.0 102
+          merge="$(cat "$FIX/merge-102")"
+          # The Release call fails once: the tag is pushed, no Release exists.
+          : > "$FIX/fail-create"
+          if publish 102 > "$RUNNER_TEMP/first-run.log" 2>&1; then
+            echo "the first run should have failed at the Release"; exit 1
+          fi
+          rm "$FIX/fail-create"
+          [[ "$(remote_commit v1.3.0)" == "$merge" ]] \
+            || { echo "the interrupted run left no tag at the merge commit"; exit 1; }
+          ! grep -qx "v1.3.0" "$RELEASES" || { echo "a Release exists after the failed run"; exit 1; }
+          object="$(remote_tag_object v1.3.0)"
+          # Re-run: the tag is already there, so the tag step is skipped.
+          publish 102
+          expect_output "tag=v1.3.0"
+          expect_output "tag_exists=true"
+          [[ ! -e "$FIX/tag-ran" ]] || { echo "the tag step ran again"; exit 1; }
+          [[ "$(remote_tag_object v1.3.0)" == "$object" ]] || { echo "the tag was rewritten"; exit 1; }
+          grep -qF "release create v1.3.0 --verify-tag --latest --title v1.3.0 --notes-file " "$ARGS" \
+            || { echo "the Release was not created with the guard's tag:"; cat "$ARGS"; exit 1; }
+          grep -qx "v1.3.0" "$RELEASES" || { echo "no Release v1.3.0"; exit 1; }
+          echo "v1.3.0 resumed: tag step skipped, tag untouched, Release created"
+
+      - name: Anything that does not describe a settled release is refused
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+
+          settle 1.4.0 103
+          O_USER=someone-else write_pr 103 1.4.0
+          refuse 103 "was opened by 'someone-else'"
+
+          # A commit landed after the settle PR was opened: the merge commit's
+          # parent is no longer the settled one.
+          LATE=1 settle 1.5.0 104
+          refuse 104 "drifted"
+
+          settle 1.6.0 105
+          seed_tag v1.6.0 "$(cat "$FIX/settled-105")"
+          refuse 105 "a release is published once"
+          [[ "$(remote_commit v1.6.0)" == "$(cat "$FIX/settled-105")" ]] || { echo "the tag moved"; exit 1; }
+
+          settle 1.7.0 106
+          seed_tag v1.7.0 "$(cat "$FIX/merge-106")"
+          echo v1.7.0 >> "$RELEASES"
+          refuse 106 "a release is published once"
+
+          WRONG_FILE=1.8.1 settle 1.8.0 107
+          refuse 107 "says 1.8.1, expected 1.8.0"
+
+          settle 1.9.0 108
+          O_UNMERGED=1 write_pr 108 1.9.0
+          refuse 108 "is not merged"
+
+          settle 1.9.1 109
+          O_MERGE_SHA="$(cat "$FIX/settled-109")" write_pr 109 1.9.1
+          refuse 109 "not the pushed commit"
+
+          settle 1.9.2 110
+          O_MARKER=none write_pr 110 1.9.2
+          refuse 110 "settle PR body has no"
+
+          settle 1.9.3 111
+          O_BASE=main write_pr 111 1.9.3
+          refuse 111 "merged into 'main'"
+
+          settle 1.9.4 112
+          O_HEAD=feature/x write_pr 112 1.9.4
+          refuse 112 "is not a settle PR"
+
+          # The remote and the recorded calls, not the messages, say that
+          # nothing was published: only the two good releases were created.
+          for v in 1.4.0 1.5.0 1.8.0 1.9.0 1.9.1 1.9.2 1.9.3 1.9.4; do
+            [[ -z "$(git ls-remote "$REPO.git" "refs/tags/v$v")" ]] \
+              || { echo "v$v was tagged although it was refused"; exit 1; }
+          done
+          [[ "$(grep -c . "$ARGS")" == 2 ]] \
+            || { echo "expected exactly the v1.2.0 and v1.3.0 Releases:"; cat "$ARGS"; exit 1; }
+          echo "ten refusals, no tag, no Release"
+
   # The generated parts of every action README (inputs, outputs, steps,
   # errors) and the catalogue come from action.yml; stale docs fail here.
   docs:
