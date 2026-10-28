@@ -3,7 +3,7 @@
 `uses: megaeth-labs/.github/.github/actions/release-settle@main`
 
 <!-- generated: description -->
-Maintain a settle PR for a release candidate: verify `commit` is the tip of the release branch and carries the expected version, generate release notes from the commits since the previous tag, write them into the changelog (stamping the date onto the candidate's `## vX.Y.Z` entry), and open or refresh a `chore/release-settle-vX.Y.Z` PR onto the release branch without rewriting its history. New commits on the release branch refresh this PR automatically; merging it is the settlement decision and release-publish then tags the merge commit once. Run as a step in a job the consumer owns; consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Needs `gh` and `python3` on the runner. Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
+Maintain a settle PR for a release candidate: verify `commit` is the tip of the release branch and carries the expected version, generate release notes from the commits since the previous tag, write them into the changelog under the candidate's undated `## vX.Y.Z` heading, and open or refresh a `chore/release-settle-vX.Y.Z` PR onto the release branch without rewriting its history. New commits on the release branch refresh this PR automatically; merging it is the settlement decision and release-publish then tags the merge commit once. Run as a step in a job the consumer owns; consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Needs `gh` and `python3` on the runner. Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 <!-- /generated -->
 
 Family: [Release pipeline](../RELEASE.md).
@@ -20,7 +20,7 @@ Family: [Release pipeline](../RELEASE.md).
 | `version_pattern` | no | `plain` | How the version is stored in `version_file`: plain, toml or json. |
 | `release_branch` | no |  | Defaults to `<release_branch_prefix>X.Y.Z`. |
 | `release_branch_prefix` | no | `release-v` | Release branch name prefix; the branch is `<prefix>X.Y.Z`. |
-| `changelog_file` | no | `CHANGELOG.md` | Changelog the entry is written to (Keep-a-Changelog style, newest first). |
+| `changelog_file` | no | `CHANGELOG.md` | Changelog the entry is written to (Keep-a-Changelog style, newest first); empty disables changelog writes. |
 | `pr_author` | no | `mega-gutenberg[bot]` | Author of the bot-maintained settle PR; PRs by other authors are superseded. |
 | `pr_labels` | no |  | Comma-separated labels for the settle PR (for repos whose label gates apply to release branches too). |
 | `git_user_name` | no | `mega-gutenberg[bot]` | Committer identity for the commits this action makes. |
@@ -40,11 +40,12 @@ Family: [Release pipeline](../RELEASE.md).
 ## What it runs
 
 <!-- generated: steps -->
-1. Configure git identity
 1. Guard
 1. Compare workflows with the default branch
-1. Generate release notes
-1. Ensure the settle PR
+1. Compute settlement state
+1. Configure git identity *(only if `steps.state.outputs.state == 'needs-settle-pr'`)*
+1. Generate release notes *(only if `steps.state.outputs.state == 'needs-settle-pr'`)*
+1. Ensure the settle PR *(only if `steps.state.outputs.state == 'needs-settle-pr'`)*
 <!-- /generated -->
 
 ## Errors it reports
@@ -56,6 +57,7 @@ Family: [Release pipeline](../RELEASE.md).
 - `$COMMIT is not the tip of $branch (tip is $tip). Settle the tip, or move the branch first.`
 - `$FILE at $COMMIT says $actual, expected $version`
 - `$version is not newer than the latest tag ${latest:-<none>}`
+- `${decision#*$`
 - `settle PR not ensured; stopped while $stage`
 - `$BRANCH moved to ${tip:-<deleted>} after this refresh of $COMMIT started (a settle PR merge or a new push); not touching the settle PR, the run for the new tip refreshes it`
 - `could not merge $COMMIT into $head; close the settle PR so the next run recreates it`
@@ -65,9 +67,9 @@ Family: [Release pipeline](../RELEASE.md).
 
 ## Example
 
-Direct mode, as in `workflow-templates/release-settle.yml` — the job
-declares `environment: release`, so the run waits for that environment's
-reviewers before this step runs:
+As used by `workflow-templates/release-settle.yml`. The refresh job needs no
+environment; the publish job that tags and creates the Release declares
+`environment: publish`, whose required reviewers authorise the tag:
 
 ```yaml
 - uses: megaeth-labs/.github/.github/actions/release-settle@main
@@ -78,25 +80,33 @@ reviewers before this step runs:
     version_file: Cargo.toml
     version_pattern: toml
     changelog_file: CHANGELOG.md
-    settle_mode: direct
-    # settlers: admin   # optional extra restriction on who may start a settle
 ```
 
-Leave out `settle_mode` (and the job's `environment:`) to settle by PR
-instead.
+The action itself never tags and never creates a Release: it only maintains
+`chore/release-settle-vX.Y.Z`. Publishing is `release-publish`, called by the
+template's publish job on a clean dispatch or on the settle PR's merge.
 
 ## Notes
 
+- Before generating notes or ensuring the PR, `settle-state` compares the
+  release-branch tip with the merged candidate PR, checks ancestry, and reads
+  the open settle PR, tag and GitHub Release facts. If the branch is unchanged
+  at the candidate merge with no open settle PR or tag, the action succeeds
+  with step outputs `settled=false` and `state=clean`. The run summary says
+  nothing was written: git identity configuration, notes generation and the
+  entire ensure-PR step are skipped, so no settle branch, commit, PR creation,
+  update or comment is made. Only `needs-settle-pr` reaches the existing PR flow,
+  including its deliberate `--allow-empty` commit when a fresh branch records
+  settlement.
 - Guards, in order: `commit` is a full SHA; the release branch exists; the
   tag does not; `commit` is the branch tip; the version file at `commit`
   says the version; the version is newer than the latest `v*` tag. Then a
   warning if `commit` lacks a workflow the default branch has (a `release`
   event runs `on-release.yml` from the tag's tree).
-- `direct`: the settle job's `release` environment reviewers are the gate
-  (`settlers: any`, the default); a login list or `admin` in `settlers`
-  additionally checks the dispatcher. The dated entry is committed straight
-  onto the release branch (the app must bypass its ruleset) and
-  `release-publish` runs in the same job with `commit` and `version` set.
+- This action never tags and never creates a Release: it maintains
+  `chore/release-settle-vX.Y.Z` only. `release-publish` does the tagging, run
+  by the template's publish job on a clean dispatch (where the `publish`
+  environment's required reviewers are the gate) or on the settle PR's merge.
 - `pr`: pushes `chore/release-settle-vX.Y.Z` and opens the settle PR,
   titled `chore(release): settle vX.Y.Z — merging publishes the release`.
   Its body opens with an `[!IMPORTANT]` alert saying that merging it settles
