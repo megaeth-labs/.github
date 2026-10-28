@@ -3,7 +3,7 @@
 `uses: megaeth-labs/.github/.github/actions/app-token-lint@main`
 
 <!-- generated: description -->
-Fail a workflow change that mints GitHub App tokens the wrong way. Maxwell (the CI app) may not request a `permission-<x>: write` other than pull-requests and issues; Gutenberg (the release app) reads `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY` from repository scope and may be minted only in `release-candidate.yml`, `release-settle.yml` or `on-release.yml`, with or without an environment and whatever contents permission the job needs, because L6 still forces an explicit `permission-*` list either way; release workflows (those using the release-candidate, release-settle, release-publish or release-route actions, and on-release.yml) mint no Maxwell token, never name their own repository in a read-only dependency token, and never use `mega-maxwell[bot]` as a git identity or PR author filter; and the one-reviewer `publish` environment gates only tagging, Release creation and artifact upload. Violations are reported as `::error file=<path>::<job>/<step>: <rule>: <message>`; unreadable or malformed YAML is an error too. No network.
+Fail a workflow change that mints GitHub App tokens the wrong way. Maxwell (the CI app) may not request a `permission-<x>: write` other than pull-requests and issues; Gutenberg (the release app) reads `MEGA_GUTENBERG_CLIENT_ID` and `MEGA_GUTENBERG_PK` from organization scope and may be minted only in `release-candidate.yml`, `release-settle.yml` or `on-release.yml`, with or without an environment and whatever contents permission the job needs, because L6 still forces an explicit `permission-*` list either way; release workflows (those using the release-candidate, release-settle, release-publish or release-route actions, and on-release.yml) mint no Maxwell token, never name their own repository in a read-only dependency token, and never use `mega-maxwell[bot]` as a git identity or PR author filter; and the one-reviewer `release` environment gates only tagging, Release creation and artifact upload. Violations are reported as `::error file=<path>::<job>/<step>: <rule>: <message>`; unreadable or malformed YAML is an error too. No network.
 <!-- /generated -->
 
 Standalone action; no family guide.
@@ -66,9 +66,8 @@ another directory or several, e.g. `paths: .github/workflows workflow-templates`
   environment; **L3** release
   workflows mint no Maxwell token and no read-only dependency token naming
   their own repository; **L4** release workflows never use `mega-maxwell[bot]`;
-  **L5** `environment: release`, and `environment: publish` in release workflows,
-  only in the same exact three files as L2'
-  (non-release workflows may still use `publish`); **L6** a Maxwell or Gutenberg
+  **L5** `environment: release` only in the same exact three files as L2'
+  (including in non-release workflows); **L6** a Maxwell or Gutenberg
   token, and any app token in a release job, requests at least one
   `permission-<x>` (without one it gets every permission of the installation).
 - The shared L2'/L5 allowlist matches the shipped release workflow templates
@@ -77,7 +76,7 @@ another directory or several, e.g. `paths: .github/workflows workflow-templates`
   is a shipped workflow template.
 - A token step is a step using `actions/create-github-app-token`; Maxwell is
   recognised by `MEGA_MAXWELL_`, `CI_APP_ID` or `MEGA_CI_APP_PK` in
-  `client-id`, `app-id` or `private-key`, Gutenberg by `RELEASE_APP_`.
+  `client-id`, `app-id` or `private-key`, Gutenberg by `MEGA_GUTENBERG_`.
 - A permission that is not a literal value (an expression) cannot be checked
   and counts as a violation for a Maxwell token.
 - A path that does not exist, a directory without `*.yml`/`*.yaml` files and

@@ -17,9 +17,9 @@ description: >-
   default branch: `propose` cuts the release branch there itself, carries the
   default branch's release workflows onto it, and points the candidate PR at
   it; that PR merges into the release branch, so `cut` never runs for it. Run
-  as a step in a job the consumer owns; the repository-scope
-  `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY` provide the app
-  credentials. The one-reviewer `publish` environment gates only tagging,
+  as a step in a job the consumer owns; the organization-level
+  `MEGA_GUTENBERG_CLIENT_ID` and `MEGA_GUTENBERG_PK` provide the app
+  credentials. The one-reviewer `release` environment gates only tagging,
   Release creation and artifact upload. The consumer checks the repository
   out first (`fetch-depth: 0`,
   `persist-credentials: false`).
@@ -32,9 +32,9 @@ inputs:
   token:
     description: >-
       mega-gutenberg installation token (contents, pull-requests, workflows
-      write) from repository-scope `RELEASE_APP_CLIENT_ID` and
-      `RELEASE_APP_PRIVATE_KEY`; it pushes the candidate branch, opens the PR
-      (so CI runs) and creates the release branch. The one-reviewer `publish`
+      write) from organization-level `MEGA_GUTENBERG_CLIENT_ID` and
+      `MEGA_GUTENBERG_PK`; it pushes the candidate branch, opens the PR
+      (so CI runs) and creates the release branch. The one-reviewer `release`
       environment gates only tagging, Release creation and artifact upload.
     required: true
   dependency_token:

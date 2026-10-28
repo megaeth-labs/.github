@@ -89,10 +89,12 @@ class MegaRethRender(unittest.TestCase):
                            ("release-settle.yml", ("refresh", "publish"))):
             for job in jobs:
                 if job == "publish":
-                    self.assertEqual(self.doc[name]["jobs"][job]["environment"], "publish", job)
+                    self.assertEqual(self.doc[name]["jobs"][job]["environment"], "release", job)
                 else:
                     self.assertNotIn("environment", self.doc[name]["jobs"][job], job)
                 token = next(s for s in steps(self.doc[name], job) if s.get("id") == "release-token")
+                self.assertEqual(token["with"]["client-id"], "${{ vars.MEGA_GUTENBERG_CLIENT_ID }}", job)
+                self.assertEqual(token["with"]["private-key"], "${{ secrets.MEGA_GUTENBERG_PK }}", job)
                 self.assertEqual(token["with"]["repositories"], "mega-reth", job)
 
     def test_bump_command_reads_dependencies_with_a_read_only_token(self):
@@ -100,6 +102,8 @@ class MegaRethRender(unittest.TestCase):
         ids = [s.get("id") for s in steps(doc, "propose")]
         self.assertLess(ids.index("dependency-token"), len(ids) - 1)
         dependency = steps(doc, "propose")[ids.index("dependency-token")]["with"]
+        self.assertEqual(dependency["client-id"], "${{ vars.MEGA_GUTENBERG_CLIENT_ID }}")
+        self.assertEqual(dependency["private-key"], "${{ secrets.MEGA_GUTENBERG_PK }}")
         self.assertEqual(dependency["repositories"], "rust-rocksdb,pstd,rocksdb")
         self.assertEqual({k for k in dependency if k.startswith("permission-")}, {"permission-contents"})
         self.assertEqual(dependency["permission-contents"], "read")

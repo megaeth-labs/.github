@@ -11,13 +11,13 @@ per-action READMEs linked below.
 |---|---|---|
 | `mega-gutenberg[bot]` (the release app) | Every write of the release: the candidate PR, the `release-vX.Y.Z` branch, the settle PR, the tag, the GitHub Release | Nothing is approved by it; it is not a reviewer |
 | `mega-maxwell[bot]` (the CI app) | Only ever reads, as far as a release is concerned: at most a read-only token for private dependencies | Create a branch, PR, tag or Release of a release; appear as a git identity or PR-author filter in a release workflow |
-| A human reviewer | Reviews and merges the candidate PR and the settle PR; approves the `publish` environment when a dispatch publishes; adds the `compat:` label | - |
+| A human reviewer | Reviews and merges the candidate PR and the settle PR; approves the `release` environment when a dispatch publishes; adds the `compat:` label | - |
 
 The [app-token lint](#app-token-lint) refuses a gutenberg token anywhere
 outside the allowlisted release workflow files (`release-candidate.yml`,
 `release-settle.yml`, `on-release.yml`, `release-publish-*.yml`, rule L2') on
 every workflow change. The publish job runs in the
-`publish` environment; the jobs that propose, cut and settle run without one,
+`release` environment; the jobs that propose, cut and settle run without one,
 and the candidate's `refresh` job mints its token without one too.
 
 ## The four flows
@@ -83,7 +83,7 @@ one-sentence reason in the job log.
    between the two steps) routes to `publish` again and resumes.
 
    Both paths run [`release-publish`](../.github/actions/release-publish/README.md)
-   in the review-gated `publish` environment, so the dispatch path also waits
+   in the review-gated `release` environment, so the dispatch path also waits
    for a human approval. Publish re-reads the PR through the API (the settle PR
    for a push; the candidate PR and the current branch tip for a dispatch,
    checked again right before the tag push), creates the annotated tag `vX.Y.Z`
@@ -103,14 +103,16 @@ one-sentence reason in the job log.
 
 | Environment | Holds | Deployment policy | Reviewers |
 |---|---|---|---|
-| `publish` | `CARGO_REGISTRY_TOKEN`, `GCP_AUTH_KEY` (the publish targets); the release-app credentials, only when a build job needs a read-only gutenberg token for private dependencies | tags `v*` | one, required: a versioned dispatch publishes without a PR, so the environment review is its approval |
+| `release` | `CARGO_REGISTRY_TOKEN`, `GCP_AUTH_KEY` (the publish targets) | default branch, `release-v*` branches and tags `v*` | one, required: a versioned dispatch publishes without a PR, so the environment review is its approval |
+| `snapshot` | `GCP_AUTH_KEY` for snapshot uploads | the branch the workflow is dispatched from | none; outside the release review gate |
 
-`release` is not listed because no template uses it; the name survives only in
-lint rule L5 below. The release-app credentials (`RELEASE_APP_CLIENT_ID`
-variable, `RELEASE_APP_PRIVATE_KEY` secret) resolve at repository scope, so
+`release` is the single gated environment for tagging, Release creation and
+artifact upload; snapshots use `snapshot`. The release-app credentials (`MEGA_GUTENBERG_CLIENT_ID`
+variable, `MEGA_GUTENBERG_PK` secret) resolve at organization scope, with
+the organization secret granted access to each consumer repository, so
 the candidate's `refresh` job mints its token with no environment.
 
-`environment: release`, and `publish` in a release workflow, may appear only in
+`environment: release` may appear only in
 `release-candidate.yml`, `release-settle.yml` and `on-release.yml` (lint rule
 L5).
 
@@ -144,7 +146,7 @@ exists as `dry_run` on [`release-assets`](../.github/actions/release-assets/READ
 and [`release-verify-version`](../.github/actions/release-verify-version/README.md).
 The candidate and settle workflows have no dry-run: the candidate and the
 settle refresh produce PRs, which are themselves the preview, and the publish
-path is gated by the `publish` environment's review instead.
+path is gated by the `release` environment's review instead.
 
 ## Copying a template
 
@@ -246,7 +248,7 @@ Each is reported as `::error file=<path>::<job>/<step>: <rule>: <message>`.
 | L3 | `no Maxwell token in a release workflow; mint a Gutenberg token instead` | Replace the Maxwell token. |
 | L3 | `read-only dependency token names the repository itself (…)` | Remove the repository from `repositories:`; the checkout uses the job token. |
 | L4 | `mega-maxwell[bot] is not a release identity` | Use `mega-gutenberg[bot]` as git identity and PR-author filter. |
-| L5 | ``environment `release` is only for release-candidate.yml, release-settle.yml and on-release.yml`` (or `publish` in place of `release`, in a release workflow) | Move the job, or use a different environment. |
+| L5 | ``environment `release` is only for release-candidate.yml, release-settle.yml and on-release.yml`` | Move the job, or use a different environment. |
 | L6 | `Maxwell token requests no permission-* inputs, so it gets every permission of the installation (contents write included); list the permissions it needs` (also for Gutenberg, and for any app token in a release job) | Add the `permission-<x>:` inputs the job needs. |
 | parse | `malformed YAML …`, `not a workflow: the document is not a mapping`, `no such file or directory`, `no workflow files (*.yml, *.yaml) found` | Fix the input; a file that cannot be read never lints clean. |
 

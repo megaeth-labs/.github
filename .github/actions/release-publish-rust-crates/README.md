@@ -51,7 +51,7 @@ Family: [Release pipeline](../RELEASE.md).
 ## Example
 
 From `workflow-templates/on-release.yml`, in a job under
-`environment: publish`:
+`environment: release`:
 
 ```yaml
 - uses: megaeth-labs/.github/.github/actions/release-publish-rust-crates@main

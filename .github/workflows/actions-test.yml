@@ -1404,8 +1404,8 @@ jobs:
                 - uses: $TOKEN_ACTION # v3
                   id: release-token
                   with:
-                    client-id: RELEASE_APP_CLIENT_ID
-                    private-key: RELEASE_APP_PRIVATE_KEY
+                    client-id: MEGA_GUTENBERG_CLIENT_ID
+                    private-key: MEGA_GUTENBERG_PK
                     permission-contents: write
                 - uses: megaeth-labs/.github/.github/actions/release-settle@main
                   with:
@@ -1419,13 +1419,13 @@ jobs:
           jobs:
             dist-docs:
               runs-on: ubuntu-24.04
-              environment: publish
+              environment: release
               steps:
                 - uses: $TOKEN_ACTION # v3
                   id: release-token
                   with:
-                    client-id: RELEASE_APP_CLIENT_ID
-                    private-key: RELEASE_APP_PRIVATE_KEY
+                    client-id: MEGA_GUTENBERG_CLIENT_ID
+                    private-key: MEGA_GUTENBERG_PK
                     repositories: dist-docs
                     permission-contents: write
                 - run: |
