@@ -9,16 +9,18 @@ name: Release Settle
 #   publish  that settle PR was just merged: create the annotated tag at the
 #            merge commit and the GitHub Release with the changelog section
 #            as notes.
-# Merging the settle PR is the release decision, so nothing waits for a click
-# on the run. To refresh every eligible release branch by hand, dispatch this
-# workflow (optionally with `version` to refresh just one); it never publishes.
+# Merging the settle PR is the release decision on push. Dispatch with `version`
+# to publish a clean release branch through the review-gated `publish`
+# environment, or refresh it when settlement is needed. A blank version
+# refreshes every eligible release branch.
 #
-# Every write is made by the release GitHub App (mega-gutenberg), whose token
-# is minted only in jobs that run in the `release` environment. Create that
-# environment with a deployment policy of the default branch and `release-v*`
-# branches, and no required reviewers. The app is a bypass actor on the `v*`
-# tag ruleset only; the `release-*` branch ruleset still requires the reviewed
-# settle PR. `route` is read-only and uses the job token.
+# Every write is made by the release GitHub App (mega-gutenberg). Store
+# RELEASE_APP_CLIENT_ID as a repository variable and RELEASE_APP_PRIVATE_KEY
+# as a repository secret. Refresh needs no environment. Only publish uses the
+# `publish` environment, with required reviewers and a deployment policy for
+# the default branch, `release-v*` branches and `v*` tags (artifact uploads).
+# The app is a bypass actor on the `v*` tag ruleset only; the `release-*` branch
+# ruleset still requires the reviewed settle PR. `route` uses the job token.
 #
 # This file must exist on the release branch (it does, when the branch is cut
 # from a default branch that has it); a push to the branch runs the copy of
@@ -32,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to refresh (X.Y.Z); blank: every eligible release branch"
+        description: "Version to settle (X.Y.Z); blank: refresh every eligible release branch"
         required: false
         type: string
         default: ""
@@ -49,6 +51,7 @@ jobs:
       pull-requests: read
     outputs:
       action: ${{ steps.route.outputs.action }}
+      settle_source: ${{ steps.route.outputs.settle_source }}
       targets: ${{ steps.route.outputs.targets }}
       release_branch: ${{ steps.route.outputs.release_branch }}
       commit: ${{ steps.route.outputs.commit }}
@@ -80,7 +83,6 @@ jobs:
       group: release-settle-refresh-${{ matrix.target.release_branch }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    environment: release
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: release-token
@@ -110,6 +112,8 @@ jobs:
 
   publish:
     needs: route
+    # Route permits a merged settle PR on push or a clean branch on dispatch;
+    # both publish paths wait for the publish environment's review.
     if: needs.route.outputs.action == 'publish'
     # One publish per release branch: the tag guard and the tag push are two
     # steps, so a re-run must queue behind a run in flight, never overlap it.
@@ -117,7 +121,7 @@ jobs:
       group: release-settle-publish-${{ needs.route.outputs.release_branch }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    environment: release
+    environment: publish
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: release-token
@@ -140,6 +144,8 @@ jobs:
           token: ${{ steps.release-token.outputs.token }}
           commit: ${{ needs.route.outputs.commit }}
           pr_number: ${{ needs.route.outputs.pr_number }}
+          settle_source: ${{ needs.route.outputs.settle_source || 'pr' }}
+          release_branch: ${{ needs.route.outputs.release_branch }}
           version_file: VERSION
           version_pattern: plain
           changelog_file: CHANGELOG.md
