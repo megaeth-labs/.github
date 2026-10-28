@@ -1,33 +1,41 @@
 name: Release Candidate
 description: >-
   Start a release (trunk-first). `stage: propose` bumps the version file on the
-  default branch, drafts this release's changelog entry (dated at settle) from the
+  default branch, drafts this release's undated changelog entry from the
   commits since the previous tag, syncs the previous release's entry from its
-  tag, and opens a `chore/release-candidate-vX.Y.Z` PR; `stage: cut`,
+  tag, and opens a `chore/release-candidate-X.Y.Z` PR. `stage: refresh`
+  merges an open candidate PR's own base into its head and re-drafts the
+  changelog without rewriting history; any push requires renewed approval.
+  `stage: cut`,
   run on the push that merged that PR (the consumer passes the `commit` and
   `pr_number` outputs of `release-route`), re-reads the PR through the API,
   refuses anything but a merged, gutenberg-authored candidate into the default
   branch, and creates `release-vX.Y.Z` at the merge commit (a retry that
   finds it already there is a no-op; at any other commit it refuses). No tag
-  is created at either stage — tags come from release-publish, once, at
+  is created at any stage — tags come from release-publish, once, at
   settlement. `base_commit` releases a commit that is not the tip of the
   default branch: `propose` cuts the release branch there itself, carries the
   default branch's release workflows onto it, and points the candidate PR at
   it; that PR merges into the release branch, so `cut` never runs for it. Run
-  as a step in a job the consumer owns, in `environment: release`; the
-  consumer checks the repository out first (`fetch-depth: 0`,
+  as a step in a job the consumer owns; the repository-scope
+  `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY` provide the app
+  credentials. The one-reviewer `publish` environment gates only tagging,
+  Release creation and artifact upload. The consumer checks the repository
+  out first (`fetch-depth: 0`,
   `persist-credentials: false`).
   Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 
 inputs:
   stage:
-    description: "`propose` (on workflow_dispatch) or `cut` (on the candidate PR merging)."
+    description: "`propose` (on workflow_dispatch), `refresh` (an open candidate), or `cut` (on the candidate PR merging)."
     required: true
   token:
     description: >-
       mega-gutenberg installation token (contents, pull-requests, workflows
-      write) minted in an `environment: release` job; it pushes the candidate
-      branch, opens the PR (so CI runs) and creates the release branch.
+      write) from repository-scope `RELEASE_APP_CLIENT_ID` and
+      `RELEASE_APP_PRIVATE_KEY`; it pushes the candidate branch, opens the PR
+      (so CI runs) and creates the release branch. The one-reviewer `publish`
+      environment gates only tagging, Release creation and artifact upload.
     required: true
   dependency_token:
     description: >-
@@ -59,7 +67,7 @@ inputs:
     required: false
     default: ".github/workflows/release-settle.yml .github/workflows/on-release.yml"
   version:
-    description: "Version to release, X.Y.Z or vX.Y.Z. Required for `propose`."
+    description: "Version to release, X.Y.Z or vX.Y.Z. Required for `propose` and `refresh`."
     required: false
     default: ""
   base_commit:
@@ -113,10 +121,11 @@ inputs:
     default: ""
   pr_author:
     description: >-
-      Login the candidate PR must have been opened by for `cut` to proceed —
+      Login the candidate PR must have been opened by for `cut` or `refresh` to proceed —
       the app identity `propose` runs under. Stops a hand-made
       `chore/release-candidate-*` branch from driving the cut. Empty disables
-      the check.
+      the check for `cut`; `refresh` always requires a bot PR and uses
+      mega-gutenberg[bot] when empty.
     required: false
     default: "mega-gutenberg[bot]"
   git_user_name:
@@ -133,8 +142,8 @@ outputs:
     description: Normalised X.Y.Z.
     value: ${{ steps.version.outputs.version }}
   pr_url:
-    description: "`propose`: URL of the candidate PR."
-    value: ${{ steps.pr.outputs.pr_url }}
+    description: "`propose` or `refresh`: URL of the candidate PR."
+    value: ${{ steps.pr.outputs.pr_url || steps.refresh.outputs.pr_url }}
   release_branch:
     description: "The release branch: created by `cut`, or by `propose` when `base_commit` is set."
     value: ${{ steps.cut.outputs.release_branch || steps.branch.outputs.release_branch }}
@@ -157,7 +166,7 @@ runs:
       run: |
         set -euo pipefail
         case "$STAGE" in
-          propose) raw="$INPUT_VERSION" ;;
+          propose|refresh) raw="$INPUT_VERSION" ;;
           cut)
             if [[ -z "$PR_NUMBER" ]]; then
               echo "::error::cut needs the pr_number input (the release-route output)"; exit 1
@@ -165,7 +174,7 @@ runs:
             head_ref="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["ref"])')"
             raw="${head_ref#chore/release-candidate-}"
             ;;
-          *) echo "::error::stage must be propose or cut, got '$STAGE'"; exit 1 ;;
+          *) echo "::error::stage must be propose, refresh or cut, got '$STAGE'"; exit 1 ;;
         esac
         version="$(python3 "$TOOLS" normalize "$raw")"
         echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -405,8 +414,54 @@ runs:
         git diff --stat
         GITHUB_AUTH_COMMAND
 
+    # Refresh keeps the existing PR and head history, unlike a new proposal.
+    # Validate ownership and the unpublished version before touching the tree.
+    - name: Prepare candidate refresh
+      if: inputs.stage == 'refresh'
+      id: refresh
+      shell: bash
+      env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.version.outputs.version }}
+        EXPECTED_AUTHOR: ${{ inputs.pr_author }}
+      run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
+        set -euo pipefail
+        head="chore/release-candidate-$VERSION"
+        prs="$(gh pr list --head "$head" --state open --json number,isCrossRepository \
+          | python3 -c 'import json,sys; print("\n".join(str(p["number"]) for p in json.load(sys.stdin) if not p.get("isCrossRepository")))')"
+        if [[ -z "$prs" || "$prs" == *$'\n'* ]]; then
+          echo "::error::refresh needs exactly one open candidate PR for v$VERSION"; exit 1
+        fi
+        pr_json="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$prs")"
+        pr_field() { python3 -c 'import functools,json,sys; v=functools.reduce(lambda d,k: d.get(k) if isinstance(d,dict) else None, sys.argv[1].split("."), json.load(sys.stdin)); print("" if v is None else v)' "$1" <<< "$pr_json"; }
+        author="${EXPECTED_AUTHOR:-mega-gutenberg[bot]}"
+        if [[ "$(pr_field state)" != "open" || "$(pr_field head.ref)" != "$head" \
+          || "$(pr_field head.repo.full_name)" != "$GITHUB_REPOSITORY" \
+          || "$(pr_field user.login)" != "$author" || "$(pr_field user.type)" != "Bot" ]]; then
+          echo "::error::refresh requires an open, app-authored candidate PR from this repository ($author)"; exit 1
+        fi
+        if [[ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION")" ]]; then
+          echo "::error::tag v$VERSION already exists; refusing to refresh a published version"; exit 1
+        fi
+        base="$(pr_field base.ref)"
+        git fetch --quiet --tags origin \
+          "refs/heads/$head:refs/remotes/origin/$head" \
+          "refs/heads/$base:refs/remotes/origin/$base"
+        original="$(git rev-parse "origin/$head")"
+        git checkout --quiet --detach "$original"
+        git merge "origin/$base" --no-edit
+        {
+          echo "head=$head"
+          echo "original=$original"
+          echo "pr_url=$(pr_field html_url)"
+        } >> "$GITHUB_OUTPUT"
+        GITHUB_AUTH_COMMAND
+
     - name: Draft changelog
-      if: inputs.stage == 'propose' && inputs.changelog_file != '' && steps.bump.outputs.skipped != 'true'
+      if: inputs.changelog_file != '' && (inputs.stage == 'refresh' || (inputs.stage == 'propose' && steps.bump.outputs.skipped != 'true'))
       id: changelog
       shell: bash
       env:
@@ -416,15 +471,14 @@ runs:
       run: |
         set -euo pipefail
         latest="$(git tag -l 'v*' | python3 "$TOOLS" latest-tag)"
-        # 1. Sync the previous release's entry from its tag. Settle stamped
-        #    the date (and any drift) on the release branch and nothing
-        #    back-merges it: this PR is where the default branch catches up.
+        # 1. Sync the previous release's entry verbatim from its tag:
+        #    this PR is where the default branch catches up.
         synced="none"
         if [[ -n "$latest" ]] && git show "$latest:$CHANGELOG" > "$RUNNER_TEMP/changelog-$latest.md" 2>/dev/null; then
           synced="$(python3 "$TOOLS" changelog-copy "$RUNNER_TEMP/changelog-$latest.md" "$CHANGELOG" "$latest")"
         fi
         # 2. Draft this release's entry from the commits since that tag. The
-        #    heading carries the version only; settle stamps the date.
+        #    heading carries the version only and remains undated.
         range="HEAD"
         [[ -n "$latest" ]] && range="$latest..HEAD"
         notes="$RUNNER_TEMP/release-notes-v$VERSION.md"
@@ -437,6 +491,33 @@ runs:
         } >> "$GITHUB_OUTPUT"
         echo "changelog: previous entry ${latest:-<none>} $synced; v$VERSION entry $drafted"
         git diff --stat
+
+    - name: Push candidate refresh
+      if: inputs.stage == 'refresh'
+      shell: bash
+      env:
+        AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
+        GITHUB_AUTH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.version.outputs.version }}
+        CHANGELOG: ${{ inputs.changelog_file }}
+        HEAD_REF: ${{ steps.refresh.outputs.head }}
+        ORIGINAL: ${{ steps.refresh.outputs.original }}
+      run: |
+        "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
+        set -euo pipefail
+        if [[ -n "$CHANGELOG" ]]; then
+          git add -- "$CHANGELOG"
+          if ! git diff --cached --quiet; then
+            git commit --quiet -m "chore(release): refresh candidate v$VERSION"
+          fi
+        fi
+        if [[ "$(git rev-parse HEAD)" != "$ORIGINAL" ]]; then
+          git push --quiet origin "HEAD:refs/heads/$HEAD_REF"
+          echo "refreshed $HEAD_REF; the candidate PR must be re-approved after this push"
+        else
+          echo "candidate v$VERSION is already current; nothing pushed"
+        fi
+        GITHUB_AUTH_COMMAND
 
     # The candidate branch is never rewritten. A re-dispatch supersedes the
     # open candidate instead: it closes that PR with a comment, deletes the
@@ -554,8 +635,10 @@ runs:
             echo
             echo "It creates **no tag**; the tag is cut once, at settlement, by \`release-settle\` → \`release-publish\`."
             echo
-            echo "Changelog: this release's entry drafted under \`## v$VERSION\` (settle stamps the date on the release branch);"
+            echo "Changelog: this release's entry is undated under \`## v$VERSION\`; the GitHub Release body is the file's section verbatim."
             echo "previous release's entry synced from its tag: $SYNCED."
+            echo
+            echo "A refresh pushes a commit and therefore clears approvals under \`require_last_push_approval\`, so the merge must be re-approved afterwards."
             echo
             echo "<!-- release-candidate: v$VERSION -->"
           } > "$body"
