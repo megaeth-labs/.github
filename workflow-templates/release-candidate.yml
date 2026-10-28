@@ -13,8 +13,9 @@ name: Release Candidate
 # `route` never selects `cut` for it.
 #
 # Every write is made by the release GitHub App (mega-gutenberg). Store
-# RELEASE_APP_CLIENT_ID as a repository variable and RELEASE_APP_PRIVATE_KEY
-# as a repository secret. Branch and PR jobs need no environment; tagging and
+# MEGA_GUTENBERG_CLIENT_ID as an organization variable and MEGA_GUTENBERG_PK
+# as an organization secret with access granted to this repository.
+# Branch and PR jobs need no environment; tagging and
 # publishing are review-gated in release-settle. `route` is read-only and uses
 # the job token.
 #
@@ -54,8 +55,8 @@ jobs:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: release-token
         with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.MEGA_GUTENBERG_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_GUTENBERG_PK }}
           owner: megaeth-labs
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
@@ -135,8 +136,8 @@ jobs:
         if: steps.candidate.outputs.version != ''
         id: release-token
         with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.MEGA_GUTENBERG_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_GUTENBERG_PK }}
           owner: megaeth-labs
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
@@ -199,8 +200,8 @@ jobs:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: release-token
         with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.MEGA_GUTENBERG_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_GUTENBERG_PK }}
           owner: megaeth-labs
           repositories: ${{ github.event.repository.name }}
           permission-contents: write

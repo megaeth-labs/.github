@@ -34,9 +34,13 @@ that can run without a repository, and the documentation check.
 Two GitHub Apps mint tokens through `actions/create-github-app-token`.
 Maxwell is the CI app (`vars.MEGA_MAXWELL_CLIENT_ID`, `secrets.MEGA_MAXWELL_PK`):
 it may write only pull requests and issues and never touches a release.
-Gutenberg is the release app (`vars.RELEASE_APP_CLIENT_ID`,
-`secrets.RELEASE_APP_PRIVATE_KEY`), minted only in a job of the `release`
-environment, where every write of a release is made. The
+Gutenberg is the release app (`vars.MEGA_GUTENBERG_CLIENT_ID`,
+`secrets.MEGA_GUTENBERG_PK`), from an organization variable and secret
+with access granted to each consumer repository. It is minted only in
+`release-candidate.yml`, `release-settle.yml` or `on-release.yml`; branch
+and PR jobs declare no environment, while tagging, Release creation and
+artifact upload use the review-gated `release` environment. Snapshots use
+`snapshot`, outside that gate. The
 [`app-token-lint`](.github/actions/app-token-lint/README.md) action enforces
 this on every workflow change (rules L1-L6, listed with their messages in the
 [runbook](docs/RELEASING.md#app-token-lint-errors)); run it locally with

@@ -6,7 +6,7 @@ The org has two GitHub Apps that mint tokens through actions/create-github-app-t
   Maxwell    CI app (vars.MEGA_MAXWELL_CLIENT_ID / secrets.MEGA_MAXWELL_PK, older
              names CI_APP_ID / MEGA_CI_APP_PK). Its commits and PRs are what
              automation shows as `mega-maxwell[bot]`; it never touches a release.
-  Gutenberg  Release app (vars.RELEASE_APP_CLIENT_ID / secrets.RELEASE_APP_PRIVATE_KEY),
+  Gutenberg  Release app (vars.MEGA_GUTENBERG_CLIENT_ID / secrets.MEGA_GUTENBERG_PK),
              only usable from an allowlisted release workflow file.
 
 Rules, each reported as `::error file=<path>::<job>/<step>: <rule>: <message>`:
@@ -21,7 +21,7 @@ Rules, each reported as `::error file=<path>::<job>/<step>: <rule>: <message>`:
       dependency token's `repositories:` must not name the repository itself.
   L4  A release workflow may not use `mega-maxwell[bot]` as a git identity or a
       PR author filter.
-  L5  `environment: release`, and `publish` in a release workflow, may appear
+  L5  `environment: release` may appear
       only in release-candidate.yml, release-settle.yml and on-release.yml.
   L6  A Maxwell or Gutenberg token, and any app token in a release workflow or
       a `release`-environment job, must request at least one `permission-<x>`:
@@ -49,7 +49,7 @@ import yaml
 
 TOKEN_ACTION = "actions/create-github-app-token@"
 MAXWELL_MARKERS = ("MEGA_MAXWELL_", "CI_APP_ID", "MEGA_CI_APP_PK")
-GUTENBERG_MARKER = "RELEASE_APP_"
+GUTENBERG_MARKER = "MEGA_GUTENBERG_"
 MAXWELL_WRITABLE = {"permission-pull-requests", "permission-issues"}
 RELEASE_USES = re.compile(r"megaeth-labs/\.github/\.github/actions/release-(candidate|settle|publish|route)")
 ON_RELEASE = "on-release"
@@ -132,7 +132,7 @@ def is_release_workflow(path: str, doc: dict) -> bool:
 def lint_job(job_id: str, job: dict, filename: str, release: bool, repo: str | None) -> list[Violation]:
     found: list[Violation] = []
     environment = environment_name(job)
-    if (environment == "release" or (release and environment == "publish")) and filename not in RELEASE_WORKFLOW_FILES:
+    if environment == "release" and filename not in RELEASE_WORKFLOW_FILES:
         found.append((job_id, "-", "L5", f"environment `{environment}` is only for {', '.join(sorted(RELEASE_WORKFLOW_FILES))}"))
     if release and mentions_maxwell_identity({k: v for k, v in job.items() if k != "steps"}):
         found.append((job_id, "-", "L4", f"{MAXWELL_IDENTITY} is not a release identity"))

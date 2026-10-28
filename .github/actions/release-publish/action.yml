@@ -30,10 +30,10 @@ description: >-
 inputs:
   token:
     description: >-
-      mega-gutenberg installation token from repository-scope
-      `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY`; gutenberg is the
+      mega-gutenberg installation token from organization-level
+      `MEGA_GUTENBERG_CLIENT_ID` and `MEGA_GUTENBERG_PK`; gutenberg is the
       bypass actor on the `v*` tag ruleset, and a Release it creates fires
-      `release: published` workflows. The one-reviewer `publish` environment
+      `release: published` workflows. The one-reviewer `release` environment
       gates only tagging, Release creation and artifact upload.
     required: true
   version_file:

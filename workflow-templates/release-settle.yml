@@ -10,14 +10,15 @@ name: Release Settle
 #            merge commit and the GitHub Release with the changelog section
 #            as notes.
 # Merging the settle PR is the release decision on push. Dispatch with `version`
-# to publish a clean release branch through the review-gated `publish`
+# to publish a clean release branch through the review-gated `release`
 # environment, or refresh it when settlement is needed. A blank version
 # refreshes every eligible release branch.
 #
 # Every write is made by the release GitHub App (mega-gutenberg). Store
-# RELEASE_APP_CLIENT_ID as a repository variable and RELEASE_APP_PRIVATE_KEY
-# as a repository secret. Refresh needs no environment. Only publish uses the
-# `publish` environment, with required reviewers and a deployment policy for
+# MEGA_GUTENBERG_CLIENT_ID as an organization variable and MEGA_GUTENBERG_PK
+# as an organization secret with access granted to this repository.
+# Refresh needs no environment. Only publish uses the
+# `release` environment, with required reviewers and a deployment policy for
 # the default branch, `release-v*` branches and `v*` tags (artifact uploads).
 # The app is a bypass actor on the `v*` tag ruleset only; the `release-*` branch
 # ruleset still requires the reviewed settle PR. `route` uses the job token.
@@ -87,8 +88,8 @@ jobs:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: release-token
         with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.MEGA_GUTENBERG_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_GUTENBERG_PK }}
           owner: megaeth-labs
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
@@ -113,7 +114,7 @@ jobs:
   publish:
     needs: route
     # Route permits a merged settle PR on push or a clean branch on dispatch;
-    # both publish paths wait for the publish environment's review.
+    # both publish paths wait for the release environment's review.
     if: needs.route.outputs.action == 'publish'
     # One publish per release branch: the tag guard and the tag push are two
     # steps, so a re-run must queue behind a run in flight, never overlap it.
@@ -121,13 +122,13 @@ jobs:
       group: release-settle-publish-${{ needs.route.outputs.release_branch }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    environment: publish
+    environment: release
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: release-token
         with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.MEGA_GUTENBERG_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_GUTENBERG_PK }}
           owner: megaeth-labs
           repositories: ${{ github.event.repository.name }}
           permission-contents: write

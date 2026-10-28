@@ -69,7 +69,7 @@ Family: [Release pipeline](../RELEASE.md).
 
 As used by `workflow-templates/release-settle.yml`. The refresh job needs no
 environment; the publish job that tags and creates the Release declares
-`environment: publish`, whose required reviewers authorise the tag:
+`environment: release`, whose required reviewers authorise the tag:
 
 ```yaml
 - uses: megaeth-labs/.github/.github/actions/release-settle@main
@@ -105,7 +105,7 @@ template's publish job on a clean dispatch or on the settle PR's merge.
   event runs `on-release.yml` from the tag's tree).
 - This action never tags and never creates a Release: it maintains
   `chore/release-settle-vX.Y.Z` only. `release-publish` does the tagging, run
-  by the template's publish job on a clean dispatch (where the `publish`
+  by the template's publish job on a clean dispatch (where the `release`
   environment's required reviewers are the gate) or on the settle PR's merge.
 - `pr`: pushes `chore/release-settle-vX.Y.Z` and opens the settle PR,
   titled `chore(release): settle vX.Y.Z — merging publishes the release`.

@@ -17,7 +17,7 @@ TOKEN_ACTION = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da
 APPS = {
     "maxwell": ("${{ vars.MEGA_MAXWELL_CLIENT_ID }}", "${{ secrets.MEGA_MAXWELL_PK }}"),
     "legacy": ("${{ secrets.CI_APP_ID }}", "${{ secrets.MEGA_CI_APP_PK }}"),
-    "gutenberg": ("${{ vars.RELEASE_APP_CLIENT_ID }}", "${{ secrets.RELEASE_APP_PRIVATE_KEY }}"),
+    "gutenberg": ("${{ vars.MEGA_GUTENBERG_CLIENT_ID }}", "${{ secrets.MEGA_GUTENBERG_PK }}"),
     "other": ("${{ vars.SOMETHING_ELSE_ID }}", "${{ secrets.SOMETHING_ELSE_KEY }}"),
 }
 LINE = re.compile(r"^::error file=(?P<file>[^:]*)::(?P<job>[^/]+)/(?P<step>.+?): (?P<rule>L\d+'?|parse|input): ")
@@ -121,8 +121,8 @@ class L2GutenbergFileAllowlist(unittest.TestCase):
         text = workflow(job(app="gutenberg", environment="{ name: release }", permissions=self.WRITE))
         self.assertEqual(lint("release-settle.yml", text), [])
 
-    def test_publish_environment_with_only_contents_read_passes(self):
-        text = workflow(job(app="gutenberg", environment="publish", permissions={"contents": "read"}, repositories=["rust-rocksdb"]))
+    def test_release_environment_with_only_contents_read_passes(self):
+        text = workflow(job(app="gutenberg", environment="release", permissions={"contents": "read"}, repositories=["rust-rocksdb"]))
         self.assertEqual(lint("on-release.yml", text), [])
 
     def test_contents_write_without_environment_in_allowed_files_passes(self):
@@ -145,6 +145,10 @@ class L2GutenbergFileAllowlist(unittest.TestCase):
         text = workflow(job(app="gutenberg", environment="staging", permissions=self.WRITE))
         self.assertEqual(lint("release-candidate.yml", text), [])
 
+    def test_other_mega_app_is_not_gutenberg(self):
+        text = workflow(job(app="other", permissions=self.WRITE)).replace("SOMETHING_ELSE", "MEGA_OTHER")
+        self.assertEqual(lint("ci.yml", text), [])
+
     def test_similar_filenames_are_not_allowlisted(self):
         text = workflow(job(app="gutenberg", permissions=self.WRITE))
         for name in ("release-candidate.yaml", "release-publish.yml", "release-publish-x.yaml",
@@ -158,12 +162,12 @@ class L2GutenbergFileAllowlist(unittest.TestCase):
             "on: push", "on: workflow_dispatch")
         self.assertEqual(rules(lint("release-publish-anything.yml", text)), [("L2'", "build")])
 
-    def test_publish_environment_with_write_passes(self):
-        text = workflow(job(app="gutenberg", environment="publish", permissions={"contents": "write"}))
+    def test_release_environment_with_write_passes(self):
+        text = workflow(job(app="gutenberg", environment="release", permissions={"contents": "write"}))
         self.assertEqual(lint("on-release.yml", text), [])
 
-    def test_publish_environment_with_more_than_contents_read_passes(self):
-        text = workflow(job(app="gutenberg", environment="publish", permissions={"contents": "read", "pull-requests": "read"}))
+    def test_release_environment_with_more_than_contents_read_passes(self):
+        text = workflow(job(app="gutenberg", environment="release", permissions={"contents": "read", "pull-requests": "read"}))
         self.assertEqual(lint("on-release.yml", text), [])
 
 
@@ -235,7 +239,7 @@ class L5ReleaseEnvironment(unittest.TestCase):
         self.assertEqual(rules(lint("release-publish.yml", text)), [("L5", "build")])
 
     def test_gated_environments_and_gutenberg_share_exact_file_allowlist(self):
-        for environment in ("release", "{ name: release }", "publish", "{ name: publish }"):
+        for environment in ("release", "{ name: release }"):
             text = workflow(job(app="gutenberg", environment=environment,
                                 permissions={"contents": "write"}, release_step=True)).replace(
                 "/release-settle@main", "/release-publish-rust-crates@main")
@@ -247,8 +251,7 @@ class L5ReleaseEnvironment(unittest.TestCase):
                 with self.subTest(environment=environment, name=name):
                     lines = lint(name, text)
                     self.assertEqual(rules(lines), [("L5", "build"), ("L2'", "build")])
-                    self.assertIn(f"environment `{ 'publish' if 'publish' in environment else 'release' }`",
-                                  lines[0])
+                    self.assertIn("environment `release`", lines[0])
 
     def test_release_environment_in_the_three_allowed_files_passes(self):
         text = workflow(job(app=None, environment="release"))
@@ -256,15 +259,15 @@ class L5ReleaseEnvironment(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(lint(name, text), [])
 
-    def test_publish_environment_in_the_three_allowed_files_passes(self):
-        for environment in ("publish", "{ name: publish }"):
+    def test_release_environment_in_release_workflows_passes(self):
+        for environment in ("release", "{ name: release }"):
             text = workflow(job(app=None, environment=environment, release_step=True))
             for name in ("release-candidate.yml", "release-settle.yml", "on-release.yml"):
                 with self.subTest(environment=environment, name=name):
                     self.assertEqual(lint(name, text), [])
 
-    def test_publish_environment_in_other_release_workflows_fails(self):
-        for environment in ("publish", "{ name: publish }"):
+    def test_release_environment_in_other_release_workflows_fails(self):
+        for environment in ("release", "{ name: release }"):
             text = workflow(job(app=None, environment=environment, release_step=True))
             for name in ("ci.yml", "release-publish-binaries.yml"):
                 with self.subTest(environment=environment, name=name):
@@ -273,8 +276,8 @@ class L5ReleaseEnvironment(unittest.TestCase):
     def test_other_environments_are_free(self):
         self.assertEqual(lint("ci.yml", workflow(job(app=None, environment="staging"))), [])
 
-    def test_publish_environment_outside_release_workflows_is_free(self):
-        self.assertEqual(lint("snapshot-publish.yml", workflow(job(app=None, environment="publish"))), [])
+    def test_snapshot_environment_outside_release_workflows_is_free(self):
+        self.assertEqual(lint("snapshot-publish.yml", workflow(job(app=None, environment="snapshot"))), [])
 
 
 class MalformedInput(unittest.TestCase):

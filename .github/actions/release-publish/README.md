@@ -13,7 +13,7 @@ Family: [Release pipeline](../RELEASE.md).
 <!-- generated: inputs -->
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `token` | yes |  | mega-gutenberg installation token from repository-scope `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY`; gutenberg is the bypass actor on the `v*` tag ruleset, and a Release it creates fires `release: published` workflows. The one-reviewer `publish` environment gates only tagging, Release creation and artifact upload. |
+| `token` | yes |  | mega-gutenberg installation token from organization-level `MEGA_GUTENBERG_CLIENT_ID` and `MEGA_GUTENBERG_PK`; gutenberg is the bypass actor on the `v*` tag ruleset, and a Release it creates fires `release: published` workflows. The one-reviewer `release` environment gates only tagging, Release creation and artifact upload. |
 | `version_file` | yes |  | File holding the version (VERSION, Cargo.toml, pyproject.toml, package.json); the same value as in release-candidate. |
 | `version_pattern` | no | `plain` | How the version is stored in `version_file`: plain, toml or json. |
 | `changelog_file` | no | `CHANGELOG.md` | Changelog the entry is written to (Keep-a-Changelog style, newest first). |

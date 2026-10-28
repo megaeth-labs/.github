@@ -8,13 +8,12 @@ name: Snapshot Publish
 #   gh workflow run snapshot-publish.yml --ref main -f ref=<sha>    # an older commit on main
 #   … -f dry_run=true                                               # rehearse: build, upload nothing
 #
-# What gets built is `ref` if given, else the run's own commit. The `publish`
+# What gets built is `ref` if given, else the run's own commit. The `snapshot`
 # environment authorises the *dispatch* ref (the branch the workflow ran
 # from), so its deployment branch policy must list that branch; the
 # `allowed_branches` guard below is what stops a dispatch from publishing a
-# commit that never landed on it. A repository that also runs the tagged
-# release pipeline can keep `publish` for tags only and give snapshots their
-# own environment (`snapshot`, same GCP secret, branch policy `main`).
+# commit that never landed on it. Snapshots use their own environment,
+# outside the human review gate (`snapshot`, GCP secret, branch policy `main`).
 #
 # The registry layout is what the tagged pipeline produces, with `latest` in
 # place of the tag: `<package>/<commit>/<profile>/latest/<file>`. A rerun on
@@ -58,7 +57,7 @@ env:
 jobs:
   binary:
     runs-on: ubuntu-latest
-    environment: publish
+    environment: snapshot
     permissions:
       contents: read
       statuses: write # release-snapshot record_status; drop with it

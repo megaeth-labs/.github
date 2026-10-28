@@ -61,7 +61,7 @@ The choices that shape it:
   that PR publishes. When the branch is exactly the candidate merge, with no
   fixes on top and no settle PR open, a maintainer can instead dispatch
   `release-settle.yml` with the version: the clean state routes straight to
-  `publish`, and the run waits for a required reviewer of the `publish`
+  `publish`, and the run waits for a required reviewer of the `release`
   environment. That approval stands in for the PR.
 - **Settlement is a state, not a mode.** For a versioned dispatch,
   `release-route` reads the repository (the candidate PR's merge commit,
@@ -84,11 +84,11 @@ The choices that shape it:
   the job. Its PRs trigger CI (a `GITHUB_TOKEN` push would not), the tag
   ruleset makes it the only tag creator, and publish refuses PRs the app did
   not open.
-- **Credentials are repository-scope; one environment gates the writes.**
-  The app credentials are a repository variable (`RELEASE_APP_CLIENT_ID`)
-  and a repository secret (`RELEASE_APP_PRIVATE_KEY`), so the branch and PR
+- **Credentials are organization-level; one environment gates the writes.**
+  The app credentials are an organization variable (`MEGA_GUTENBERG_CLIENT_ID`)
+  and an organization secret (`MEGA_GUTENBERG_PK`) granted to each consumer, so the branch and PR
   jobs mint tokens with no environment at all. Only the jobs that tag,
-  create the Release or upload artifacts run in the `publish` environment,
+  create the Release or upload release artifacts run in the `release` environment,
   which has required reviewers and a deployment policy of the default
   branch, `release-v*` branches and `v*` tags. The publish-target
   credentials (`CARGO_REGISTRY_TOKEN`, `GCP_AUTH_KEY`, whatever the targets
@@ -179,7 +179,7 @@ to the branch refreshes the same PR.
   A blank `version` refreshes every eligible release branch and never
   publishes.
 
-Both ways run the same publish job in the `publish` environment, so both
+Both ways run the same publish job in the `release` environment, so both
 wait for a required reviewer under "Review deployments" on the run page.
 After the approval, the job re-verifies the PR (for a dispatch, the merged
 candidate PR, and that the release branch still points at the commit,
@@ -253,9 +253,10 @@ installed on it (organisation settings, GitHub Apps, mega-gutenberg,
 repository access). Nothing here can check that for you; a missing
 installation shows up as the token step failing in the first run.
 
-**2. Repository variable and secret.** The workflows mint the app token from
-the repository variable `RELEASE_APP_CLIENT_ID` and the repository secret
-`RELEASE_APP_PRIVATE_KEY`. Repository scope, not an environment: the
+**2. Organization variable and secret.** The workflows mint the app token from
+the organization variable `MEGA_GUTENBERG_CLIENT_ID` and the organization secret
+`MEGA_GUTENBERG_PK`. Grant the organization secret access to each consumer
+repository, and make the variable available to it. Organization scope, not an environment: the
 candidate and settle branch jobs mint tokens with no environment, so the
 credentials must resolve outside one.
 
@@ -289,7 +290,9 @@ done
 `RepositoryRole` actor `5` is the admin role; the `Integration` actor is the
 app's id.
 
-**4. The `publish` environment.** Required reviewers: the maintainers who
+**4. The `release` environment.** The single gated environment for tagging,
+Release creation and artifact upload; snapshots use `snapshot` instead,
+outside the human review gate. Required reviewers: the maintainers who
 may approve a release. A versioned dispatch publishes without a PR, so this
 review is its approval. Deployment policy: the default branch, `release-v*`
 branches and `v*` tags. The settle publish job runs on the first two, the
@@ -302,14 +305,14 @@ a branch build could read it.
 
 ```sh
 uid=$(gh api users/LOGIN -q .id)
-gh api -X PUT repos/OWNER/REPO/environments/publish --input - <<JSON
+gh api -X PUT repos/OWNER/REPO/environments/release --input - <<JSON
 {"wait_timer": 0, "prevent_self_review": false,
  "reviewers": [{"type": "User", "id": $uid}],
  "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
 JSON
-gh api -X POST repos/OWNER/REPO/environments/publish/deployment-branch-policies -f name=main -f type=branch
-gh api -X POST repos/OWNER/REPO/environments/publish/deployment-branch-policies -f name='release-v*' -f type=branch
-gh api -X POST repos/OWNER/REPO/environments/publish/deployment-branch-policies -f name='v*' -f type=tag
+gh api -X POST repos/OWNER/REPO/environments/release/deployment-branch-policies -f name=main -f type=branch
+gh api -X POST repos/OWNER/REPO/environments/release/deployment-branch-policies -f name='release-v*' -f type=branch
+gh api -X POST repos/OWNER/REPO/environments/release/deployment-branch-policies -f name='v*' -f type=tag
 ```
 
 **5. The workflows.** Stamp `release-candidate.yml`, `release-settle.yml`
@@ -385,9 +388,9 @@ The Release's `published` event runs the repository's `on-release.yml`. What
 every one of them carries, and why (the template has all of it):
 
 - `TAG: ${{ github.ref_name }}` and a `Require a tag ref` first step in each
-  job, never a tag input: the `publish` environment authorises the run's
+  job, never a tag input: the `release` environment authorises the run's
   ref, so that ref is the only thing the run may build and publish.
-- `environment: publish` on every job that reads a publish credential.
+- `environment: release` on every job that reads a release publish credential.
 - A workflow-level `concurrency` group keyed on `github.ref`,
   `cancel-in-progress: false`: uploads must not overlap and must not be
   cancelled mid-flight.
@@ -442,11 +445,10 @@ bookended by `release-snapshot`:
    `snapshot/<package>` commit status linking back to the run.
 
 Install: copy the template, replace the build steps and destinations, and
-put the GCP secret in an environment whose deployment policy allows the
+put the GCP secret in the `snapshot` environment whose deployment policy allows the
 branch the workflow is dispatched from. The environment authorises the
-dispatch ref; `allowed_branches` guards the commit actually built. A
-repository that also runs the tagged pipeline can share `publish` when its
-policy lists that branch, or give snapshots their own environment. Nothing
+dispatch ref; `allowed_branches` guards the commit actually built. Snapshots
+stay outside the `release` environment's human review gate. Nothing
 else is needed: no version file, no changelog, no rulesets, no app.
 
 ## Operations and recovery
@@ -507,8 +509,8 @@ workflow file differs from the default branch's. It is not a required check;
 merge, and the reviewer works again from the merged file.
 
 **The app cannot push, tag, or read the credentials**: check, in this order,
-that the app is installed on the repository, that the repository variable
-and secret exist (the branch jobs have no environment to fall back on), and
+that the app is installed on the repository, that the organization variable
+and secret are available to it (the branch jobs have no environment to fall back on), and
 that the app is a bypass actor on the `v*` tag ruleset.
 
 ## Reference
@@ -542,9 +544,9 @@ actions at `@main`: a merge here reaches every repository at once, and that
 workflow is the gate.
 
 Requirements on the consumer's side, in one list: the app installed; the
-repository variable `RELEASE_APP_CLIENT_ID` and secret
-`RELEASE_APP_PRIVATE_KEY`; the two rulesets, with the app as bypass actor on
-the tag ruleset only; the `publish` environment with its reviewers and
+organization variable `MEGA_GUTENBERG_CLIENT_ID` and secret
+`MEGA_GUTENBERG_PK` with access granted to the repository; the two rulesets, with the app as bypass actor on
+the tag ruleset only; the `release` environment with its reviewers and
 deployment policies; `gh` and `python3` on the runner (any GitHub-hosted
 image); `release-candidate.yml` and `release-settle.yml` with the same
 `version_file`/`version_pattern`/`changelog_file` in each; a `CHANGELOG.md`.
