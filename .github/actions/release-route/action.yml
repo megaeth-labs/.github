@@ -29,11 +29,14 @@ inputs:
 
 outputs:
   action:
-    description: "Next action: cut, refresh, publish or skip."
+    description: "Next action: cut, refresh, publish or skip; versioned settle dispatch returns publish, refresh or skip."
     value: ${{ steps.route.outputs.action }}
   reason:
     description: "Why this action was selected."
     value: ${{ steps.route.outputs.reason }}
+  settle_source:
+    description: "Publication source: dispatch for a versioned settle dispatch routed to publish; empty otherwise."
+    value: ${{ steps.route.outputs.settle_source }}
   version:
     description: "Normalized release version, when routing one push."
     value: ${{ steps.route.outputs.version }}
@@ -44,7 +47,7 @@ outputs:
     description: "Pushed commit for cut, refresh or publish."
     value: ${{ steps.route.outputs.commit }}
   pr_number:
-    description: "Merged release PR number, when matched."
+    description: "Merged release PR number, or candidate PR number for a versioned settle dispatch, when provided."
     value: ${{ steps.route.outputs.pr_number }}
   targets:
     description: "Compact JSON array of refresh targets."
@@ -138,7 +141,7 @@ runs:
                 jq -ce 'if type != "array" then error("pr list must return an array") else
                   map({number, merge_commit_sha: .mergeCommit.oid, merged_at: .mergedAt,
                     head: {ref: .headRefName}, base: {ref: .baseRefName},
-                    user: {login: .author.login}, body}) end')"
+                    user: {login: (if ((.author.login // "") | startswith("app/")) then (.author.login[4:] + "[bot]") else (.author.login // "") end)}, body}) end')"
             fi
           fi
         elif [[ "$KIND" == settle && "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
@@ -150,11 +153,48 @@ runs:
               echo "::notice title=Release route::skipping $branch: not $PREFIX<X.Y.Z>"; continue
             fi
             git fetch --quiet origin "$tip"
-            tagged=false; actual=""
-            if has_tag "v$version"; then tagged=true; else read_version "$tip" "$branch"; fi
+            tagged=false; branch_release_exists=false; actual=""
+            if has_tag "v$version"; then
+              tagged=true
+              if gh release view "v$version" --json tagName >/dev/null 2>&1; then branch_release_exists=true; fi
+            else
+              read_version "$tip" "$branch"
+            fi
+            candidate_merge_sha=""; candidate_is_ancestor='""'; candidate_pr_number=""
+            open_settle_pr=false; published_tag_sha=""
+            if [[ -n "$DISPATCH_VERSION" ]]; then
+              candidate_pr="$(gh pr list --state merged \
+                --head "chore/release-candidate-$version" \
+                --json number,mergeCommit,headRefName,baseRefName,author |
+                jq -r --arg default "$default" --arg branch "$branch" \
+                  '[.[] | select(.baseRefName == $default or .baseRefName == $branch)][0] // {}')"
+              candidate_merge_sha="$(jq -r '.mergeCommit.oid // ""' <<< "$candidate_pr")"
+              candidate_pr_number="$(jq -r '.number // ""' <<< "$candidate_pr")"
+              if [[ -n "$candidate_merge_sha" ]]; then
+                candidate_is_ancestor=false
+                if git merge-base --is-ancestor "$candidate_merge_sha" "$tip"; then
+                  candidate_is_ancestor=true
+                fi
+              fi
+              open_settle_pr="$(gh pr list --state open \
+                --head "chore/release-settle-v$version" --json number |
+                jq -c 'length > 0')"
+              if [[ "$tagged" == true ]]; then
+                published_tag_sha="$(git ls-remote origin "refs/tags/v$version^{}" | cut -f1)"
+                if [[ -z "$published_tag_sha" ]]; then
+                  published_tag_sha="$(git ls-remote origin "refs/tags/v$version" | cut -f1)"
+                fi
+              fi
+            fi
             branches="$(jq -c --arg name "$branch" --arg tip "$tip" --arg actual "$actual" \
-              --argjson tagged "$tagged" \
-              '. + [{name: $name, tip: $tip, version_at_tip: (if $actual == "" then null else $actual end), tag_exists: $tagged}]' <<< "$branches")"
+              --argjson tagged "$tagged" --argjson release_exists "$branch_release_exists" \
+              --arg candidate_pr_number "$candidate_pr_number" \
+              --arg candidate_merge_sha "$candidate_merge_sha" --argjson candidate_is_ancestor "$candidate_is_ancestor" \
+              --argjson open_settle_pr "$open_settle_pr" --arg published_tag_sha "$published_tag_sha" \
+              '. + [{name: $name, tip: $tip, version_at_tip: (if $actual == "" then null else $actual end), tag_exists: $tagged,
+                release_exists: $release_exists, candidate_pr_number: $candidate_pr_number,
+                candidate_merge_sha: $candidate_merge_sha, candidate_is_ancestor: $candidate_is_ancestor,
+                open_settle_pr: $open_settle_pr, published_tag_sha: $published_tag_sha}]' <<< "$branches")"
           done <<< "$heads"
         fi
         if ! decision="$(jq -n --arg kind "$KIND" --arg event "$GITHUB_EVENT_NAME" \
@@ -174,6 +214,7 @@ runs:
           exit 1
         fi
         # Multiline output framing also keeps API-supplied reasons from becoming output keys.
+        # On dispatch, route() maps candidate_pr_number to pr_number for GITHUB_OUTPUT below.
         while read -r key; do
           delimiter="route_$(openssl rand -hex 16)"
           {
