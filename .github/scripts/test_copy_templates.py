@@ -81,13 +81,17 @@ class MegaRethRender(unittest.TestCase):
                     action = yaml.safe_load((copy_templates.ACTIONS / match["name"] / "action.yml").read_text())
                     self.assertLessEqual(set(step.get("with") or {}), set(action.get("inputs") or {}), step["uses"])
                     seen += 1
-        self.assertEqual(seen, 7)
+        # Candidate propose/refresh/route/cut, settle route/refresh/publish, lint.
+        self.assertEqual(seen, 8)
 
     def test_release_tokens_are_scoped_to_the_repository(self):
-        for name, jobs in (("release-candidate.yml", ("propose", "cut")),
+        for name, jobs in (("release-candidate.yml", ("propose", "refresh", "cut")),
                            ("release-settle.yml", ("refresh", "publish"))):
             for job in jobs:
-                self.assertEqual(self.doc[name]["jobs"][job]["environment"], "release", job)
+                if job == "publish":
+                    self.assertEqual(self.doc[name]["jobs"][job]["environment"], "publish", job)
+                else:
+                    self.assertNotIn("environment", self.doc[name]["jobs"][job], job)
                 token = next(s for s in steps(self.doc[name], job) if s.get("id") == "release-token")
                 self.assertEqual(token["with"]["repositories"], "mega-reth", job)
 

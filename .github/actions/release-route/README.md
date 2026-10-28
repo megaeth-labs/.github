@@ -27,12 +27,13 @@ Family: [Release pipeline](../RELEASE.md).
 <!-- generated: outputs -->
 | Output | Description |
 |---|---|
-| `action` | Next action: cut, refresh, publish or skip. |
+| `action` | Next action: cut, refresh, publish or skip; versioned settle dispatch returns publish, refresh or skip. |
 | `reason` | Why this action was selected. |
+| `settle_source` | Publication source: dispatch for a versioned settle dispatch routed to publish; empty otherwise. |
 | `version` | Normalized release version, when routing one push. |
 | `release_branch` | Release branch for the pushed version. |
 | `commit` | Pushed commit for cut, refresh or publish. |
-| `pr_number` | Merged release PR number, when matched. |
+| `pr_number` | Merged release PR number, or candidate PR number for a versioned settle dispatch, when provided. |
 | `targets` | Compact JSON array of refresh targets. |
 <!-- /generated -->
 
@@ -65,6 +66,31 @@ Family: [Release pipeline](../RELEASE.md).
 ## Notes
 
 The calling job needs `contents: read` and `pull-requests: read`.
+
+For `kind: settle` on `workflow_dispatch` with a `version`, `action` is
+`publish`, `refresh` or `skip`: publish or resume publication, refresh the
+settle PR, or take no action, respectively. `reason` explains the decision.
+`settle_source` is `dispatch` when the decision is `publish` and empty
+otherwise; `pr_number` is the selected merged candidate PR's `.number`,
+passed as `candidate_pr_number` to `route()` and written to `GITHUB_OUTPUT`
+by the decision output loop.
+The action passes the dispatch context to `route()` unchanged and exposes
+its decision without remapping it. Candidate pushes may still return `cut`.
+
+For a versioned settle dispatch, each enumerated release branch includes
+`candidate_merge_sha` from the merged candidate PR with head
+`chore/release-candidate-<version>` (no leading `v`) targeting the default
+branch or that release branch, `candidate_is_ancestor` from a Git ancestry
+check against its tip, `open_settle_pr` from the open settle PR lookup, and
+`published_tag_sha` from the peeled release tag (or the lightweight tag).
+All four keys are always present: missing SHAs and ancestry without a candidate
+are empty strings, and no open settle PR is `false`. Dispatches without a
+version leave these facts empty or false.
+
+Each dispatch branch also includes `release_exists`, queried with
+`gh release view v<version>` when its tag exists and otherwise `false`.
+Together with the tag facts, this lets an already published version route
+to `skip` instead of `publish`.
 
 A push to a `release_branch_prefix` branch whose suffix is not `X.Y.Z` (for
 example `release-vnext`) routes to `skip` with a reason naming the branch; a

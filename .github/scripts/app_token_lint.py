@@ -7,22 +7,22 @@ The org has two GitHub Apps that mint tokens through actions/create-github-app-t
              names CI_APP_ID / MEGA_CI_APP_PK). Its commits and PRs are what
              automation shows as `mega-maxwell[bot]`; it never touches a release.
   Gutenberg  Release app (vars.RELEASE_APP_CLIENT_ID / secrets.RELEASE_APP_PRIVATE_KEY),
-             only usable from a job in the `release` environment.
+             only usable from an allowlisted release workflow file.
 
 Rules, each reported as `::error file=<path>::<job>/<step>: <rule>: <message>`:
 
   L1  A Maxwell token may not request `permission-<x>: write` except for
       pull-requests and issues (a permission that is not a literal value, such as
       an expression, cannot be verified and is refused too).
-  L2  A Gutenberg token must sit in a job whose `environment` is `release`, or in a
-      `publish` job when the token requests exactly `permission-contents: read`
-      (private-dependency reads in on-release build jobs).
+  L2' A Gutenberg token may be minted only in release-candidate.yml,
+      release-settle.yml or on-release.yml, regardless
+      of its job's environment or requested permissions.
   L3  In a release workflow, no Maxwell token at all; and a Gutenberg read-only
       dependency token's `repositories:` must not name the repository itself.
   L4  A release workflow may not use `mega-maxwell[bot]` as a git identity or a
       PR author filter.
-  L5  `environment: release` may appear only in release-candidate.yml,
-      release-settle.yml and on-release.yml.
+  L5  `environment: release`, and `publish` in a release workflow, may appear
+      only in release-candidate.yml, release-settle.yml and on-release.yml.
   L6  A Maxwell or Gutenberg token, and any app token in a release workflow or
       a `release`-environment job, must request at least one `permission-<x>`:
       without one, create-github-app-token returns every permission the
@@ -53,7 +53,7 @@ GUTENBERG_MARKER = "RELEASE_APP_"
 MAXWELL_WRITABLE = {"permission-pull-requests", "permission-issues"}
 RELEASE_USES = re.compile(r"megaeth-labs/\.github/\.github/actions/release-(candidate|settle|publish|route)")
 ON_RELEASE = "on-release"
-RELEASE_ENVIRONMENT_FILES = {"release-candidate", "release-settle", ON_RELEASE}
+RELEASE_WORKFLOW_FILES = {"release-candidate.yml", "release-settle.yml", "on-release.yml"}
 MAXWELL_IDENTITY = "mega-maxwell[bot]"
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 
@@ -129,11 +129,11 @@ def is_release_workflow(path: str, doc: dict) -> bool:
     return False
 
 
-def lint_job(job_id: str, job: dict, stem: str, release: bool, repo: str | None) -> list[Violation]:
+def lint_job(job_id: str, job: dict, filename: str, release: bool, repo: str | None) -> list[Violation]:
     found: list[Violation] = []
     environment = environment_name(job)
-    if environment == "release" and stem not in RELEASE_ENVIRONMENT_FILES:
-        found.append((job_id, "-", "L5", "environment `release` is only for release-candidate.yml, release-settle.yml and on-release.yml"))
+    if (environment == "release" or (release and environment == "publish")) and filename not in RELEASE_WORKFLOW_FILES:
+        found.append((job_id, "-", "L5", f"environment `{environment}` is only for {', '.join(sorted(RELEASE_WORKFLOW_FILES))}"))
     if release and mentions_maxwell_identity({k: v for k, v in job.items() if k != "steps"}):
         found.append((job_id, "-", "L4", f"{MAXWELL_IDENTITY} is not a release identity"))
     steps = job.get("steps") if isinstance(job.get("steps"), list) else []
@@ -161,8 +161,8 @@ def lint_job(job_id: str, job: dict, stem: str, release: bool, repo: str | None)
             if release:
                 found.append((job_id, label, "L3", "no Maxwell token in a release workflow; mint a Gutenberg token instead"))
         if GUTENBERG_MARKER in refs:
-            if not (environment == "release" or (environment == "publish" and is_read_only_contents(permissions))):
-                found.append((job_id, label, "L2", f"Gutenberg token needs `environment: release` (or `publish` with only permission-contents: read), job has {environment or 'none'}"))
+            if filename not in RELEASE_WORKFLOW_FILES:
+                found.append((job_id, label, "L2'", f"Gutenberg token may be minted only in {', '.join(sorted(RELEASE_WORKFLOW_FILES))}; file is {filename}"))
             if release and repo and is_read_only_contents(permissions) and repo.lower() in repository_names(with_):
                 found.append((job_id, label, "L3", f"read-only dependency token names the repository itself ({repo})"))
     return found
@@ -182,13 +182,13 @@ def lint_source(path: str, text: str, repo: str | None) -> list[str]:
     if jobs is not None and not isinstance(jobs, dict):
         return [error_line(path, ("-", "-", "parse", "`jobs` is not a mapping"))]
     release = is_release_workflow(path, doc)
-    stem = Path(path).stem
+    filename = Path(path).name
     found: list[Violation] = []
     if release and mentions_maxwell_identity({k: v for k, v in doc.items() if k != "jobs"}):
         found.append(("(workflow)", "-", "L4", f"{MAXWELL_IDENTITY} is not a release identity"))
     for job_id, job in (jobs or {}).items():
         if isinstance(job, dict):
-            found.extend(lint_job(str(job_id), job, stem, release, repo))
+            found.extend(lint_job(str(job_id), job, filename, release, repo))
         else:
             found.append((str(job_id), "-", "parse", "job is not a mapping"))
     return [error_line(path, v) for v in found]

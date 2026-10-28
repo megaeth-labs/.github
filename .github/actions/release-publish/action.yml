@@ -1,14 +1,19 @@
 name: Release Publish
 description: >-
-  Publish a settled release. Runs on a push to `release-vX.Y.Z` (the consumer
+  Publish a settled release. By default, runs on a push to `release-vX.Y.Z` (the consumer
   passes the `commit` and `pr_number` that `release-route` resolved for the
   push). Re-verifies the merged `chore/release-settle-vX.Y.Z` PR through the
   API — merged, merge commit equals the pushed commit, head/base names, author,
-  and the settled-SHA marker against the merge commit's parent — then creates
+  and the settled-SHA marker against the merge commit's parent. With
+  `settle_source: dispatch`, verifies the merged candidate PR's merge SHA,
+  head, base and author, and that `release_branch` still points at `commit`
+  for a fresh publish, or contains `commit` when resuming an existing tag;
+  repeats this state check immediately before tagging. Then creates
   the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release
   with the changelog section as notes. A tag already at the commit without a
   Release (a run that died between the two steps) is resumed: the tag step is
-  skipped and the Release is still created. A tag at the commit with its
+  skipped and the Release is still created. Re-run the push-triggered workflow
+  for the settle-PR shape, or dispatch for the direct shape. A tag at the commit with its
   Release already there is a retry of a finished run and exits 0 with a
   notice; a tag at any other commit refuses, because a release is published
   once. A version that is not newer than every other `vX.Y.Z` tag (the rule
@@ -25,9 +30,11 @@ description: >-
 inputs:
   token:
     description: >-
-      mega-gutenberg installation token minted in an `environment: release`
-      job; gutenberg is the bypass actor on the `v*` tag ruleset, and a Release
-      it creates fires `release: published` workflows.
+      mega-gutenberg installation token from repository-scope
+      `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY`; gutenberg is the
+      bypass actor on the `v*` tag ruleset, and a Release it creates fires
+      `release: published` workflows. The one-reviewer `publish` environment
+      gates only tagging, Release creation and artifact upload.
     required: true
   version_file:
     description: "File holding the version (VERSION, Cargo.toml, pyproject.toml, package.json); the same value as in release-candidate."
@@ -44,17 +51,25 @@ inputs:
     description: "Release branch name prefix; the branch is `<prefix>X.Y.Z`."
     required: false
     default: release-v
+  settle_source:
+    description: "Settlement source: pr verifies a merged settle PR; dispatch verifies a merged candidate PR and the current release-branch tip."
+    required: false
+    default: pr
+  release_branch:
+    description: "Release branch that must equal <release_branch_prefix>X.Y.Z; for dispatch its tip must equal commit for a fresh publish, or contain commit when resuming an existing tag."
+    required: false
+    default: ""
   commit:
-    description: "The pushed commit to publish (full SHA), as resolved by `release-route`; it must be the settle PR's merge commit."
+    description: "The commit to publish (full SHA); it must be the settle PR's merge commit for pr, or the candidate PR's merge commit for dispatch."
     required: true
   pr_number:
-    description: "Number of the merged settle PR for `commit`, as resolved by `release-route`."
+    description: "Number of the merged settle PR for pr, or the merged candidate PR for dispatch."
     required: true
   pr_author:
     description: >-
-      Login the settle PR must have been opened by — the app identity
+      Login the settle or candidate PR must have been opened by — the app identity
       `release-settle` runs under. Stops a hand-made `chore/release-settle-*`
-      branch from reaching the tag step. Empty disables the check.
+      branch from reaching the tag step. Empty disables the check only for pr.
     required: false
     default: "mega-gutenberg[bot]"
   git_user_name:
@@ -99,6 +114,8 @@ runs:
         MERGE_SHA: ${{ inputs.commit }}
         PR_NUMBER: ${{ inputs.pr_number }}
         EXPECTED_AUTHOR: ${{ inputs.pr_author }}
+        SETTLE_SOURCE: ${{ inputs.settle_source }}
+        RELEASE_BRANCH: ${{ inputs.release_branch }}
         PREFIX: ${{ inputs.release_branch_prefix }}
         FILE: ${{ inputs.version_file }}
         PATTERN: ${{ inputs.version_pattern }}
@@ -107,12 +124,21 @@ runs:
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
+        # Default the newer inputs here too: a consumer that omits them (or a
+        # harness that extracts this step without the action's input defaults)
+        # must get the old behaviour, never an unbound-variable failure.
+        SETTLE_SOURCE="${SETTLE_SOURCE:-pr}"
+        RELEASE_BRANCH="${RELEASE_BRANCH:-}"
         if [[ ! "$MERGE_SHA" =~ ^[0-9a-f]{40}$ || ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
           echo "::error::publish needs a full 40-hex commit and a numeric pr_number (the release-route outputs)"; exit 1
+        fi
+        if [[ "$SETTLE_SOURCE" != pr && "$SETTLE_SOURCE" != dispatch ]]; then
+          echo "::error::settle_source must be pr or dispatch, got '$SETTLE_SOURCE'"; exit 1
         fi
         # Nothing about the settle PR is taken from the triggering event: the
         # push only says which commit landed. Everything below is read back
         # from the API and the repository.
+        verify_state() {
         pr="$RUNNER_TEMP/settle-pr.json"
         gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$pr"
         pr_field() { # <dotted.path>
@@ -129,10 +155,51 @@ runs:
         pr_author="$(pr_field user.login)"
         pr_body="$(pr_field body)"
         if [[ -z "$merged_at" ]]; then
+          if [[ "$SETTLE_SOURCE" == dispatch ]]; then
+            echo "::error::candidate PR #$PR_NUMBER is not merged"; exit 1
+          fi
           echo "::error::settle PR #$PR_NUMBER is not merged; publish only follows a merged settle PR"; exit 1
         fi
         if [[ "$pr_merge_sha" != "$MERGE_SHA" ]]; then
+          if [[ "$SETTLE_SOURCE" == dispatch ]]; then
+            echo "::error::candidate PR #$PR_NUMBER merge_commit_sha is '$pr_merge_sha', not the requested commit $MERGE_SHA"; exit 1
+          fi
           echo "::error::settle PR #$PR_NUMBER merged as '$pr_merge_sha', not the pushed commit $MERGE_SHA"; exit 1
+        fi
+        if [[ "$SETTLE_SOURCE" == dispatch ]]; then
+          if [[ -z "$RELEASE_BRANCH" ]]; then
+            echo "::error::release_branch is required for dispatch settlement"; exit 1
+          fi
+          git fetch --quiet --tags origin "$MERGE_SHA"
+          version="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
+          version="$(python3 "$TOOLS" normalize "$version")"
+          if [[ "$RELEASE_BRANCH" != "${PREFIX}${version}" ]]; then
+            echo "::error::release_branch is '$RELEASE_BRANCH', expected '${PREFIX}${version}' for dispatch settlement"; exit 1
+          fi
+          if [[ "$head_ref" != "chore/release-candidate-$version" ]]; then
+            echo "::error::candidate PR #$PR_NUMBER head ref is '$head_ref', expected chore/release-candidate-$version"; exit 1
+          fi
+          default_branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          if [[ "$base_ref" != "$default_branch" && "$base_ref" != "$RELEASE_BRANCH" ]]; then
+            echo "::error::candidate PR #$PR_NUMBER base is '$base_ref', expected '$default_branch' or '$RELEASE_BRANCH'"; exit 1
+          fi
+          if [[ "$pr_author" != "$EXPECTED_AUTHOR" ]]; then
+            echo "::error::candidate PR #$PR_NUMBER author is '$pr_author', expected '$EXPECTED_AUTHOR'"; exit 1
+          fi
+          tip="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$RELEASE_BRANCH" --jq .object.sha)"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            git fetch --quiet --force origin "refs/tags/v$version:refs/tags/v$version"
+            if [[ "$(git rev-parse "v$version^{commit}")" != "$MERGE_SHA" ]]; then
+              echo "::error::tag v$version already exists (at $(git rev-parse "v$version^{commit}")), not at $MERGE_SHA; a release is published once"; exit 1
+            fi
+            git fetch --quiet origin "$tip"
+            if ! git merge-base --is-ancestor "$MERGE_SHA" "$tip"; then
+              echo "::error::release branch '$RELEASE_BRANCH' tip is '$tip'; resuming an existing tag requires $MERGE_SHA to be an ancestor of the tip (equality is allowed); a fresh publish without a tag requires exact tip equality"; exit 1
+            fi
+          elif [[ "$tip" != "$MERGE_SHA" ]]; then
+            echo "::error::release branch '$RELEASE_BRANCH' tip is '$tip'; a fresh publish without a tag requires exact tip equality with $MERGE_SHA; resuming an existing tag instead requires that commit to be an ancestor of the tip (equality is allowed)"; exit 1
+          fi
+          return
         fi
         if [[ "$head_ref" != chore/release-settle-v* ]]; then
           echo "::error::head branch '$head_ref' is not a settle PR"; exit 1
@@ -157,6 +224,10 @@ runs:
         if [[ "$parent" != "$settled" ]]; then
           echo "::error::release branch drifted: settle PR settled $settled but the branch tip at merge was $parent. Re-run release-settle on the current tip."; exit 1
         fi
+        }
+        verify_state
+        # Keep the same verifier for a fresh API read in the tag step.
+        declare -f verify_state > "$RUNNER_TEMP/release-publish-verify-state.sh"
         # A release is published once, at this commit. A tag already here is
         # an earlier run of this same publish: without a Release it died
         # between the two steps and is resumed; with one it finished, and this
@@ -175,6 +246,7 @@ runs:
             published=true
           else
             release_url=""
+            echo "::notice::tag $tag is already at $MERGE_SHA without a Release; resuming. Re-run the push-triggered workflow for the settle-PR shape, or dispatch for the direct shape."
           fi
         fi
         actual="$(git show "$MERGE_SHA:$FILE" | python3 "$TOOLS" read-file /dev/stdin "$PATTERN")"
@@ -193,8 +265,42 @@ runs:
           echo "order check passed: v$version is newer than the latest tag ${latest:-<none>}"
         fi
         notes="$RUNNER_TEMP/release-notes-v$version.md"
-        git show "$MERGE_SHA:$CHANGELOG" > "$RUNNER_TEMP/changelog-at-merge.md"
-        python3 "$TOOLS" changelog-extract "$RUNNER_TEMP/changelog-at-merge.md" "$version" > "$notes"
+        if [[ -n "$CHANGELOG" ]]; then
+          git show "$MERGE_SHA:$CHANGELOG" > "$RUNNER_TEMP/changelog-at-merge.md"
+          python3 "$TOOLS" changelog-extract "$RUNNER_TEMP/changelog-at-merge.md" "$version" > "$notes"
+        else
+          previous="$(git tag --list 'v*' | python3 "$TOOLS" latest-tag --exclude "$version")"
+          range="$MERGE_SHA"
+          [[ -n "$previous" ]] && range="$previous..$MERGE_SHA"
+          git log --no-merges --format='%H%x09%s' "$range" \
+            | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$version" "" > "$notes"
+        fi
+        if [[ "$SETTLE_SOURCE" == dispatch && "$published" != true ]]; then
+          section_matches=true
+          if [[ -n "$CHANGELOG" ]]; then
+            previous="$(git tag --list 'v*' | python3 "$TOOLS" latest-tag --exclude "$version")"
+            range="$MERGE_SHA"
+            [[ -n "$previous" ]] && range="$previous..$MERGE_SHA"
+            regenerated="$RUNNER_TEMP/release-regenerated-v$version.md"
+            committed="$RUNNER_TEMP/release-committed-v$version.md"
+            git log --no-merges --format='%H%x09%s' "$range" \
+              | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$version" "" > "$regenerated"
+            python3 "$TOOLS" changelog-extract "$RUNNER_TEMP/changelog-at-merge.md" "$version" \
+              --include-heading > "$committed"
+            section_matches=false
+            if [[ "$(sed 's/[[:space:]]*$//' "$regenerated")" == "$(sed 's/[[:space:]]*$//' "$committed")" ]]; then
+              section_matches=true
+            fi
+          fi
+          decision="$(python3 "$TOOLS" settle-state --version "$version" \
+            --branch-tip "$MERGE_SHA" --candidate-merge-sha "$MERGE_SHA" \
+            --candidate-is-ancestor true --open-settle-pr false \
+            --published-tag-exists false --release-exists false \
+            --section-matches "$section_matches")"
+          if [[ "${decision%%$'\n'*}" != clean ]]; then
+            echo "::error::changelog section for v$version at $MERGE_SHA disagrees with regenerated notes; let the settle refresh land first, then publish."; exit 1
+          fi
+        fi
         {
           echo "version=$version"
           echo "tag=$tag"
@@ -218,18 +324,32 @@ runs:
       env:
         AUTH_WRAPPER: ${{ github.action_path }}/../git-auth/with-github-auth.sh
         GITHUB_AUTH_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ inputs.token }}
         TAG: ${{ steps.guard.outputs.tag }}
         MERGE_SHA: ${{ steps.guard.outputs.merge_sha }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        EXPECTED_AUTHOR: ${{ inputs.pr_author }}
+        SETTLE_SOURCE: ${{ inputs.settle_source }}
+        RELEASE_BRANCH: ${{ inputs.release_branch }}
+        PREFIX: ${{ inputs.release_branch_prefix }}
+        FILE: ${{ inputs.version_file }}
+        PATTERN: ${{ inputs.version_pattern }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
+        SETTLE_SOURCE="${SETTLE_SOURCE:-pr}"
+        RELEASE_BRANCH="${RELEASE_BRANCH:-}"
         # Re-check the order now, right before the tag exists: another release
         # line publishes under its own concurrency group and may have won.
         latest="$(git ls-remote --tags --refs origin 'refs/tags/v*' | cut -f2 | sed 's#^refs/tags/##' |
           python3 "$TOOLS" latest-tag --exclude "$TAG")"
         if ! refusal="$(python3 "$TOOLS" check-order "$TAG" "$latest")"; then
           echo "::error title=Refusing to publish an older version::not tagging $MERGE_SHA: $refusal (tagged since the guard ran)"; exit 1
+        fi
+        if [[ "$SETTLE_SOURCE" == dispatch ]]; then
+          source "$RUNNER_TEMP/release-publish-verify-state.sh"
+          verify_state
         fi
         git tag -a "$TAG" "$MERGE_SHA" -m "Release $TAG"
         if git push --quiet origin "refs/tags/$TAG"; then

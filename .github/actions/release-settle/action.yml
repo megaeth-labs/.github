@@ -2,8 +2,8 @@ name: Release Settle
 description: >-
   Maintain a settle PR for a release candidate: verify `commit` is the tip of the
   release branch and carries the expected version, generate release notes from
-  the commits since the previous tag, write them into the changelog (stamping
-  the date onto the candidate's `## vX.Y.Z` entry), and open or refresh a
+  the commits since the previous tag, write them into the changelog under
+  the candidate's undated `## vX.Y.Z` heading, and open or refresh a
   `chore/release-settle-vX.Y.Z` PR onto the release branch without rewriting
   its history. New commits on the release branch refresh this PR automatically;
   merging it is the settlement decision and release-publish then tags the merge
@@ -43,7 +43,7 @@ inputs:
     required: false
     default: release-v
   changelog_file:
-    description: "Changelog the entry is written to (Keep-a-Changelog style, newest first)."
+    description: "Changelog the entry is written to (Keep-a-Changelog style, newest first); empty disables changelog writes."
     required: false
     default: CHANGELOG.md
   pr_author:
@@ -77,15 +77,6 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Configure git identity
-      shell: bash
-      env:
-        NAME: ${{ inputs.git_user_name }}
-        EMAIL: ${{ inputs.git_user_email }}
-      run: |
-        git config user.name "$NAME"
-        git config user.email "$EMAIL"
-
     - name: Guard
       id: guard
       shell: bash
@@ -161,7 +152,111 @@ runs:
         fi
         GITHUB_AUTH_COMMAND
 
+    - name: Compute settlement state
+      id: state
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ steps.guard.outputs.version }}
+        BRANCH: ${{ steps.guard.outputs.branch }}
+        COMMIT: ${{ inputs.commit }}
+        PREVIOUS: ${{ steps.guard.outputs.previous_tag }}
+        CHANGELOG: ${{ inputs.changelog_file }}
+        PR_AUTHOR: ${{ inputs.pr_author }}
+        TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+      run: |
+        set -euo pipefail
+        candidates="$(gh pr list --state merged --head "chore/release-candidate-$VERSION" \
+          --json mergeCommit,body,author,mergedAt)"
+        candidate="$(python3 - "$VERSION" "$PR_AUTHOR" "$candidates" <<'PY'
+        import json, sys
+
+        def normalized(login):
+            # `gh pr list --json author` reports an app as "app/<name>", while the
+            # REST API and every other check here use "<name>[bot]"; compare one form.
+            login = login or ""
+            if login.startswith("app/"):
+                return login[4:] + "[bot]"
+            return login
+
+        marker = f"<!-- release-candidate: v{sys.argv[1]} -->"
+        expected = normalized(sys.argv[2])
+        candidates = [pr for pr in json.loads(sys.argv[3])
+                      if marker in (pr.get("body") or "")
+                      and (not expected or normalized(pr["author"]["login"]) == expected)]
+        if not candidates:
+            sys.exit("no merged candidate PR found for this version")
+        print(max(candidates, key=lambda pr: pr["mergedAt"])["mergeCommit"]["oid"])
+        PY
+        )"
+        ancestor=false
+        ancestry_status=0
+        git merge-base --is-ancestor "$candidate" "$COMMIT" || ancestry_status=$?
+        case "$ancestry_status" in
+          0) ancestor=true ;;
+          1) ;;
+          *) exit "$ancestry_status" ;;
+        esac
+        open_pr="$(gh pr list --state open --head "chore/release-settle-v$VERSION" \
+          --base "$BRANCH" --json number --jq 'length > 0')"
+        tag_exists=false
+        tag_sha=""
+        if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+          tag_exists=true
+          tag_sha="$(git rev-parse "v$VERSION^{commit}")"
+        fi
+        release_exists=false
+        releases="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq \
+          ".[] | select(.tag_name == \"v$VERSION\") | .id")"
+        [[ -z "$releases" ]] || release_exists=true
+        section_matches=true
+        if [[ -n "$CHANGELOG" ]]; then
+          range="$COMMIT"
+          [[ -n "$PREVIOUS" ]] && range="$PREVIOUS..$COMMIT"
+          regenerated="$RUNNER_TEMP/release-regenerated-v$VERSION.md"
+          committed="$RUNNER_TEMP/release-committed-v$VERSION.md"
+          git log --no-merges --format='%H%x09%s' "$range" \
+            | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$VERSION" "" > "$regenerated"
+          section_matches=false
+          if git show "$COMMIT:$CHANGELOG" > "$RUNNER_TEMP/changelog-at-tip.md" \
+            && python3 "$TOOLS" changelog-extract "$RUNNER_TEMP/changelog-at-tip.md" "$VERSION" \
+              --include-heading > "$committed"; then
+            if [[ "$(sed 's/[[:space:]]*$//' "$regenerated")" == "$(sed 's/[[:space:]]*$//' "$committed")" ]]; then
+              section_matches=true
+            fi
+          fi
+        fi
+        decision="$(python3 "$TOOLS" settle-state --version "$VERSION" \
+          --branch-tip "$COMMIT" --candidate-merge-sha "$candidate" \
+          --candidate-is-ancestor "$ancestor" --open-settle-pr "$open_pr" \
+          --published-tag-exists "$tag_exists" --release-exists "$release_exists" \
+          --published-tag-sha "$tag_sha" --section-matches "$section_matches")"
+        state="${decision%%$'\n'*}"
+        echo "state=$state" >> "$GITHUB_OUTPUT"
+        case "$state" in
+          clean)
+            echo "settled=false" >> "$GITHUB_OUTPUT"
+            echo "Release branch \`$BRANCH\` is unchanged at the candidate merge; nothing was written." >> "$GITHUB_STEP_SUMMARY"
+            ;;
+          needs-settle-pr) ;;
+          resume|published)
+            echo "${decision#*$'\n'}; no settle PR was written." >> "$GITHUB_STEP_SUMMARY"
+            ;;
+          *) echo "::error::${decision#*$'\n'}"; exit 1 ;;
+        esac
+
+    - name: Configure git identity
+      if: steps.state.outputs.state == 'needs-settle-pr'
+      shell: bash
+      env:
+        NAME: ${{ inputs.git_user_name }}
+        EMAIL: ${{ inputs.git_user_email }}
+      run: |
+        git config user.name "$NAME"
+        git config user.email "$EMAIL"
+
     - name: Generate release notes
+      if: steps.state.outputs.state == 'needs-settle-pr'
       id: notes
       shell: bash
       env:
@@ -175,11 +270,12 @@ runs:
         range="$COMMIT"
         [[ -n "$PREVIOUS" ]] && range="$PREVIOUS..$COMMIT"
         git log --no-merges --format='%H%x09%s' "$range" \
-          | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$VERSION" "$(date -u +%F)" > "$notes"
+          | python3 "$TOOLS" notes "$GITHUB_REPOSITORY" "$VERSION" "" > "$notes"
         echo "notes_file=$notes" >> "$GITHUB_OUTPUT"
         echo "--- release notes ---"; cat "$notes"
 
     - name: Ensure the settle PR
+      if: steps.state.outputs.state == 'needs-settle-pr'
       id: pr
       shell: bash
       env:
@@ -256,10 +352,16 @@ runs:
           python3 - "$prs" "$VERSION" "$title" > "$RUNNER_TEMP/settle-prs.tsv" <<'PY'
         import json, re, sys
 
+        def normalized(login):
+            # `gh pr list --json author` reports an app as "app/<name>"; PR_AUTHOR
+            # and every other check in this repo use "<name>[bot]". Compare one form.
+            login = login or ""
+            return login[4:] + "[bot]" if login.startswith("app/") else login
+
         for pr in json.load(open(sys.argv[1])):
             marker = re.search(r"<!-- release-settle: v" + re.escape(sys.argv[2]) + r" ([0-9a-f]{40}) -->", pr["body"])
             title_ok = "yes" if pr.get("title") == sys.argv[3] else "no"
-            print(pr["number"], pr["author"]["login"], pr["url"], marker[1] if marker else "-", title_ok, sep="\t")
+            print(pr["number"], normalized(pr["author"]["login"]), pr["url"], marker[1] if marker else "-", title_ok, sep="\t")
         PY
           pr=""; old_marker=""; old_title_ok=""
           while IFS=$'\t' read -r number author url marker title_ok; do
@@ -286,12 +388,16 @@ runs:
               fi
               changed=true
             fi
-            stage="committing the changelog on $head (local only; nothing pushed, a re-run starts over from the remote)"
-            what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
-            if ! git diff --quiet -- "$CHANGELOG"; then
-              git add "$CHANGELOG"
-              git commit --quiet -m "chore(release): refresh settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
-              changed=true
+            if [[ -n "$CHANGELOG" ]]; then
+              stage="committing the changelog on $head (local only; nothing pushed, a re-run starts over from the remote)"
+              what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
+              if ! git diff --quiet -- "$CHANGELOG"; then
+                git add "$CHANGELOG"
+                git commit --quiet -m "chore(release): refresh settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
+                changed=true
+              fi
+            else
+              echo "::notice::changelog disabled"
             fi
             if [[ "$changed" == false && "$old_marker" == "$COMMIT" && "$old_title_ok" == yes ]]; then
               echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
@@ -330,13 +436,19 @@ runs:
           fi
           stage="committing the settlement on a fresh $head (local only; nothing pushed)"
           git checkout --quiet --force -B "$head" "$COMMIT"
-          what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
-          if git diff --quiet -- "$CHANGELOG"; then
-            git commit --quiet --allow-empty -m "chore(release): settle v$VERSION" \
-              -m "Changelog already current at $COMMIT; this PR records the settlement decision."
+          if [[ -n "$CHANGELOG" ]]; then
+            what="$(python3 "$TOOLS" changelog-insert "$CHANGELOG" "$VERSION" "$NOTES")"
+            if git diff --quiet -- "$CHANGELOG"; then
+              git commit --quiet --allow-empty -m "chore(release): settle v$VERSION" \
+                -m "Changelog already current at $COMMIT; this PR records the settlement decision."
+            else
+              git add "$CHANGELOG"
+              git commit --quiet -m "chore(release): settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
+            fi
           else
-            git add "$CHANGELOG"
-            git commit --quiet -m "chore(release): settle v$VERSION" -m "Changelog entry $what for v$VERSION at $COMMIT."
+            echo "::notice::changelog disabled"
+            git commit --quiet --allow-empty -m "chore(release): settle v$VERSION" \
+              -m "Changelog disabled at $COMMIT; this PR records the settlement decision."
           fi
           stage="pushing a fresh $head"
           if ! git push --quiet origin "$head"; then

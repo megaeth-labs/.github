@@ -80,7 +80,7 @@ class Route(unittest.TestCase):
             "pulls": [{
                 "number": 42, "merged_at": "2026-10-27T00:00:00Z",
                 "merge_commit_sha": self.SHA, "base": {"ref": ref},
-                "head": {"ref": "chore/release-candidate-v1.2.0" if candidate
+                "head": {"ref": "chore/release-candidate-1.2.0" if candidate
                          else "chore/release-settle-v1.2.0"},
                 "user": {"login": "mega-gutenberg[bot]"},
                 "body": f"<!-- release-settle: v1.2.0 {self.PARENT} -->",
@@ -271,8 +271,10 @@ class Route(unittest.TestCase):
         data = self.fixture()
         data.update(event="workflow_dispatch", branches=[
             {"name": "release-v1.2.0", "tip": self.SHA, "version_at_tip": "1.2.0", "tag_exists": False},
-            {"name": "release-v1.3.0", "tip": self.PARENT, "version_at_tip": "1.3.0", "tag_exists": True},
+            {"name": "release-v1.3.0", "tip": self.PARENT, "version_at_tip": "1.3.0",
+             "tag_exists": True, "release_exists": True},
         ])
+        data.update(candidate_merge_sha="c" * 40, candidate_is_ancestor=True)
         return data
 
     def test_dispatch_two_branches_excludes_tagged_branch(self):
@@ -511,6 +513,219 @@ class Changelog(unittest.TestCase):
 
     def test_extract_missing(self):
         self.assertIsNone(rt.extract_changelog_section(self.OLD, "9.9.9"))
+
+    def test_generated_undated_section_round_trip_is_unchanged(self):
+        text = "# Changelog\n\n## v0.2.0\n\n### Fixes\n\n- b (`bbbbbbbbbb`)\n\n" + self.OLD.split("\n\n", 1)[1]
+        lines = ["b" * 40 + "\tfix: b"]
+        section = rt.generate_notes("o/r", "0.2.0", "", lines)
+
+        new, what = rt.insert_changelog_section(text, "0.2.0", section)
+
+        self.assertEqual((new, what), (text, "replaced"))
+
+    def test_generated_undated_section_replaces_dated_heading(self):
+        text = "# Changelog\n\n" + self.SEC
+        section = rt.generate_notes("o/r", "0.2.0", "", ["b" * 40 + "\tfix: b"])
+
+        new, what = rt.insert_changelog_section(text, "0.2.0", section)
+
+        self.assertEqual(what, "replaced")
+        self.assertNotEqual(new, text)
+        self.assertEqual(new, "# Changelog\n\n" + section)
+
+    def test_extract_cli_can_include_heading(self):
+        for flags, expected in (
+            ([], "### Fixes\n\n- b (`bbbbbbbbbb`)\n"),
+            (["--include-heading"], self.SEC),
+        ):
+            with self.subTest(flags=flags):
+                stdout = io.StringIO()
+                with patch.object(rt.Path, "read_text", return_value=self.SEC), contextlib.redirect_stdout(stdout):
+                    code = rt.main(["changelog-extract", "CHANGELOG.md", "0.2.0", *flags])
+                self.assertEqual(code, 0)
+                self.assertEqual(stdout.getvalue(), expected)
+
+
+class SettlementSections(unittest.TestCase):
+    def test_matching_section_keeps_candidate_merge_clean(self):
+        for facts in ({}, {"section_matches": True}):
+            with self.subTest(facts=facts):
+                state, _ = rt.settle_state("1.2.0", "a" * 40, "a" * 40, True, False, False, False, **facts)
+                self.assertEqual(state, "clean")
+
+    def test_stale_section_at_candidate_merge_needs_settle_pr(self):
+        state, reason = rt.settle_state(
+            "1.2.0", "a" * 40, "a" * 40, True, False, False, False,
+            section_matches=False,
+        )
+        self.assertEqual(state, "needs-settle-pr")
+        self.assertIn("stale changelog section", reason)
+
+    def test_cli_section_matches_defaults_true_and_accepts_false(self):
+        args = [
+            "settle-state", "--version", "1.2.0", "--branch-tip", "a" * 40,
+            "--candidate-merge-sha", "a" * 40, "--candidate-is-ancestor", "true",
+            "--open-settle-pr", "false", "--published-tag-exists", "false",
+            "--release-exists", "false",
+        ]
+        for flags, expected in (
+            ([], "clean"),
+            (["--section-matches", "true"], "clean"),
+            (["--section-matches", "false"], "needs-settle-pr"),
+        ):
+            with self.subTest(flags=flags):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = rt.main([*args, *flags])
+                self.assertEqual(code, 0)
+                self.assertEqual(stdout.getvalue().splitlines()[0], expected)
+
+
+class DispatchSettlement(unittest.TestCase):
+    def fixture(self, **facts):
+        branch = {
+            "name": "release-v1.2.0", "tip": "a" * 40, "version_at_tip": "1.2.0",
+            "candidate_merge_sha": "a" * 40, "candidate_is_ancestor": True,
+            "open_settle_pr": False, "tag_exists": False, "release_exists": False,
+        }
+        branch.update(facts)
+        return {
+            "kind": "settle", "event": "workflow_dispatch", "dispatch_version": "v1.2.0",
+            "latest_tag": "v9.0.0", "branches": [branch],
+        }
+
+    def test_predicate_states_map_to_dispatch_actions_and_reasons(self):
+        cases = [
+            ("clean", {}, "publish"),
+            ("needs-settle-pr", {"tip": "b" * 40}, "refresh"),
+            ("resume", {"tag_exists": True}, "publish"),
+            ("published", {"tag_exists": True, "release_exists": True}, "skip"),
+            ("blocked", {"candidate_is_ancestor": False}, "skip"),
+        ]
+        for expected_state, facts, action in cases:
+            with self.subTest(state=expected_state):
+                data = self.fixture(**facts)
+                branch = data["branches"][0]
+                state, reason = rt.settle_state(
+                    "1.2.0", branch["tip"], branch["candidate_merge_sha"],
+                    branch["candidate_is_ancestor"], branch["open_settle_pr"],
+                    branch["tag_exists"], branch["release_exists"],
+                )
+                self.assertEqual(state, expected_state)
+                result = rt.route(data)
+                self.assertEqual((result["action"], result["reason"]), (action, reason))
+                self.assertEqual(result.get("settle_source"), "dispatch" if action == "publish" else None)
+                self.assertEqual((result["version"], result["release_branch"], result["commit"]),
+                                 ("1.2.0", branch["name"], branch["tip"]))
+                self.assertEqual(result["targets"], [
+                    {"version": "1.2.0", "release_branch": branch["name"], "commit": branch["tip"]},
+                ] if action == "refresh" else [])
+
+    def test_candidate_pr_number_is_optional(self):
+        self.assertIsNone(rt.route(self.fixture())["pr_number"])
+        for key in ("candidate_pr_number", "candidatePRNumber", "pr_number"):
+            with self.subTest(key=key):
+                self.assertEqual(rt.route(self.fixture(**{key: 42}))["pr_number"], 42)
+
+    def test_resume_publishes_tagged_commit_when_tip_is_ahead(self):
+        for key in ("published_tag_sha", "tag_commit", None):
+            with self.subTest(tag_sha_key=key):
+                facts = {"tip": "b" * 40, "tag_exists": True}
+                if key:
+                    facts[key] = "a" * 40
+                result = rt.route(self.fixture(**facts))
+                self.assertEqual(result["action"], "publish")
+                self.assertEqual(result["settle_source"], "dispatch")
+                self.assertEqual(result["commit"], "a" * 40 if key else "b" * 40)
+
+    def test_selected_version_always_reaches_predicate(self):
+        for facts in (
+            {"version_at_tip": None},
+            {"tag_exists": True, "release_exists": True},
+        ):
+            with self.subTest(facts=facts):
+                with patch.object(rt, "settle_state", return_value=("blocked", "blocked")) as predicate:
+                    result = rt.route(self.fixture(**facts))
+                predicate.assert_called_once()
+                self.assertEqual((result["action"], result["reason"]), ("skip", "blocked"))
+
+    def test_missing_branch_facts_cannot_publish(self):
+        data = self.fixture()
+        data["branches"] = []
+        result = rt.route(data)
+        self.assertEqual(result["action"], "skip")
+        self.assertIn("release-v1.2.0 does not exist", result["reason"])
+
+    def test_push_without_merged_settle_pr_cannot_publish(self):
+        data = self.fixture()
+        data.update(event="push", ref_name="release-v1.2.0", sha="a" * 40,
+                    version_at_sha="1.2.0", latest_tag="", pulls=[])
+        with patch.object(rt, "settle_state", side_effect=AssertionError("dispatch only")):
+            result = rt.route(data)
+        self.assertEqual(result["action"], "refresh")
+        self.assertNotIn("settle_source", result)
+
+    def test_sweep_keeps_tag_without_release_and_summarizes_published_branch(self):
+        data = self.fixture(tag_exists=True, version_at_tip=None)
+        data["dispatch_version"] = ""
+        data["branches"].append({
+            "name": "release-v1.3.0", "tip": "b" * 40, "version_at_tip": "1.3.0",
+            "tag_exists": True, "release_exists": True,
+        })
+        summary = io.StringIO()
+        with contextlib.redirect_stderr(summary):
+            result = rt.route(data)
+        self.assertEqual(result["action"], "refresh")
+        self.assertEqual(result["targets"], [
+            {"version": "1.2.0", "release_branch": "release-v1.2.0", "commit": "a" * 40},
+        ])
+        self.assertEqual(len(summary.getvalue().splitlines()), 1)
+        self.assertIn("release-v1.3.0 (v1.3.0)", summary.getvalue())
+        self.assertIn("published tag and Release", summary.getvalue())
+
+
+class DispatchSettlementFacts(unittest.TestCase):
+    def fixture(self):
+        return {
+            "kind": "settle", "event": "workflow_dispatch", "dispatch_version": "v1.2.0",
+            "branches": [{
+                "name": "release-v1.2.0", "tip": "a" * 40,
+                "version_at_tip": "1.2.0", "tag_exists": False,
+            }],
+        }
+
+    def test_without_facts_raises(self):
+        for facts, missing in (
+            ({}, ["candidate_merge_sha", "candidate_is_ancestor"]),
+            ({"candidate_merge_sha": "", "candidate_is_ancestor": True},
+             ["candidate_merge_sha"]),
+            ({"candidate_merge_sha": "a" * 40}, ["candidate_is_ancestor"]),
+        ):
+            with self.subTest(facts=facts):
+                data = self.fixture()
+                data["branches"][0].update(facts)
+                with self.assertRaises(ValueError) as raised:
+                    rt.route(data)
+                self.assertIn("v1.2.0", str(raised.exception))
+                for key in missing:
+                    self.assertIn(key, str(raised.exception))
+
+    def test_with_facts_publishes(self):
+        data = self.fixture()
+        data["branches"][0].update(
+            candidate_merge_sha="a" * 40, candidate_is_ancestor=True, open_settle_pr=False,
+        )
+        result = rt.route(data)
+        self.assertEqual(result["action"], "publish")
+        self.assertEqual(result["settle_source"], "dispatch")
+
+    def test_missing_branch_still_skips(self):
+        data = self.fixture()
+        data["branches"] = []
+        result = rt.route(data)
+        self.assertEqual(result["action"], "skip")
+        self.assertIn("release-v1.2.0", result["reason"])
+        self.assertIn("does not exist", result["reason"])
 
 
 if __name__ == "__main__":

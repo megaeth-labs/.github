@@ -612,7 +612,7 @@ jobs:
           }
           SH
 
-      - name: Fake GitHub PR state and a fixed notes date
+      - name: Fake GitHub PR state and reject notes dates
         run: |
           set -euo pipefail
           cat > "$FIXTURE/bin/gh" <<'PY'
@@ -671,8 +671,8 @@ jobs:
           else:
               sys.exit(f"unexpected gh command: {args}")
           PY
-          # Notes are unchanged across reruns even if a run crosses UTC midnight.
-          printf '#!/bin/bash\n[[ "$*" == "-u +%%F" ]] || exit 1\nprintf "2026-01-01\\n"\n' > "$FIXTURE/bin/date"
+          # Generated notes must not depend on the current date.
+          printf '#!/bin/bash\necho "unexpected date call in release-settle" >&2\nexit 1\n' > "$FIXTURE/bin/date"
           chmod +x "$FIXTURE/bin/gh" "$FIXTURE/bin/date"
           echo "$FIXTURE/bin" >> "$GITHUB_PATH"
 
@@ -1400,7 +1400,6 @@ jobs:
           jobs:
             settle:
               runs-on: ubuntu-24.04
-              environment: release
               steps:
                 - uses: $TOKEN_ACTION # v3
                   id: release-token
@@ -1420,7 +1419,7 @@ jobs:
           jobs:
             dist-docs:
               runs-on: ubuntu-24.04
-              environment: release
+              environment: publish
               steps:
                 - uses: $TOKEN_ACTION # v3
                   id: release-token
@@ -2382,6 +2381,13 @@ jobs:
               cat "$FIX/pulls.json" ;;
             api*"repos/$FAKE_REPOSITORY/pulls/42")
               jq '.[0]' "$FIX/settle.json" ;;
+            "pr list --state merged --head chore/release-candidate-1.2.0 "*)
+              if [[ -e "$FIX/dispatch-candidate.json" ]]; then
+                cat "$FIX/dispatch-candidate.json"
+              else
+                echo '[]'
+              fi ;;
+            "pr list --state open "*) echo '[]' ;;
             "pr list "*)
               echo fallback >> "$FIX/fallback-calls"
               cat "$FIX/fallback.json" ;;
@@ -2493,17 +2499,39 @@ jobs:
           expect_output action refresh
           [[ "$(out_get targets | jq -r '.[0].commit')" == "$(cat "$FIX/merge")" ]]
 
-      - name: Dispatch excludes tagged branches and filters versions
+      - name: Dispatch refreshes unpublished tags and requires settlement facts
         run: |
           set -euo pipefail
           source "$SH/helpers.sh"
           route settle main "$(cat "$FIX/candidate")" workflow_dispatch
           expect_output action refresh
+          [[ "$(out_get targets | jq -c 'map(.release_branch) | sort')" == '["release-v1.1.0","release-v1.2.0"]' ]]
+          touch "$FIX/release-exists"
+          route settle main "$(cat "$FIX/candidate")" workflow_dispatch > "$FIX/dispatch-published.log" 2>&1
+          expect_output action refresh
           [[ "$(out_get targets | jq length)" == 1 ]]
           [[ "$(out_get targets | jq -r '.[0].release_branch')" == release-v1.2.0 ]]
-          DISPATCH_VERSION=v1.1.0 route settle main "$(cat "$FIX/candidate")" workflow_dispatch
-          expect_output action skip
+          grep -qxF "skipping release-v1.1.0 (v1.1.0): published tag and Release already exist" "$FIX/dispatch-published.log"
+          rm "$FIX/release-exists"
+          if DISPATCH_VERSION=v1.1.0 route settle main "$(cat "$FIX/candidate")" workflow_dispatch \
+              > "$FIX/dispatch-missing.log" 2>&1; then
+            echo "versioned dispatch without a merged candidate PR succeeded"; exit 1
+          fi
+          [[ ! -s "$OUT" ]]
+          grep -qxF "release_tools: v1.1.0 missing settlement facts: candidate_merge_sha" "$FIX/dispatch-missing.log"
+          # A merged candidate at the branch tip supplies the clean-state facts.
+          jq --arg sha "$(cat "$FIX/merge")" \
+            '[.[0] | {number, mergeCommit: {oid: $sha}, headRefName: "chore/release-candidate-1.2.0",
+              baseRefName: .base.ref, author: .user}]' "$FIX/candidate.json" > "$FIX/dispatch-candidate.json"
+          DISPATCH_VERSION=v1.2.0 route settle main "$(cat "$FIX/candidate")" workflow_dispatch
+          expect_output action publish
+          expect_output version 1.2.0
+          expect_output release_branch release-v1.2.0
+          expect_output commit "$(cat "$FIX/merge")"
+          expect_output pr_number 41
+          expect_output settle_source dispatch
           expect_output targets '[]'
+          rm "$FIX/dispatch-candidate.json"
 
       - name: Lagging index uses merged PR fallback and malformed API fails
         run: |
@@ -2543,7 +2571,7 @@ jobs:
           expect_output action refresh
           route settle main "$(cat "$FIX/candidate")" workflow_dispatch
           expect_output action refresh
-          [[ "$(out_get targets | jq -r '.[0].release_branch')" == release-v1.2.0 ]]
+          [[ "$(out_get targets | jq -c 'map(.release_branch) | sort')" == '["release-v1.1.0","release-v1.2.0"]' ]]
           echo "v1.3.0-rc1 is ignored: publish, refresh and dispatch all route"
 
       # A hotfix line merged after a newer release would otherwise be tagged

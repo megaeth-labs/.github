@@ -12,6 +12,7 @@ Subcommands (see `main`):
                                                other tags (v1.2.0-rc1) are named on stderr and ignored
   check-order VERSION LATEST_TAG_OR_EMPTY   -> exit 0 if VERSION may be published after LATEST, else
                                                print the refusal on stdout and exit 1
+  settle-state --version VERSION ...        -> settlement state, then a one-line reason
   read-file   PATH PATTERN                  -> version found in the file
   bump-file   PATH PATTERN VERSION          -> rewrite in place, print old version
   notes       REPO VERSION DATE             -> stdin: "<sha>\t<subject>" lines; stdout: markdown
@@ -116,6 +117,38 @@ def order_refusal(version: str, latest: str) -> str | None:
     if not is_greater(version, latest):
         return f"v{version} is not newer than the latest published tag {latest} ({ORDER_RULE})"
     return None
+
+
+# --- settlement -------------------------------------------------------------
+
+
+def settle_state(
+    version: str,
+    branch_tip: str,
+    candidate_merge_sha: str,
+    candidate_is_ancestor: bool,
+    open_settle_pr: bool,
+    published_tag_exists: bool,
+    release_exists: bool,
+    published_tag_sha: str = "",
+    *,
+    section_matches: bool = True,
+) -> tuple[str, str]:
+    """Decide settlement from caller-collected facts, without external reads."""
+    version = normalize_version(version)
+    if not candidate_is_ancestor:
+        return "blocked", f"candidate merge {candidate_merge_sha} is not an ancestor of tip {branch_tip}"
+    if published_tag_exists:
+        if published_tag_sha and published_tag_sha != candidate_merge_sha:
+            return "blocked", f"v{version} points to {published_tag_sha}, not candidate merge {candidate_merge_sha}"
+        if release_exists:
+            return "published", f"v{version} already has a published tag and Release"
+        return "resume", f"v{version} has a published tag but no Release"
+    if branch_tip != candidate_merge_sha or open_settle_pr:
+        return "needs-settle-pr", f"v{version} has commits beyond the candidate merge or an open settle PR"
+    if not section_matches:
+        return "needs-settle-pr", f"v{version} has a stale changelog section"
+    return "clean", f"v{version} is at the candidate merge with no open settle PR or published tag"
 
 
 # --- release routing --------------------------------------------------------
@@ -249,16 +282,67 @@ def route(data: dict) -> dict:
     elif kind == "settle" and event == "workflow_dispatch":
         selected = _field(data, "dispatch_version", "")
         selected = normalize_version(selected) if selected else ""
-        for branch in _items(data, "branches"):
+        branches = _items(data, "branches")
+        if selected:
+            name = f"{prefix}{selected}"
+            branch = next((branch for branch in branches if branch.get("name") == name), {})
+            if not branch:
+                result.update(
+                    reason=f"release branch {name} does not exist",
+                    version=selected, release_branch=name,
+                )
+                return result
+            facts = {**data, **branch}
+            missing = []
+            if not facts.get("candidate_merge_sha"):
+                missing.append("candidate_merge_sha")
+            if "candidate_is_ancestor" not in facts:
+                missing.append("candidate_is_ancestor")
+            if missing:
+                raise ValueError(f"v{selected} missing settlement facts: {', '.join(missing)}")
+            tip = facts.get("tip") or facts.get("branch_tip") or ""
+            tag_sha = facts.get("published_tag_sha") or facts.get("tag_commit") or ""
+            state, reason = settle_state(
+                selected, tip, facts["candidate_merge_sha"],
+                bool(facts["candidate_is_ancestor"]),
+                bool(facts.get("open_settle_pr")),
+                bool(facts.get("published_tag_exists", facts.get("tag_exists"))),
+                bool(facts.get("release_exists")),
+                tag_sha,
+            )
+            action = {"clean": "publish", "resume": "publish", "needs-settle-pr": "refresh",
+                      "published": "skip", "blocked": "skip"}[state]
+            result.update(
+                action=action, reason=reason, version=selected, release_branch=name,
+                commit=(tag_sha or tip) if state == "resume" else tip,
+                pr_number=(facts.get("candidate_pr_number") or facts.get("candidatePRNumber")
+                           or facts.get("pr_number")),
+            )
+            if action == "publish":
+                result["settle_source"] = "dispatch"
+            elif action == "refresh":
+                result["targets"] = [
+                    {"version": selected, "release_branch": name, "commit": tip},
+                ]
+            if state == "published":
+                print(f"skipping {name} (v{selected}): {reason}", file=sys.stderr)
+            return result
+        for branch in branches:
             name = branch.get("name")
-            if not isinstance(name, str) or not name.startswith(prefix) or branch.get("tag_exists"):
+            if not isinstance(name, str) or not name.startswith(prefix):
                 continue
             version = _branch_version(name, prefix)
             if version is None:
                 continue
-            if (branch.get("version_at_tip") == version
-                    and order_refusal(version, _field(data, "latest_tag", "")) is None
-                    and (not selected or version == selected)):
+            tagged = branch.get("published_tag_exists", branch.get("tag_exists"))
+            if tagged and branch.get("release_exists"):
+                print(
+                    f"skipping {name} (v{version}): published tag and Release already exist",
+                    file=sys.stderr,
+                )
+                continue
+            if (tagged or (branch.get("version_at_tip") == version
+                           and order_refusal(version, _field(data, "latest_tag", "")) is None)):
                 result["targets"].append({
                     "version": version, "release_branch": name, "commit": branch.get("tip") or "",
                 })
@@ -434,6 +518,15 @@ def main(argv: list[str]) -> int:
     s.add_argument("version")
     s.add_argument("latest")
 
+    s = sub.add_parser("settle-state")
+    s.add_argument("--version", required=True)
+    s.add_argument("--branch-tip", required=True)
+    s.add_argument("--candidate-merge-sha", required=True)
+    for flag in ("candidate-is-ancestor", "open-settle-pr", "published-tag-exists", "release-exists"):
+        s.add_argument(f"--{flag}", choices=("true", "false"), required=True)
+    s.add_argument("--published-tag-sha", default="")
+    s.add_argument("--section-matches", choices=("true", "false"), default="true")
+
     s = sub.add_parser("read-file")
     s.add_argument("path")
     s.add_argument("pattern")
@@ -456,6 +549,7 @@ def main(argv: list[str]) -> int:
     s = sub.add_parser("changelog-extract")
     s.add_argument("path")
     s.add_argument("version")
+    s.add_argument("--include-heading", action="store_true")
 
     s = sub.add_parser("changelog-copy")
     s.add_argument("src")
@@ -480,6 +574,16 @@ def main(argv: list[str]) -> int:
             if refusal:
                 print(refusal)
                 return 1
+        elif a.cmd == "settle-state":
+            state, reason = settle_state(
+                a.version, a.branch_tip, a.candidate_merge_sha,
+                a.candidate_is_ancestor == "true", a.open_settle_pr == "true",
+                a.published_tag_exists == "true", a.release_exists == "true",
+                a.published_tag_sha,
+                section_matches=a.section_matches == "true",
+            )
+            print(state)
+            print(reason)
         elif a.cmd == "read-file":
             print(read_version_file(Path(a.path).read_text(), a.pattern))
         elif a.cmd == "bump-file":
@@ -509,7 +613,8 @@ def main(argv: list[str]) -> int:
                 dst.write_text(new)
                 print(what)
         elif a.cmd == "changelog-extract":
-            body = extract_changelog_section(Path(a.path).read_text(), a.version)
+            extract = changelog_section_text if a.include_heading else extract_changelog_section
+            body = extract(Path(a.path).read_text(), a.version)
             if body is None:
                 print(f"no section for v{normalize_version(a.version)} in {a.path}", file=sys.stderr)
                 return 1
