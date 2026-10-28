@@ -20,7 +20,7 @@ APPS = {
     "gutenberg": ("${{ vars.RELEASE_APP_CLIENT_ID }}", "${{ secrets.RELEASE_APP_PRIVATE_KEY }}"),
     "other": ("${{ vars.SOMETHING_ELSE_ID }}", "${{ secrets.SOMETHING_ELSE_KEY }}"),
 }
-LINE = re.compile(r"^::error file=(?P<file>[^:]*)::(?P<job>[^/]+)/(?P<step>.+?): (?P<rule>\w+): ")
+LINE = re.compile(r"^::error file=(?P<file>[^:]*)::(?P<job>[^/]+)/(?P<step>.+?): (?P<rule>L\d+'?|parse|input): ")
 
 
 def job(name="build", *, environment=None, app="maxwell", permissions=None, repositories=None,
@@ -95,6 +95,10 @@ class L6ExplicitPermissions(unittest.TestCase):
         text = workflow(job(app="gutenberg", environment="release", release_step=True))
         self.assertEqual(rules(lint("release-settle.yml", text)), [("L6", "build")])
 
+    def test_gutenberg_token_without_permissions_fails_without_environment(self):
+        text = workflow(job(app="gutenberg"))
+        self.assertEqual(rules(lint("release-candidate.yml", text)), [("L6", "build")])
+
     def test_any_app_token_in_a_release_job_needs_permissions(self):
         self.assertEqual(rules(lint("ci.yml", workflow(job(app="other", release_step=True)))), [("L6", "build")])
         text = workflow(job(app="other", environment="release"))
@@ -107,7 +111,7 @@ class L6ExplicitPermissions(unittest.TestCase):
         self.assertEqual(lint("ci.yml", workflow(job(permissions={"contents": "read"}))), [])
 
 
-class L2GutenbergEnvironment(unittest.TestCase):
+class L2GutenbergFileAllowlist(unittest.TestCase):
     WRITE = {"contents": "write", "pull-requests": "write"}
 
     def test_release_environment_as_string_passes(self):
@@ -121,20 +125,46 @@ class L2GutenbergEnvironment(unittest.TestCase):
         text = workflow(job(app="gutenberg", environment="publish", permissions={"contents": "read"}, repositories=["rust-rocksdb"]))
         self.assertEqual(lint("on-release.yml", text), [])
 
-    def test_no_environment_fails(self):
-        self.assertEqual(rules(lint("ci.yml", workflow(job(app="gutenberg", permissions=self.WRITE)))), [("L2", "build")])
+    def test_contents_write_without_environment_in_allowed_files_passes(self):
+        text = workflow(job(app="gutenberg", permissions={"contents": "write"}))
+        for name in ("release-candidate.yml", "release-settle.yml", ".github/workflows/on-release.yml"):
+            with self.subTest(name=name):
+                self.assertEqual(lint(name, text), [])
 
-    def test_other_environment_fails(self):
-        text = workflow(job(app="gutenberg", environment="staging", permissions={"contents": "read"}))
-        self.assertEqual(rules(lint("ci.yml", text)), [("L2", "build")])
+    def test_contents_write_in_non_release_file_fails_naming_file(self):
+        text = workflow(job(app="gutenberg", permissions={"contents": "write"}))
+        lines = lint("daily-audit.yml", text)
+        self.assertEqual(rules(lines), [("L2'", "build")])
+        self.assertTrue(lines[0].startswith("::error file=daily-audit.yml::build/token: L2': "))
 
-    def test_publish_environment_with_write_fails(self):
+    def test_release_action_does_not_bypass_file_allowlist(self):
+        text = workflow(job(app="gutenberg", permissions=self.WRITE, release_step=True))
+        self.assertEqual(rules(lint("daily-audit.yml", text)), [("L2'", "build")])
+
+    def test_other_environment_in_allowed_file_passes(self):
+        text = workflow(job(app="gutenberg", environment="staging", permissions=self.WRITE))
+        self.assertEqual(lint("release-candidate.yml", text), [])
+
+    def test_similar_filenames_are_not_allowlisted(self):
+        text = workflow(job(app="gutenberg", permissions=self.WRITE))
+        for name in ("release-candidate.yaml", "release-publish.yml", "release-publish-x.yaml",
+                     "release-publish-rust-crates.yml", "release-publish-anything.yml",
+                     "release-publish-binaries.yml", "daily-release-publish-x.yml"):
+            with self.subTest(name=name):
+                self.assertEqual(rules(lint(name, text)), [("L2'", "build")])
+
+    def test_dispatch_trigger_does_not_admit_arbitrary_publish_file(self):
+        text = workflow(job(app="gutenberg", permissions={"contents": "write"})).replace(
+            "on: push", "on: workflow_dispatch")
+        self.assertEqual(rules(lint("release-publish-anything.yml", text)), [("L2'", "build")])
+
+    def test_publish_environment_with_write_passes(self):
         text = workflow(job(app="gutenberg", environment="publish", permissions={"contents": "write"}))
-        self.assertEqual(rules(lint("on-release.yml", text)), [("L2", "build")])
+        self.assertEqual(lint("on-release.yml", text), [])
 
-    def test_publish_environment_with_more_than_contents_read_fails(self):
+    def test_publish_environment_with_more_than_contents_read_passes(self):
         text = workflow(job(app="gutenberg", environment="publish", permissions={"contents": "read", "pull-requests": "read"}))
-        self.assertEqual(rules(lint("on-release.yml", text)), [("L2", "build")])
+        self.assertEqual(lint("on-release.yml", text), [])
 
 
 class L3ReleaseWorkflows(unittest.TestCase):
@@ -204,14 +234,47 @@ class L5ReleaseEnvironment(unittest.TestCase):
         text = workflow(job(app=None, environment="{ name: release }"))
         self.assertEqual(rules(lint("release-publish.yml", text)), [("L5", "build")])
 
+    def test_gated_environments_and_gutenberg_share_exact_file_allowlist(self):
+        for environment in ("release", "{ name: release }", "publish", "{ name: publish }"):
+            text = workflow(job(app="gutenberg", environment=environment,
+                                permissions={"contents": "write"}, release_step=True)).replace(
+                "/release-settle@main", "/release-publish-rust-crates@main")
+            for name in ("release-candidate.yml", "release-settle.yml", "on-release.yml"):
+                with self.subTest(environment=environment, name=name):
+                    self.assertEqual(lint(name, text), [])
+            for name in ("release-publish.yml", "release-publish-rust-crates.yml",
+                         "release-publish-anything.yml", "release-candidate.yaml"):
+                with self.subTest(environment=environment, name=name):
+                    lines = lint(name, text)
+                    self.assertEqual(rules(lines), [("L5", "build"), ("L2'", "build")])
+                    self.assertIn(f"environment `{ 'publish' if 'publish' in environment else 'release' }`",
+                                  lines[0])
+
     def test_release_environment_in_the_three_allowed_files_passes(self):
         text = workflow(job(app=None, environment="release"))
         for name in ("release-candidate.yml", "release-settle.yml", "on-release.yml"):
             with self.subTest(name):
                 self.assertEqual(lint(name, text), [])
 
+    def test_publish_environment_in_the_three_allowed_files_passes(self):
+        for environment in ("publish", "{ name: publish }"):
+            text = workflow(job(app=None, environment=environment, release_step=True))
+            for name in ("release-candidate.yml", "release-settle.yml", "on-release.yml"):
+                with self.subTest(environment=environment, name=name):
+                    self.assertEqual(lint(name, text), [])
+
+    def test_publish_environment_in_other_release_workflows_fails(self):
+        for environment in ("publish", "{ name: publish }"):
+            text = workflow(job(app=None, environment=environment, release_step=True))
+            for name in ("ci.yml", "release-publish-binaries.yml"):
+                with self.subTest(environment=environment, name=name):
+                    self.assertEqual(rules(lint(name, text)), [("L5", "build")])
+
     def test_other_environments_are_free(self):
-        self.assertEqual(lint("ci.yml", workflow(job(app=None, environment="publish"))), [])
+        self.assertEqual(lint("ci.yml", workflow(job(app=None, environment="staging"))), [])
+
+    def test_publish_environment_outside_release_workflows_is_free(self):
+        self.assertEqual(lint("snapshot-publish.yml", workflow(job(app=None, environment="publish"))), [])
 
 
 class MalformedInput(unittest.TestCase):
@@ -251,7 +314,8 @@ class CommandLine(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "GITHUB_REPOSITORY"}
         if repository:
             env["GITHUB_REPOSITORY"] = repository
-        return subprocess.run([sys.executable, "-I", str(SCRIPT), *args], capture_output=True, text=True, env=env)
+        # Use the same dependency environment as the suite, including user-installed PyYAML.
+        return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=env)
 
     def directory(self, files):
         tmp = tempfile.TemporaryDirectory()

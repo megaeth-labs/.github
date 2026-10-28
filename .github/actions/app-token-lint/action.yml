@@ -2,14 +2,17 @@ name: App Token Lint
 description: >-
   Fail a workflow change that mints GitHub App tokens the wrong way. Maxwell
   (the CI app) may not request a `permission-<x>: write` other than
-  pull-requests and issues; Gutenberg (the release app) may be minted only in a
-  job of the `release` environment, or in a `publish` job when the token asks
-  for exactly `permission-contents: read`; release workflows (those using the
+  pull-requests and issues; Gutenberg (the release app) reads
+  `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY` from repository scope and
+  may be minted only in `release-candidate.yml`, `release-settle.yml` or
+  `on-release.yml`, with or without an environment and whatever contents
+  permission the job needs, because L6 still forces an explicit
+  `permission-*` list either way; release workflows (those using the
   release-candidate, release-settle, release-publish or release-route actions,
   and on-release.yml) mint no Maxwell token, never name their own repository
   in a read-only dependency token, and never use `mega-maxwell[bot]` as a git
-  identity or PR author filter; and `environment: release` appears only in
-  release-candidate.yml, release-settle.yml and on-release.yml. Violations are
+  identity or PR author filter; and the one-reviewer `publish` environment
+  gates only tagging, Release creation and artifact upload. Violations are
   reported as `::error file=<path>::<job>/<step>: <rule>: <message>`; unreadable
   or malformed YAML is an error too. No network.
 
