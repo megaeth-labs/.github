@@ -124,6 +124,11 @@ runs:
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
+        # Default the newer inputs here too: a consumer that omits them (or a
+        # harness that extracts this step without the action's input defaults)
+        # must get the old behaviour, never an unbound-variable failure.
+        SETTLE_SOURCE="${SETTLE_SOURCE:-pr}"
+        RELEASE_BRANCH="${RELEASE_BRANCH:-}"
         if [[ ! "$MERGE_SHA" =~ ^[0-9a-f]{40}$ || ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
           echo "::error::publish needs a full 40-hex commit and a numeric pr_number (the release-route outputs)"; exit 1
         fi
@@ -333,6 +338,8 @@ runs:
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
         set -euo pipefail
+        SETTLE_SOURCE="${SETTLE_SOURCE:-pr}"
+        RELEASE_BRANCH="${RELEASE_BRANCH:-}"
         # Re-check the order now, right before the tag exists: another release
         # line publishes under its own concurrency group and may have won.
         latest="$(git ls-remote --tags --refs origin 'refs/tags/v*' | cut -f2 | sed 's#^refs/tags/##' |
