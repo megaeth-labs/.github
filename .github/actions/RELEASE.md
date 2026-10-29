@@ -28,8 +28,9 @@ Contents:
 
 ## What it does, and the choices behind it
 
-A release is four phases, each a workflow in the consuming repository calling
-one composite action here at `@main`. The workflows carry no decision logic:
+A release is four phases across three workflows in the consuming repository:
+candidate, settle (including its publish job), and publish targets. They call
+the composite actions here at `@main`. The shared actions hold the decisions:
 the read-only `release-route` action classifies every push and dispatch and
 answers `cut`, `refresh`, `publish` or `skip`, with a one-line reason in the
 job log.
@@ -37,7 +38,7 @@ job log.
 | Phase | Trigger | Result |
 |---|---|---|
 | **Candidate** | a maintainer dispatches `release-candidate.yml` with a version | a PR on the default branch that bumps the version and drafts the changelog entry; merging it creates `release-vX.Y.Z` at the merge commit |
-| **Settle** | a push to `release-vX.Y.Z`: the branch being cut, and every later push to it | `route` answers `refresh`, and `release-settle` opens or updates one reviewed `chore/release-settle-vX.Y.Z` PR onto the release branch, carrying the changelog entry for the commits since the previous tag |
+| **Settle** | a push to `release-vX.Y.Z`: the branch being cut, and every later push to it | `route` answers `refresh`; `release-settle` writes nothing for a clean candidate merge, otherwise opens or updates one reviewed `chore/release-settle-vX.Y.Z` PR carrying the changelog entry |
 | **Publish** | the settle PR merging, or a dispatch of `release-settle.yml` with a version whose branch needs no settle PR | `release-publish` creates the annotated tag `vX.Y.Z` at the settled commit and publishes the GitHub Release with the changelog section as notes |
 | **Publish targets** | the GitHub Release being published | whatever the repository ships: crates to crates.io, binaries to the artifact registry, downloads on the Release page, composed in `on-release.yml` from the publish-target actions |
 
@@ -57,9 +58,11 @@ The choices that shape it:
   ruleset forbids updating or deleting them, and its only bypass actors are
   the repository admin role and the app, so nothing else can create one.
 - **The settle PR is the release decision.** A push to the release branch
-  never publishes directly; it opens or refreshes the settle PR, and merging
-  that PR publishes. When the branch is exactly the candidate merge, with no
-  fixes on top and no settle PR open, a maintainer can instead dispatch
+  never publishes directly unless it is the fresh settle PR merging; other
+  pushes refresh settlement. A clean candidate merge creates no settle PR.
+  When the branch is exactly the candidate merge, with no
+  fixes on top and no settle PR or tag, and its changelog section matches the
+  regenerated notes (or changelog handling is disabled), a maintainer dispatches
   `release-settle.yml` with the version: the clean state routes straight to
   `publish`, and the run waits for a required reviewer of the `release`
   environment. That approval stands in for the PR.
@@ -72,9 +75,14 @@ The choices that shape it:
   published and blocked skip with the reason. A tag that exists at the
   candidate merge without its Release (a run that died between the two
   steps) is `resume`: publishing runs again and creates the missing Release.
+  Dispatch routing assumes a matching changelog; publish verifies the actual
+  section and refuses a mismatch before tagging. A refresh action also compares
+  the section, so a stale section creates a settle PR even at the candidate
+  merge. A tag at a settle-PR merge is blocked by versioned dispatch; recover
+  that publication by re-running its original push-triggered run.
 - **The changelog has one owner per phase, and no dates.** The candidate PR
-  drafts the entry under an undated `## vX.Y.Z` heading from the merged PR
-  titles and syncs the previous release's final entry from its tag. The
+  drafts the entry under an undated `## vX.Y.Z` heading from non-merge
+  commit subjects and syncs the previous release's final entry from its tag. The
   settle PR re-drafts the same undated entry over the commits that actually
   ship. The Release body is that section read from the tagged tree,
   verbatim; nothing stamps a date anywhere. The default branch catches up in
@@ -97,7 +105,7 @@ The choices that shape it:
 - **A lint holds those rules.** `app-token-lint` runs on every workflow
   change (the `app-token-lint.yml` template). Rule L2' allows a Gutenberg
   mint only in `release-candidate.yml`, `release-settle.yml`,
-  `on-release.yml` and `release-publish-*.yml`; rule L6 requires every app
+  `on-release.yml` (exact filenames, not prefixes); rule L6 requires every app
   token in a release workflow to list its `permission-*` inputs explicitly,
   because a token minted without them gets every permission of the
   installation, contents write included.
@@ -125,10 +133,10 @@ Commands assume `gh` authenticated as a maintainer and the default branch
 gh workflow run release-candidate.yml --ref main -f version=1.2.3
 ```
 
-Within a minute the app opens a candidate PR from the branch
+The app opens a candidate PR from the branch
 `chore/release-candidate-1.2.3`: the version file bumped, whatever
 `bump_command` maintains (a lockfile, path-dependency versions), the
-changelog entry `## v1.2.3` drafted from the merged PR titles since the last
+changelog entry `## v1.2.3` drafted from non-merge commit subjects since the last
 `v*` tag (grouped by Conventional Commit type, with PR links), and the
 previous release's entry synced from its tag. Review it like any PR; fix
 wording in it if the generated entry needs work.
@@ -153,8 +161,14 @@ runs `release-settle.yml`. Once the candidate has landed on the branch,
 `route` answers `refresh` and the settle job opens (or refreshes) the PR
 from `chore/release-settle-v1.2.3` onto the release branch, with the entry
 for the commits since the previous tag under the undated `## v1.2.3`
-heading. Review it like any PR. Nothing is published yet, and every new push
-to the branch refreshes the same PR.
+heading when the state is `needs-settle-pr`. At the candidate merge with no
+open settle PR or tag and a section matching regenerated notes (or changelog
+handling disabled), the state is `clean`: the action skips all write steps
+and creates no settle PR. Its summary says the release branch is unchanged
+at the candidate merge and nothing was written. Push routing cannot see
+changelog state, so its `refresh` answer can legitimately end in this clean
+no-op. Use the versioned dispatch in step 4 to publish that branch. Otherwise,
+review the settle PR like any PR; each new push refreshes it.
 
 **4. Publish**, one of two ways:
 
@@ -172,10 +186,15 @@ to the branch refreshes the same PR.
   ```
 
   When the branch tip is exactly the candidate merge, with no open settle PR
-  and no tag, the settlement state is `clean` and routes straight to
-  `publish`. A branch with commits beyond the candidate merge, or an open
+  and no tag, dispatch routing assumes a clean changelog and routes straight to
+  `publish` with `settle_source=dispatch`. Publish compares the committed
+  section with regenerated notes and refuses a mismatch; dispatch with a
+  blank `version` to refresh that section through a settle PR first.
+  A branch with commits beyond the candidate merge, or an open
   settle PR, routes to `refresh` instead; a version already published, or
   one whose candidate is not an ancestor of the tip, skips with the reason.
+  A tag not at the candidate merge also skips, even when a settle PR created
+  it; re-run the original push-triggered run to recover that publication.
   A blank `version` refreshes every eligible release branch and never
   publishes.
 
@@ -332,6 +351,25 @@ this repository):
 python3 .github/scripts/app_token_lint.py --repo REPO /path/to/REPO/.github/workflows
 ```
 
+Required PR checks must also run against release branches. A consumer
+`pull_request.branches: [main]` filter must include `"release-v*"` too
+(substitute the actual default branch); audit job conditions, path filters,
+test workflows and any `compat:` label check. Otherwise a candidate targeting
+a release branch, and the follow-up settle PR, cannot satisfy those required
+checks. Carry the corrected CI workflows onto existing release branches.
+For `base_commit` candidates, include them in `release_workflows`, for example:
+
+```yaml
+release_workflows: |
+  .github/workflows/release-settle.yml
+  .github/workflows/on-release.yml
+  .github/workflows/lint.yml
+```
+
+The default carry list includes only the two release workflows, not lint or
+tests. Fix the CI filters on the default branch before proposing the candidate
+so its PR carries the corrected files.
+
 **6. The changelog.** Create `CHANGELOG.md` with a preamble and nothing
 else; the first candidate PR adds the first entry. A previous, hand-made
 release history is not needed: the notes for the first pipeline release are
@@ -371,7 +409,9 @@ naming those repositories, never the release token. Examples:
   path dependencies pinned to the workspace version, then the lockfile.
 
 **Labels** (`pr_labels`, candidate and settle): for repositories whose label
-gates apply to the app's PRs.
+gates apply to the app's PRs. The templates leave this empty: where a consumer
+requires a `compat:` label, the reviewer chooses it for each candidate or
+settle PR. The shared actions do not enforce a compatibility-label gate.
 
 **Branch prefix** (`release_branch_prefix`, default `release-v`): change it
 everywhere at once, including the `branches:` filter in `release-settle.yml`
@@ -487,19 +527,22 @@ workflow-wide group would let such a run evict a queued release run), the
 candidate refresh runs one per PR, the settle refresh and publish one per
 release branch, and `on-release` one per tag.
 
-**The tag already exists** when settling: that version is released, and the
-refresh refuses to touch it. Pick the next version and start from the
-candidate.
+**The tag already exists** when settling: the refresh refuses to touch it.
+If its GitHub Release exists too, pick the next version and start from the
+candidate. If not, recover the interrupted publication as below.
 
 **A publish died between the tag and the Release.** The half-published state
 (tag at the candidate merge, no Release) is `resume`: re-run the failed run,
-or dispatch `release-settle.yml` with the version. Either routes to
-`publish`, skips the tag step and creates the missing Release.
+or dispatch `release-settle.yml` with the version. For a tag created by
+merging a settle PR, re-run the original push-triggered run at that merge:
+a versioned dispatch refuses a tag not at the candidate merge. The appropriate
+path skips the tag step and creates the missing Release.
 
 **A publish target failed after the tag was created**: fix the cause on
 the default branch. If the fix is in the shared action, dispatch
 `on-release.yml` again on the tag (`--ref vX.Y.Z -f dry_run=false`); all
-targets are idempotent, so the ones that succeeded are no-ops. If the fix is
+registry and crate targets skip identical or already-published versions,
+while Release assets are uploaded again with `--clobber`. If the fix is
 in the workflow file itself, it cannot reach that tag's tree; the next
 release carries it.
 

@@ -75,8 +75,9 @@ environment; the publish job that tags and creates the Release declares
 - uses: megaeth-labs/.github/.github/actions/release-settle@main
   with:
     token: ${{ steps.app-token.outputs.token }}
-    version: ${{ inputs.version }}
-    commit: ${{ inputs.commit }}      # full SHA of the release-branch tip
+    version: ${{ matrix.target.version }}
+    commit: ${{ matrix.target.commit }}   # full SHA of the release-branch tip
+    release_branch: ${{ matrix.target.release_branch }}
     version_file: Cargo.toml
     version_pattern: toml
     changelog_file: CHANGELOG.md
@@ -85,19 +86,30 @@ environment; the publish job that tags and creates the Release declares
 The action itself never tags and never creates a Release: it only maintains
 `chore/release-settle-vX.Y.Z`. Publishing is `release-publish`, called by the
 template's publish job on a clean dispatch or on the settle PR's merge.
+The workflow's sole dispatch input is `version`; a blank value refreshes
+every eligible release branch. `commit` is an action input supplied by the
+route's refresh-target matrix, not a workflow dispatch input.
 
 ## Notes
 
 - Before generating notes or ensuring the PR, `settle-state` compares the
   release-branch tip with the merged candidate PR, checks ancestry, and reads
-  the open settle PR, tag and GitHub Release facts. If the branch is unchanged
-  at the candidate merge with no open settle PR or tag, the action succeeds
-  with step outputs `settled=false` and `state=clean`. The run summary says
+  the open settle PR, tag and GitHub Release facts, and compares the committed
+  changelog section with regenerated notes. If the branch is unchanged
+  at the candidate merge with no open settle PR or tag and a matching section
+  (or changelog handling is disabled), the action succeeds
+  with internal step outputs `settled=false` and `state=clean`; these are not
+  public action outputs. The public `pr_url` and `notes_file` are empty.
+  The run summary says
   nothing was written: git identity configuration, notes generation and the
   entire ensure-PR step are skipped, so no settle branch, commit, PR creation,
   update or comment is made. Only `needs-settle-pr` reaches the existing PR flow,
   including its deliberate `--allow-empty` commit when a fresh branch records
   settlement.
+- Push routing cannot see changelog state and returns `refresh` even when this
+  action will find `clean`; that is a successful no-op, not a missing PR.
+  Publish a clean branch by dispatching `release-settle.yml` with its version.
+  A blank-version dispatch only refreshes and never publishes.
 - Guards, in order: `commit` is a full SHA; the release branch exists; the
   tag does not; `commit` is the branch tip; the version file at `commit`
   says the version; the version is newer than the latest `v*` tag. Then a
@@ -110,7 +122,7 @@ template's publish job on a clean dispatch or on the settle PR's merge.
 - `pr`: pushes `chore/release-settle-vX.Y.Z` and opens the settle PR,
   titled `chore(release): settle vX.Y.Z — merging publishes the release`.
   Its body opens with an `[!IMPORTANT]` alert saying that merging it settles
-  the release, followed by the `<!-- release-settle: vX.Y.Z <sha> -->`
+  the release, followed by the `<!-- release-settle: vX.Y.Z <40-hex> -->`
   marker that `release-route` and `release-publish` read. A new tip on the
   release branch merges into the same PR and moves the marker; a re-run
   with nothing new changes nothing. Only a PR that is closed, merged or not

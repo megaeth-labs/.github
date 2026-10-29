@@ -107,6 +107,13 @@ repeats the entire state check inside the tag step immediately before tagging,
 so branch drift during an environment approval is refused for a fresh publish.
 Both refusal messages state the fresh-publish equality rule and the existing-tag
 ancestry rule.
+These are composite-action inputs, not workflow dispatch inputs:
+`release-settle.yml` accepts only `version`, and its route supplies the commit,
+candidate PR number and `settle_source=dispatch` to the publish job. Dispatch
+routing assumes a matching changelog; this action compares the committed
+section with regenerated notes and refuses stale notes before tagging.
+Refresh them through a blank-version settle dispatch and merge the resulting
+settle PR instead.
 
 ## Notes
 
@@ -131,5 +138,7 @@ ancestry rule.
   push; tags that are not `vX.Y.Z` are ignored.
 - The tag push comes from the app token so `push: tags` and `release`
   workflows fire; the app must bypass the `v*` tag ruleset.
-- This workflow must exist on the release branch (it does when the branch
-  was cut from a default branch that has it).
+- The caller, `release-settle.yml`, must exist on the release branch for its
+  push-triggered publish job to run (it does when the branch was cut from a
+  default branch that has it). Publication is that workflow's `publish` job,
+  not a separate consumer workflow.

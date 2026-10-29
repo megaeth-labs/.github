@@ -84,13 +84,32 @@ branch or that release branch, `candidate_is_ancestor` from a Git ancestry
 check against its tip, `open_settle_pr` from the open settle PR lookup, and
 `published_tag_sha` from the peeled release tag (or the lightweight tag).
 All four keys are always present: missing SHAs and ancestry without a candidate
-are empty strings, and no open settle PR is `false`. Dispatches without a
+are empty strings, and no open settle PR is `false`. A selected branch without a
+candidate merge fails with `missing settlement facts: candidate_merge_sha`;
+it does not route to a successful skip. Dispatches without a
 version leave these facts empty or false.
 
 Each dispatch branch also includes `release_exists`, queried with
 `gh release view v<version>` when its tag exists and otherwise `false`.
 Together with the tag facts, this lets an already published version route
-to `skip` instead of `publish`.
+to `skip` instead of `publish`. The tag must point at the candidate merge:
+a tag at a settle-PR merge is `blocked` by versioned dispatch, whether or not
+its Release exists. Recover an interrupted settle-PR publication by re-running
+its original push-triggered run, not by versioned dispatch.
+
+For an ordinary push after the candidate lands, routing returns `refresh`
+without comparing changelog state. The settle action then compares the
+section and may find `clean`, write nothing and create no PR. Publish that
+branch with a versioned dispatch. Dispatch routing also does not compare
+the section: it assumes a match, and `release-publish` refuses stale notes
+before tagging. Use a blank-version dispatch to refresh stale notes first.
+The versioned dispatch route does not check version ordering; the publish
+guard still refuses versions not newer than every other `vX.Y.Z` tag.
+
+The workflow accepts only `version` on dispatch. A blank version refreshes all
+eligible branches and never publishes. The `version`, `release_branch` and
+`commit` outputs also describe a selected versioned dispatch; a resume uses
+the existing tag's peeled commit rather than a branch tip that has advanced.
 
 A push to a `release_branch_prefix` branch whose suffix is not `X.Y.Z` (for
 example `release-vnext`) routes to `skip` with a reason naming the branch; a

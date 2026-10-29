@@ -10,12 +10,12 @@ per-action READMEs linked below.
 | Identity | Does | Never does |
 |---|---|---|
 | `mega-gutenberg[bot]` (the release app) | Every write of the release: the candidate PR, the `release-vX.Y.Z` branch, the settle PR, the tag, the GitHub Release | Nothing is approved by it; it is not a reviewer |
-| `mega-maxwell[bot]` (the CI app) | Only ever reads, as far as a release is concerned: at most a read-only token for private dependencies | Create a branch, PR, tag or Release of a release; appear as a git identity or PR-author filter in a release workflow |
-| A human reviewer | Reviews and merges the candidate PR and the settle PR; approves the `release` environment when a dispatch publishes; adds the `compat:` label | - |
+| `mega-maxwell[bot]` (the CI app) | CI outside the release workflows | Mint any token in a release workflow, even read-only; appear as a git identity or PR-author filter there. Private dependency reads use a separate read-only Gutenberg token. |
+| A human reviewer | Reviews and merges the candidate PR and, when needed, the settle PR; approves the `release` environment for either publish path; adds the `compat:` label where the repository requires it | - |
 
 The [app-token lint](#app-token-lint) refuses a gutenberg token anywhere
 outside the allowlisted release workflow files (`release-candidate.yml`,
-`release-settle.yml`, `on-release.yml`, `release-publish-*.yml`, rule L2') on
+`release-settle.yml`, `on-release.yml`, rule L2') on
 every workflow change. The publish job runs in the
 `release` environment; the jobs that propose, cut and settle run without one,
 and the candidate's `refresh` job mints its token without one too.
@@ -23,8 +23,8 @@ and the candidate's `refresh` job mints its token without one too.
 ## The four flows
 
 Each flow starts from a push (or a merge) the previous one made; there is no
-polling. The only manual triggers are the candidate dispatch of flow 1 and the
-versioned settle dispatch of flow 3. The read-only `route` step
+polling. The core workflows accept a candidate dispatch in flow 1 and a settle
+dispatch in flows 2 and 3. The read-only `route` step
 ([`release-route`](../.github/actions/release-route/README.md)) decides what a
 push or a dispatch means: `cut`, `refresh`, `publish` or `skip`, with a
 one-sentence reason in the job log.
@@ -32,9 +32,10 @@ one-sentence reason in the job log.
 1. **Candidate: push to the default branch, then the cut.** An operator starts
    the Release Candidate workflow with the version (and optionally
    `base_commit`). Gutenberg opens a `chore/release-candidate-X.Y.Z` PR that
-   bumps the version file and drafts the changelog entry under an undated
-   `## vX.Y.Z` heading; the notes generator is never given a date. A reviewer
-   adds the `compat:` label (see [the reviewer step](#the-reviewer-step-the-compat-label))
+   bumps the version file and drafts the changelog entry from non-merge commit
+   subjects under an undated `## vX.Y.Z` heading; the notes generator is never
+   given a date. A reviewer adds the `compat:` label where required
+   (see [the reviewer step](#the-reviewer-step-the-compat-label))
    and merges it. The merge is a push to the default branch; `route` finds the
    merged, gutenberg-authored candidate PR and answers `cut`, and
    [`release-candidate`](../.github/actions/release-candidate/README.md) creates
@@ -52,9 +53,17 @@ one-sentence reason in the job log.
 
 2. **Settle: push to `release-vX.Y.Z`, then the settle PR.** The creation of the
    branch (and every later push to it) starts the Release Settle workflow.
-   Once the candidate has landed on the branch, `route` answers `refresh` and
-   [`release-settle`](../.github/actions/release-settle/README.md) opens or
-   updates one long-lived `chore/release-settle-vX.Y.Z` PR onto the release
+   Once the candidate has landed on the branch, `route` answers `refresh`.
+   [`release-settle`](../.github/actions/release-settle/README.md) then checks
+   the changelog too: if the tip equals the candidate merge, no settle PR or
+   tag exists, and the section matches regenerated notes (or changelog handling
+   is disabled), the state is `clean`. It writes nothing and creates no settle
+   PR; publish it with the versioned dispatch in flow 3. Push routing cannot
+   see changelog state, so `refresh` in the route log and `clean` in the action
+   are consistent, not a failed PR creation.
+
+   Otherwise, `needs-settle-pr` opens or updates one long-lived
+   `chore/release-settle-vX.Y.Z` PR onto the release
    branch, with the changelog entry for the commits since the previous tag.
    The heading stays undated here too. New commits on the release branch
    refresh the same PR. A dispatch with a blank `version` refreshes every eligible
@@ -63,7 +72,8 @@ one-sentence reason in the job log.
 3. **Publish: merge the settle PR, or dispatch a clean branch.** Two paths,
    one publish step.
 
-   *Merge the settle PR:* a reviewer adds the `compat:` label and merges it.
+   *Merge the settle PR:* a reviewer adds the `compat:` label where required
+   and merges it.
    The merge is a push to the release branch; `route` re-checks that the PR is
    gutenberg's, that it settled exactly the branch tip it was merged onto, and
    answers `publish`. This is the path a branch takes when it carries fixes on
@@ -76,9 +86,15 @@ one-sentence reason in the job log.
    commit is an ancestor of the branch tip, whether a settle PR is open, and
    whether the tag and the GitHub Release exist. A clean state (the tip equals
    the candidate merge, no settle PR is open, the version is unpublished)
-   routes to `publish`. Commits beyond the candidate merge or an open settle PR
+   routes to `publish` with `settle_source=dispatch`. Dispatch routing does not
+   compare the changelog section; publish checks it against regenerated notes
+   and refuses a mismatch before tagging. Refresh first with a blank-version
+   dispatch if that happens. Commits beyond the candidate merge or an open settle PR
    route to `refresh` instead. A version whose tag and Release both exist is
-   skipped, and so is one whose candidate is not an ancestor of the tip. A tag
+   skipped when its tag is at the candidate merge, and so is one whose candidate
+   is not an ancestor of the tip. A tag elsewhere is blocked by this dispatch
+   path, including one created from a settle PR; re-run that publication's
+   original push-triggered run to recover it. A tag
    that exists at the candidate merge without its Release (a run that died
    between the two steps) routes to `publish` again and resumes.
 
@@ -92,8 +108,8 @@ one-sentence reason in the job log.
    no date is injected. A settle PR that went stale before it merged publishes
    nothing; `route` answers `refresh` and a fresh PR follows.
 
-4. **Assets: the tag push (the Release) fires On Release.** Publishing the
-   Release runs the repository's `on-release.yml`, which builds, verifies the
+4. **Assets: publishing the Release fires On Release.** The `release: published`
+   event runs the repository's `on-release.yml`, which builds, verifies the
    version ([`release-verify-version`](../.github/actions/release-verify-version/README.md)),
    uploads ([`release-upload-artifact`](../.github/actions/release-upload-artifact/README.md)),
    attaches [release assets](../.github/actions/release-assets/README.md), and
@@ -167,19 +183,33 @@ copy before pushing (from a checkout of this repository):
 python3 .github/scripts/app_token_lint.py --repo my-repo /path/to/my-repo/.github/workflows
 ```
 
-Each template ships with a `.properties.json` sidecar that feeds the "New
-workflow" picker; keep the pair together when copying. The templates carry the
-mega-reth values as the worked example: `Cargo.toml` with `version_pattern:
-toml`, `cargo update --workspace` as the bump command, and the private
-dependency repos as the read-only dependency token's `repositories`.
+Each template ships with a `.properties.json` sidecar for the organization's
+"New workflow" picker; consumers copy the YAML into `.github/workflows/`,
+not the sidecar. The core templates use `VERSION` with `version_pattern: plain`;
+the bump command is a commented example, not an enabled Cargo setup. Use
+`.github/scripts/copy_templates.py` to render the core workflows with the
+repository's version file, pattern, bump command and private dependency repos.
+
+Required PR checks must run for PRs targeting `release-v*`, not just the
+default branch. For example, a consumer `lint.yml` with
+`pull_request.branches: [main]` needs `[main, "release-v*"]` (use the actual
+default branch). Check test and label workflows too, including job conditions
+and path filters. A candidate aimed at a release branch otherwise has no
+required checks, and the follow-up settle PR has the same problem. For
+`base_commit` candidates, add the corrected lint/test workflows to
+`release_workflows` so they are carried from the default branch in the candidate
+PR; the default list carries only `release-settle.yml` and `on-release.yml`.
+An existing release branch needs those CI changes carried onto it too.
 
 ## The reviewer step: the `compat:` label
 
-Every PR into the default branch or a `release-*` branch must carry a label
-starting with `compat:` (mega-reth's required check "Compatibility Label Check",
-in `pr-title.yml`). The patch/minor/major call is a per-release judgement, so
+Where the consumer requires it, every PR into the default branch or a
+`release-*` branch must carry a label starting with `compat:` (for example,
+mega-reth's "Compatibility Label Check" in `pr-title.yml`). This is a consumer
+check, not a gate implemented by the shared release actions.
+The patch/minor/major call is a per-release judgement, so
 the pipeline leaves `pr_labels` empty on the candidate and settle PRs. The
-reviewer adds the label to both PRs while reviewing. `pr-title.yml` also
+reviewer adds the label to both PRs while reviewing. Mega-reth's `pr-title.yml` also
 listens for `labeled`, so adding the label re-runs the check and turns it green;
 no push or manual re-run is needed.
 
@@ -200,10 +230,10 @@ run; `::warning::` and the route `skip` reason do not.
 | `refusing to publish settle PR #N: vX.Y.Z is not newer than the latest published tag vA.B.C (rule: a version is published only when it is newer than every vX.Y.Z tag)` | An older line (a hotfix branch) was settled after a newer release was published. It is not tagged, so the newer Release stays latest. Cut the fix as a version above vA.B.C instead. |
 | `vX.Y.Z is already published` | The tag and the Release both exist. |
 | `merged settle PR #N was stale (settled …, tip was …); a fresh settle PR follows` | The branch moved after the settle PR was written. Review and merge the fresh PR. |
-| `vX.Y.Z is tagged but has no Release: re-run the release-settle run for the settle PR's merge commit … to finish publishing` (also a `::warning::`) | `publish` died between tag and Release. Re-run the failed run for that merge commit, or dispatch Release Settle with the version: the half-published state routes to `publish` and creates the missing Release. |
+| `vX.Y.Z is tagged but has no Release: re-run the release-settle run for the settle PR's merge commit … to finish publishing` (also a `::warning::`) | `publish` died between tag and Release. For a settle-PR publication, re-run the original push-triggered run at that merge commit. A versioned dispatch resumes only a tag at the candidate merge, not a settle-PR merge. |
 | `vX.Y.Z already has a published tag and Release` | A versioned dispatch named a finished release. Nothing to do. |
 | `candidate merge … is not an ancestor of tip …` | A versioned dispatch, but the branch history no longer contains the candidate merge (rewritten, or the wrong branch). Skipped; restore the branch or start the release again. |
-| `vX.Y.Z points to …, not candidate merge …` | The tag exists at a commit that is not the candidate PR's merge. Skipped; investigate the tag before doing anything else. |
+| `vX.Y.Z points to …, not candidate merge …` | Versioned dispatch blocks a tag not at the candidate merge. A settle-PR merge tag is legitimate: re-run its original push-triggered run if its Release is missing. Investigate any other unexpected tag target. |
 | `release branch release-vX.Y.Z does not exist` | A versioned dispatch named a version that was never cut. |
 | `no route for kind=…, event=…, ref=…` | The event is not one the pipeline handles. |
 
@@ -218,12 +248,12 @@ run; `::warning::` and the route `skip` reason do not.
 | `candidate PR #N targets '…', not the default branch '…'` | Only a candidate merged into the default branch is cut. |
 | `branch <name> already exists: vX.Y.Z was already cut from its merged candidate, so there is nothing left to propose; settle it from <name>` | The release was proposed before. Settle the existing branch, or delete it and propose again. |
 | `release candidates start from the default branch (…); this run is on …` | Dispatch the candidate workflow from the default branch. |
-| `base_commit … is not reachable from the default branch (…); a release must ship code that landed on trunk` | Choose a commit that is on the default branch. |
+| `base_commit … is not reachable from the default branch (…); a release must ship code that landed on trunk` | Choose a commit reachable from the default branch, or on the latest release line between its merge-base with trunk and the latest exact `vX.Y.Z` tag. Other side branches are refused. |
 | `$FILE at $COMMIT says X, expected Y` | The version file does not carry the release version at that commit. |
 | `could not merge … into …; close the settle PR so the next run recreates it` | A refresh conflicts with the settle PR branch. Close the settle PR; the next settle run recreates it. |
 | `… is not the tip of release-vX.Y.Z (tip is …). Settle the tip, or move the branch first.` | The branch moved while the settle ran. Re-run on the current tip. |
 | `release branch drifted: settle PR settled X but the branch tip at merge was Y. Re-run release-settle on the current tip.` | The settle PR was merged after the branch moved. Re-run, review the fresh PR. |
-| `settle PR body has no '<!-- release-settle: ... -->' marker; refusing to publish an unverifiable settlement` | The PR body was edited. Close it and let settle recreate it. |
+| `settle PR body has no '<!-- release-settle: ... -->' marker; refusing to publish an unverifiable settlement` | The settlement cannot be verified. The PR is already merged on this path: refresh the current release tip with a blank-version settle dispatch and review the replacement PR; do not invent a marker. |
 | `settle PR #N was opened by '…', not by 'mega-gutenberg[bot]' …; refusing to publish from it` | A hand-made settle PR never publishes. |
 | `tag vX.Y.Z already exists (at …), not at …; a release is published once` | Publish refuses to retag. Investigate the existing tag. |
 | `Refusing to publish an older version::settle PR #N: vX.Y.Z is not newer than the latest published tag vA.B.C …` | Publish re-checks the route's order rule, in the guard and again right before the tag push. Nothing was tagged. |
@@ -231,10 +261,11 @@ run; `::warning::` and the route `skip` reason do not.
 | `release-vX.Y.Z moved to … after this refresh of … started …` | A refresh lost the race to a settle-PR merge or a newer push. It wrote nothing; the run for the new tip refreshes the settle PR. |
 | `::notice title=Already tagged::vX.Y.Z is already tagged, so this refresh … does not open or update a settle PR for it` | The release was published while this refresh ran. Nothing to do. |
 | `settle_source must be pr or dispatch, got '…'` | The publish job's wiring is broken; fix the workflow. |
+| `changelog section for vX.Y.Z at … disagrees with regenerated notes; let the settle refresh land first, then publish.` | Dispatch routing does not compare notes. Dispatch with a blank `version` to refresh; review and merge the resulting settle PR rather than retrying the unchanged versioned dispatch. |
 | `candidate PR #N is not merged` / `candidate PR #N merge_commit_sha is '…', not the requested commit …` | A dispatch publish, but the candidate PR route resolved is not the merged candidate for this version. |
 | `release_branch is required for dispatch settlement` | The publish job did not pass the route's `release_branch` output. |
 | `candidate PR #N head ref is '…', expected chore/release-candidate-X.Y.Z` / `candidate PR #N base is '…', expected '…' or '…'` / `candidate PR #N author is '…', expected '…'` | A dispatch publish re-verifies the candidate PR through the API and refuses a PR that is not gutenberg's candidate into the default or release branch. |
-| `release branch '…' tip is '…', expected …` | The branch moved between the dispatch and the publish. Dispatch again for the new tip. |
+| `release branch '…' tip is '…'; a fresh publish without a tag requires exact tip equality …` / `… resuming an existing tag requires … to be an ancestor of the tip …` | The branch moved or no longer contains the tagged candidate. A new versioned dispatch refreshes a moved, untagged branch through a settle PR; an existing candidate tag can resume only while it remains an ancestor. |
 | `::warning::… lacks workflows that <default> has: …` | The release branch is missing a workflow that the default branch has (usually `on-release.yml`). A release-event workflow runs from the tagged commit's tree, so add it to the branch through its own PR before merging the settle PR, or the Release publishes with nothing attached. |
 
 ### App-token lint errors
@@ -244,11 +275,11 @@ Each is reported as `::error file=<path>::<job>/<step>: <rule>: <message>`.
 | Code | Message | Fix |
 |---|---|---|
 | L1 | `Maxwell token requests permission-contents: write; Maxwell may only write pull-requests and issues` | Drop the permission, or mint a gutenberg token in one of the allowlisted release workflow files. A `permission-…` that is an expression is refused too. |
-| L2' | `Gutenberg token may be minted only in release-candidate.yml, release-settle.yml, on-release.yml or release-publish-*.yml; file is …` | Move the token step into one of the allowlisted release workflow files. |
+| L2' | `Gutenberg token may be minted only in on-release.yml, release-candidate.yml, release-settle.yml; file is …` | Move the token step into one of the three exact allowlisted release workflow files; filename prefixes do not grant access. |
 | L3 | `no Maxwell token in a release workflow; mint a Gutenberg token instead` | Replace the Maxwell token. |
 | L3 | `read-only dependency token names the repository itself (…)` | Remove the repository from `repositories:`; the checkout uses the job token. |
 | L4 | `mega-maxwell[bot] is not a release identity` | Use `mega-gutenberg[bot]` as git identity and PR-author filter. |
-| L5 | ``environment `release` is only for release-candidate.yml, release-settle.yml and on-release.yml`` | Move the job, or use a different environment. |
+| L5 | ``environment `release` is only for on-release.yml, release-candidate.yml, release-settle.yml`` | Move the job, or use a different environment. |
 | L6 | `Maxwell token requests no permission-* inputs, so it gets every permission of the installation (contents write included); list the permissions it needs` (also for Gutenberg, and for any app token in a release job) | Add the `permission-<x>:` inputs the job needs. |
 | parse | `malformed YAML …`, `not a workflow: the document is not a mapping`, `no such file or directory`, `no workflow files (*.yml, *.yaml) found` | Fix the input; a file that cannot be read never lints clean. |
 

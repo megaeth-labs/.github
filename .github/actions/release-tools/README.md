@@ -10,17 +10,30 @@ only. The actions call them as `python3 $GITHUB_ACTION_PATH/../release-tools/<mo
 |---|---|
 | `normalize VERSION` | `X.Y.Z` on stdout (accepts `vX.Y.Z`); exit 1 if not a semantic version |
 | `is-greater VERSION LATEST_TAG_OR_EMPTY` | exit 0 if `VERSION` is newer than the tag, else 1 |
+| `latest-tag [--exclude VERSION]` | stdin tag names → highest exact `vX.Y.Z` tag, or empty; names ignored tags on stderr; `--exclude` omits the version's own tag when resuming |
+| `check-order VERSION LATEST_TAG_OR_EMPTY` | exit 0 only when newer than the latest exact `vX.Y.Z` tag (or none exists); otherwise prints the refusal and exits 1 |
+| `settle-state --version VERSION …` | caller-collected facts → `clean`, `needs-settle-pr`, `resume`, `published` or `blocked`, then a one-line reason; `--section-matches false` requires a settle PR even at the candidate merge |
+| `route` | stdin JSON snapshot → JSON decision `cut`, `refresh`, `publish` or `skip`, reason and action inputs; a versioned settle dispatch sets `settle_source=dispatch` when publishing |
 | `read-file PATH PATTERN` | the version found in the file (`plain`, `toml`, `json`) |
 | `bump-file PATH PATTERN VERSION` | rewrite the version in place; prints the old version |
 | `notes REPO VERSION DATE` | stdin `"<sha>\t<subject>"` lines → the Markdown section: heading `## vX.Y.Z (DATE)` (no date when `DATE` is empty), commits grouped by Conventional Commit type, PR links from `(#N)` suffixes, `chore(release):` commits dropped |
 | `changelog-insert PATH VERSION SECTION_MD` | insert or replace the version's section; prints `inserted` / `replaced`; keeps exactly one blank line between blocks so formatters leave the file alone |
-| `changelog-extract PATH VERSION` | the section body on stdout; exit 1 if absent |
+| `changelog-extract PATH VERSION [--include-heading]` | the section body on stdout, or the section including its heading with the flag; exit 1 if absent |
 | `changelog-copy SRC DST VERSION` | copy the version's section (heading included) from one changelog into another; prints `inserted` / `replaced` / `unchanged` / `absent` |
 
 Version patterns: `plain` is the whole file, trimmed; `toml` is the first
 line of the form `version = "…"` at column 0 (the `[package]` or
 `[workspace.package]` version, never a dependency's); `json` is the first
 `"version": "…"`.
+
+`settle-state` returns `clean` only at the candidate merge with no open settle
+PR or tag and a matching changelog section (`--section-matches` defaults to
+true). A non-ancestor candidate is blocked; an existing tag at a different
+commit is blocked before checking whether its Release exists. A tag at the
+candidate merge is `published` with a Release and `resume` without one.
+`route` does not supply a changelog comparison for a versioned dispatch;
+the publish guard checks it. Ordinary release-branch pushes route to
+`refresh`, and the settle action may then find `clean` and write nothing.
 
 ## `crates_tools.py`
 

@@ -108,13 +108,14 @@ both from `workflow-templates/release-candidate.yml`:
     version_pattern: toml
     changelog_file: CHANGELOG.md
     bump_command: cargo update --workspace   # propose only; needs the toolchain installed first
+    dependency_token: ${{ github.token }}    # use a separate read-only App token for private dependencies
 ```
 
 ## Notes
 
 - `propose` bumps the version file, runs `bump_command` with `OLD_VERSION`
   and `NEW_VERSION` set, drafts the `## vX.Y.Z` changelog entry from the
-  merged PR titles since the last `v*` tag, syncs the previous release's
+  non-merge commit subjects since the last `v*` tag, syncs the previous release's
   entry from its tag, and opens the candidate PR from a new
   `chore/release-candidate-X.Y.Z` branch. It never rewrites a branch: a
   candidate PR still open for that version is closed with a comment saying a
@@ -142,4 +143,11 @@ both from `workflow-templates/release-candidate.yml`:
   any other commit it refuses and names both SHAs.
 - `token` must be an App installation token: a `GITHUB_TOKEN` push would not
   trigger the consumer's CI on the candidate PR.
+- With `base_commit`, the candidate targets `release-vX.Y.Z`, so the consumer's
+  required lint, test and label checks must include that base branch, not just
+  the default branch. Add corrected CI workflows to `release_workflows` to
+  carry them onto the old tree; the default list carries only the settle and
+  publish-target workflows. The candidate body carries
+  `<!-- release-candidate: vX.Y.Z -->`; keep it intact, because the settle
+  action uses it to find the merged candidate.
 - The full flow, installation and recovery: [RELEASE.md](../RELEASE.md).
