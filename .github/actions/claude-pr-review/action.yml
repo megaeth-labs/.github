@@ -10,8 +10,9 @@ inputs:
     default: ""
     description: >
       Optional GitHub token used for review publication and state updates.
-      When supplied, it is also used to resolve addressed automated review
-      threads. Empty uses the job token and skips thread resolution.
+      When supplied, it also authenticates model analysis and resolves addressed
+      automated review threads. Empty uses OIDC for model analysis and the job
+      token for publication, and skips thread resolution.
   allowed_bots:
     required: false
     default: mega-putin
@@ -213,6 +214,7 @@ runs:
       uses: anthropics/claude-code-action@5ef2e550a465a721f4f45e4a7d3c340c873e1dcc # v1
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        github_token: ${{ inputs.github_identity_token }}
         allowed_bots: ${{ inputs.allowed_bots }}
         display_report: false
         # Always on. The review body says what the model concluded; only this
@@ -371,6 +373,7 @@ runs:
       uses: anthropics/claude-code-action@5ef2e550a465a721f4f45e4a7d3c340c873e1dcc # v1
       with:
         claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        github_token: ${{ inputs.github_identity_token }}
         allowed_bots: ${{ inputs.allowed_bots }}
         display_report: false
         show_full_output: true

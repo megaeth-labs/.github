@@ -2,6 +2,7 @@
 
 import copy
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -220,6 +221,13 @@ class ReviewPipelineTests(unittest.TestCase):
         )
         # prepare (announce), publish, and report (retire on failure).
         self.assertEqual(action.count(identity_env), 3)
+        model_steps = [
+            step for step in action.split("\n    - name:")
+            if "uses: anthropics/claude-code-action@" in step
+        ]
+        self.assertEqual(len(model_steps), 2)
+        for step in model_steps:
+            self.assertIn("github_token: ${{ inputs.github_identity_token }}", step)
         self.assertIn(
             "GH_RESOLVE_THREADS: "
             "${{ inputs.github_identity_token != '' }}",
@@ -353,6 +361,112 @@ class ReviewPipelineTests(unittest.TestCase):
             str(context.exception),
             "gh api graphql failed: permission denied",
         )
+
+    @mock.patch.object(pipeline, "gh_json")
+    @mock.patch.object(pipeline, "run")
+    def test_large_pr_diff_uses_frozen_merge_base_and_head(self, run_mock, gh_mock):
+        base, head, merge_base = "a" * 40, "b" * 40, "c" * 40
+        gh_mock.return_value = {"merge_base_commit": {"sha": merge_base}}
+        run_mock.side_effect = [
+            pipeline.PipelineError(
+                "gh pr diff failed: HTTP 406: diff exceeded the maximum number of files (300)",
+                code="GITHUB_API_FAILED",
+            ),
+            SimpleNamespace(returncode=1),  # Missing merge base in a shallow checkout.
+            SimpleNamespace(returncode=1),  # Missing PR head.
+            SimpleNamespace(stdout=""),
+            SimpleNamespace(stdout="complete diff including all files"),
+        ]
+
+        result = pipeline.pull_request_diff("megaeth-labs/example", 7, base, head)
+
+        self.assertEqual(result, "complete diff including all files")
+        gh_mock.assert_called_once_with(
+            ["api", f"repos/megaeth-labs/example/compare/{base}...{head}"]
+        )
+        fetch = run_mock.call_args_list[-2].args[0]
+        self.assertIn("fetch", fetch)
+        self.assertEqual(fetch[-2:], [merge_base, head])
+        self.assertEqual(
+            run_mock.call_args_list[-1].args[0],
+            ["git", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", merge_base, head, "--"],
+        )
+
+    @mock.patch.object(pipeline, "gh_json")
+    @mock.patch.object(pipeline, "run")
+    def test_normal_pr_diff_uses_github_without_fetching(self, run_mock, gh_mock):
+        run_mock.return_value = SimpleNamespace(stdout="github diff")
+        self.assertEqual(
+            pipeline.pull_request_diff("megaeth-labs/example", 7, "a" * 40, "b" * 40),
+            "github diff",
+        )
+        run_mock.assert_called_once()
+        gh_mock.assert_not_called()
+
+    @mock.patch.object(pipeline, "gh_json")
+    @mock.patch.object(pipeline, "run")
+    def test_diff_server_errors_are_not_hidden_by_git_fallback(self, run_mock, gh_mock):
+        failure = pipeline.PipelineError("gh pr diff failed: HTTP 500", code="GITHUB_API_FAILED")
+        run_mock.side_effect = failure
+        with self.assertRaises(pipeline.PipelineError) as context:
+            pipeline.pull_request_diff("megaeth-labs/example", 7, "a" * 40, "b" * 40)
+        self.assertIs(context.exception, failure)
+        run_mock.assert_called_once()
+        gh_mock.assert_not_called()
+
+    def test_large_pr_diff_is_complete_from_a_shallow_checkout(self):
+        real_run = subprocess.run
+        with tempfile.TemporaryDirectory() as directory:
+            source, checkout = Path(directory) / "source", Path(directory) / "checkout"
+            source.mkdir()
+
+            def git(*args):
+                return real_run(
+                    ["git", *args], cwd=source, text=True, capture_output=True, check=True
+                ).stdout.strip()
+
+            git("init", "--initial-branch=base")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.invalid")
+            names = [f"file-{index}.txt" for index in range(301)]
+            for name in names:
+                (source / name).write_text("before\n", encoding="utf-8")
+            (source / "binary.dat").write_bytes(b"\x00before")
+            git("add", "--", *names, "binary.dat")
+            git("commit", "-m", "merge base")
+            merge_base = git("rev-parse", "HEAD")
+            git("checkout", "-b", "head")
+            (source / names[0]).rename(source / "renamed.txt")
+            for name in names[1:]:
+                (source / name).write_text("after\n", encoding="utf-8")
+            (source / "binary.dat").write_bytes(b"\x00after")
+            git("add", "--", *names, "renamed.txt", "binary.dat")
+            git("commit", "-m", "large PR")
+            head = git("rev-parse", "HEAD")
+            git("checkout", "base")
+            (source / "base-only.txt").write_text("unrelated base change\n", encoding="utf-8")
+            git("add", "base-only.txt")
+            git("commit", "-m", "base advanced independently")
+            base = git("rev-parse", "HEAD")
+            git("clone", "--depth=1", "--branch=base", source.as_uri(), str(checkout))
+
+            def run_in_checkout(args, **kwargs):
+                if args[0] == "gh":
+                    return subprocess.CompletedProcess(
+                        args, 1, stdout="",
+                        stderr="HTTP 406: diff exceeded the maximum number of files (300)",
+                    )
+                return real_run(args, cwd=checkout, **kwargs)
+
+            with mock.patch.object(pipeline.subprocess, "run", side_effect=run_in_checkout), mock.patch.object(
+                pipeline, "gh_json", return_value={"merge_base_commit": {"sha": merge_base}}
+            ):
+                result = pipeline.pull_request_diff("megaeth-labs/example", 7, base, head)
+
+            self.assertEqual(sum(line.startswith("diff --git ") for line in result.splitlines()), 302)
+            self.assertIn("rename from file-0.txt", result)
+            self.assertIn("GIT binary patch", result)
+            self.assertNotIn("base-only.txt", result)
 
     @mock.patch("builtins.print")
     def test_failure_report_is_human_readable(self, print_mock):
@@ -2604,4 +2718,3 @@ class ObservabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

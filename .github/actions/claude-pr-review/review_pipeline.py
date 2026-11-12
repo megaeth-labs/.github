@@ -1435,6 +1435,53 @@ def prepare_trace(
     return lines
 
 
+def pull_request_diff(
+    repository: str, pull_request: int, base_sha: str, head_sha: str
+) -> str:
+    try:
+        return run(
+            ["gh", "pr", "diff", str(pull_request), "--repo", repository]
+        ).stdout
+    except PipelineError as error:
+        if (
+            error.code != "GITHUB_API_FAILED"
+            or "HTTP 406" not in str(error)
+            or "maximum number of files" not in str(error)
+        ):
+            raise
+
+    # GitHub's diff endpoint rejects PRs with more than 300 files. Resolve the
+    # frozen merge base through the compare API, then diff the complete trees.
+    # Fetching only those two snapshots also works with a depth-one checkout.
+    comparison = gh_json(
+        ["api", f"repos/{repository}/compare/{base_sha}...{head_sha}"]
+    )
+    merge_base = str((comparison.get("merge_base_commit") or {}).get("sha") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", merge_base):
+        raise PipelineError("GitHub compare did not return a valid merge base")
+    missing = [
+        sha
+        for sha in (merge_base, head_sha)
+        if run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], check=False).returncode
+    ]
+    if missing:
+        # checkout may remove its credentials before the shared action runs.
+        # gh's helper reads GH_TOKEN from the environment; no token enters argv.
+        run(
+            [
+                "git", "-c", "credential.helper=",
+                "-c", "credential.helper=!gh auth git-credential",
+                "fetch", "--no-tags", "--depth=1", "origin", merge_base, head_sha,
+            ]
+        )
+    return run(
+        [
+            "git", "diff", "--no-ext-diff", "--no-textconv", "--no-color",
+            "--binary", merge_base, head_sha, "--",
+        ]
+    ).stdout
+
+
 def prepare(args: argparse.Namespace) -> None:
 
     action_dir = Path(__file__).resolve().parent
@@ -1647,16 +1694,9 @@ def prepare(args: argparse.Namespace) -> None:
     else:
         run_premortem = mode == "full" or high_risk
 
-    full_diff = run(
-        [
-            "gh",
-            "pr",
-            "diff",
-            str(args.pull_request),
-            "--repo",
-            args.repository,
-        ]
-    ).stdout
+    full_diff = pull_request_diff(
+        args.repository, args.pull_request, expected_base, expected_head
+    )
     require_expected_pull(
         gh_json(
             ["api", f"repos/{args.repository}/pulls/{args.pull_request}"]
