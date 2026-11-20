@@ -74,6 +74,7 @@ Family: [Release pipeline](../RELEASE.md).
 - `release asset must be an existing regular file and not a symlink: $file`
 - `release asset basename is reserved or duplicated: $name`
 - `release asset path cannot contain GitHub CLI`
+- `asset_files is set but names no usable paths`
 - `could not push $TAG; the remote tag is at $(git rev-parse`
 - `cannot read the latest Release to decide whether $TAG is the latest; re-run to resume`
 - `could not create the Release for $TAG`

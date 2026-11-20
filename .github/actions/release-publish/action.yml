@@ -315,7 +315,7 @@ runs:
           asset_dir="$(mktemp -d "$RUNNER_TEMP/release-publish-assets.XXXXXXXX")"
           touch "$asset_dir/files" "$asset_dir/names" "$asset_dir/SHA256SUMS"
           while IFS= read -r file; do
-            [[ -n "$file" ]] || continue
+            [[ "$file" =~ ^[[:space:]]*$ ]] && continue
             [[ "$file" == /* ]] || file="$GITHUB_WORKSPACE/$file"
             if [[ ! -f "$file" || -L "$file" ]]; then
               echo "::error::release asset must be an existing regular file and not a symlink: $file"; exit 1
@@ -331,9 +331,10 @@ runs:
             printf '%s\n' "$file" >> "$asset_dir/files"
             (cd "${file%/*}/" && sha256sum -- "./$name") | sed 's/  \.\//  /' >> "$asset_dir/SHA256SUMS"
           done <<< "$ASSET_FILES"
-          if [[ -s "$asset_dir/files" ]]; then
-            echo "asset_dir=$asset_dir" >> "$GITHUB_OUTPUT"
+          if [[ ! -s "$asset_dir/files" ]]; then
+            echo "::error::asset_files is set but names no usable paths"; exit 1
           fi
+          echo "asset_dir=$asset_dir" >> "$GITHUB_OUTPUT"
         fi
         {
           echo "version=$version"

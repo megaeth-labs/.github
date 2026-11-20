@@ -2364,6 +2364,15 @@ jobs:
           [[ -z "$(remote_tag_object v3.2.0)" ]]
           [[ "$(grep -c . "$ARGS")" == "$count" ]]
 
+      - name: Asset validation refuses blank lists before tagging
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          for files in $'\n\n' $'\n  \n'; do
+            ASSET_FILES="$files" refuse 140 '::error::asset_files is set but names no usable paths'
+            [[ -z "$(remote_tag_object v3.2.0)" ]]
+          done
+
       - name: Asset paths and basename checksums reach Release create
         run: |
           set -euo pipefail
