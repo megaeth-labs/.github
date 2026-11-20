@@ -10,8 +10,9 @@ description: >-
   for a fresh publish, or contains `commit` when resuming an existing tag;
   repeats this state check immediately before tagging. Then creates
   the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release
-  with the changelog section as notes. A tag already at the commit without a
-  Release (a run that died between the two steps) is resumed: the tag step is
+  with the changelog section as notes. Pass `asset_files` to attach files and
+  `SHA256SUMS` before the Release becomes immutable. A tag already at the commit
+  without a published Release (a run that died between the two steps) is resumed: the tag step is
   skipped and the Release is still created. Re-run the push-triggered workflow
   for the settle-PR shape, or dispatch for the direct shape. A tag at the commit with its
   Release already there is a retry of a finished run and exits 0 with a
@@ -65,6 +66,13 @@ inputs:
   pr_number:
     description: "Number of the merged settle PR for pr, or the merged candidate PR for dispatch."
     required: true
+  asset_files:
+    description: >-
+      Newline-separated regular file paths, absolute or relative to the workspace.
+      Use unique basenames and reserve SHA256SUMS for the generated checksum file.
+      Paths cannot contain `#`, which GitHub CLI treats as an asset label separator.
+    required: false
+    default: ""
   pr_author:
     description: >-
       Login the settle or candidate PR must have been opened by — the app identity
@@ -120,6 +128,7 @@ runs:
         FILE: ${{ inputs.version_file }}
         PATTERN: ${{ inputs.version_pattern }}
         CHANGELOG: ${{ inputs.changelog_file }}
+        ASSET_FILES: ${{ inputs.asset_files }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
       run: |
         "$AUTH_WRAPPER" bash --noprofile --norc -e -o pipefail <<'GITHUB_AUTH_COMMAND'
@@ -242,7 +251,8 @@ runs:
             echo "::error::tag $tag already exists (at $(git rev-parse "$tag^{commit}")), not at $MERGE_SHA; a release is published once"; exit 1
           fi
           tag_exists=true
-          if release_url="$(gh release view "$tag" --json url -q .url 2>/dev/null)"; then
+          if release_url="$(gh release view "$tag" --json url,isDraft -q 'select(.isDraft == false) | .url' 2>/dev/null)" &&
+              [[ -n "$release_url" ]]; then
             published=true
           else
             release_url=""
@@ -300,6 +310,31 @@ runs:
           if [[ "${decision%%$'\n'*}" != clean ]]; then
             echo "::error::changelog section for v$version at $MERGE_SHA disagrees with regenerated notes; let the settle refresh land first, then publish."; exit 1
           fi
+        fi
+        if [[ -n "${ASSET_FILES:-}" ]]; then
+          asset_dir="$(mktemp -d "$RUNNER_TEMP/release-publish-assets.XXXXXXXX")"
+          touch "$asset_dir/files" "$asset_dir/names" "$asset_dir/SHA256SUMS"
+          while IFS= read -r file; do
+            [[ "$file" =~ ^[[:space:]]*$ ]] && continue
+            [[ "$file" == /* ]] || file="$GITHUB_WORKSPACE/$file"
+            if [[ ! -f "$file" || -L "$file" ]]; then
+              echo "::error::release asset must be an existing regular file and not a symlink: $file"; exit 1
+            fi
+            name="${file##*/}"
+            if [[ "$name" == SHA256SUMS ]] || grep -qxF -- "$name" "$asset_dir/names"; then
+              echo "::error::release asset basename is reserved or duplicated: $name"; exit 1
+            fi
+            if [[ "$file" == *'#'* ]]; then
+              echo "::error::release asset path cannot contain GitHub CLI's label separator (#): $file"; exit 1
+            fi
+            printf '%s\n' "$name" >> "$asset_dir/names"
+            printf '%s\n' "$file" >> "$asset_dir/files"
+            (cd "${file%/*}/" && sha256sum -- "./$name") | sed 's/  \.\//  /' >> "$asset_dir/SHA256SUMS"
+          done <<< "$ASSET_FILES"
+          if [[ ! -s "$asset_dir/files" ]]; then
+            echo "::error::asset_files is set but names no usable paths"; exit 1
+          fi
+          echo "asset_dir=$asset_dir" >> "$GITHUB_OUTPUT"
         fi
         {
           echo "version=$version"
@@ -374,6 +409,7 @@ runs:
         TAG: ${{ steps.guard.outputs.tag }}
         NOTES: ${{ steps.guard.outputs.notes_file }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
+        ASSET_DIR: ${{ steps.guard.outputs.asset_dir }}
       run: |
         set -euo pipefail
         # Mark the Release latest only if it is newer than the Release GitHub
@@ -395,10 +431,42 @@ runs:
           latest_flag=--latest=false
           echo "::warning title=Not the latest Release::$TAG is published without becoming latest: $refusal (rule: latest only when newer than the latest Release)"
         fi
-        if ! url="$(gh release create "$TAG" --verify-tag "$latest_flag" --title "$TAG" --notes-file "$NOTES")"; then
+        set --
+        fields=url,isDraft
+        if [[ -n "${ASSET_DIR:-}" ]]; then
+          fields+=,assets
+          while IFS= read -r file; do
+            # An empty label tells gh to use the literal path without globbing.
+            case "$file" in
+              *['*?[\']*) set -- "$@" "$file#" ;;
+              *) set -- "$@" "$file" ;;
+            esac
+          done < "$ASSET_DIR/files"
+          set -- "$@" "$ASSET_DIR/SHA256SUMS"
+          releases="repos/$GITHUB_REPOSITORY/releases"
+          drafts="$(gh api --paginate "$releases" --jq ".[] | select(.tag_name == \"$TAG\" and .draft == true) | .id")"
+          while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            # The publish job serializes each release branch. Recheck by ID
+            # immediately before deleting so a published Release is skipped.
+            draft="$(gh api "$releases/$id" --jq .draft)"
+            if [[ "$draft" == true ]]; then
+              gh api --method DELETE "$releases/$id"
+            fi
+          done <<< "$drafts"
+        fi
+        if ! url="$(gh release create "$TAG" --verify-tag "$latest_flag" --title "$TAG" --notes-file "$NOTES" "$@")"; then
           # A concurrent publish created it first; that Release is this one.
-          url="$(gh release view "$TAG" --json url -q .url)" \
+          view="$(gh release view "$TAG" --json "$fields")" &&
+            url="$(jq -er 'select(.isDraft == false) | .url // empty' <<< "$view")" \
             || { echo "::error::could not create the Release for $TAG"; exit 1; }
+          if [[ -n "${ASSET_DIR:-}" ]]; then
+            while IFS= read -r name; do
+              if ! jq -e --arg name "$name" 'any(.assets[]; .name == $name and .state == "uploaded")' <<< "$view" > /dev/null; then
+                echo "::error::published Release $TAG is missing asset: $name"; exit 1
+              fi
+            done < <(cat "$ASSET_DIR/names"; printf '%s\n' SHA256SUMS)
+          fi
           echo "::notice::the Release for $TAG was created by a concurrent run; keeping it"
         fi
         echo "url=$url" >> "$GITHUB_OUTPUT"

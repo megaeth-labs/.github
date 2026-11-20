@@ -506,7 +506,8 @@ jobs:
           assert action["inputs"]["git_user_email"]["default"] == "348780249+mega-gutenberg[bot]@users.noreply.github.com"
           assert not {"settle_mode", "settlers", "github_token"} & action["inputs"].keys()
           assert set(action["outputs"]) == {"version", "pr_url", "notes_file"}
-          want = {"Guard": "guard.sh", "Generate release notes": "notes.sh", "Ensure the settle PR": "ensure.sh"}
+          want = {"Guard": "guard.sh", "Generate release notes": "notes.sh", "Ensure the settle PR": "ensure.sh",
+                  "Compute settlement state": "state.sh"}
           found = {s["name"]: s["run"] for s in action["runs"]["steps"] if s.get("name") in want}
           assert found.keys() == want.keys(), f"missing shipped steps: {want.keys() - found.keys()}"
           for name, script in found.items():
@@ -629,11 +630,21 @@ jobs:
               path.write_text(json.dumps(state))
 
           if args[:2] == ["pr", "list"]:
+              if option("--state") == "merged":
+                  candidate = {"mergeCommit": {"oid": os.environ["CANDIDATE_SHA"]},
+                               "body": "<!-- release-candidate: v1.1.0 -->",
+                               "author": {"login": "app/mega-gutenberg"}, "mergedAt": "2026-01-01"}
+                  print(json.dumps([candidate]))
+                  sys.exit(0)
               assert option("--state") == "open"
               fields = option("--json").split(",")
               pulls = [pr for pr in state["pulls"] if pr["state"] == "open"
                        and pr["headRefName"] == option("--head") and pr["baseRefName"] == option("--base")]
-              print(json.dumps([{key: pr[key] for key in fields} for pr in pulls]))
+              payload = json.dumps([{key: pr[key] for key in fields} for pr in pulls])
+              if "--jq" in args:
+                  subprocess.run(["jq", "-r", option("--jq")], input=payload, text=True, check=True)
+              else:
+                  print(payload)
           elif args[:2] == ["pr", "create"]:
               assert not any(pr["state"] == "open" and pr["headRefName"] == option("--head")
                              and pr["baseRefName"] == option("--base") for pr in state["pulls"])
@@ -663,6 +674,8 @@ jobs:
               pr["state"] = "closed"
               pr["comment"] = option("--comment")
               save("close")
+          elif args[:3] == ["api", "--paginate", "repos/megaeth-labs/fake/releases"]:
+              subprocess.run(["jq", "-r", option("--jq"), os.environ["RELEASE_PAGES"]], check=True)
           elif args[:3] == ["api", "-X", "DELETE"]:
               prefix = "repos/megaeth-labs/fake/git/refs/heads/"
               assert len(args) == 4 and args[3].startswith(prefix), args
@@ -911,6 +924,32 @@ jobs:
             echo "failed merge was not aborted"; exit 1
           fi
           echo "PASS conflicting CHANGELOG fails, aborts the merge and leaves remote refs and PR untouched"
+
+      - name: Settlement state treats a tagged draft as resumable
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          export REPO="$FIXTURE/draft" PR_STATE="$FIXTURE/draft-prs.json"
+          make_repo
+          export COMMIT CANDIDATE_SHA PREVIOUS=v1.0.0
+          COMMIT="$(remote_head "$BRANCH")"
+          CANDIDATE_SHA="$COMMIT"
+          export RELEASE_PAGES="$FIXTURE/release-pages.jsonl"
+          printf '%s\n' '[{"tag_name":"v1.0.0","id":1,"draft":false}]' \
+            '[{"tag_name":"v1.1.0","id":2,"draft":true}]' > "$RELEASE_PAGES"
+          (
+            cd "$REPO"
+            git tag -a v1.1.0 "$COMMIT" -m 'interrupted publish'
+            export GITHUB_STEP_SUMMARY="$FIXTURE/draft-summary"
+            : > "$OUT"
+            bash "$SH/state.sh"
+            grep -qxF 'state=resume' "$OUT"
+
+            printf '%s\n' '[{"tag_name":"v1.1.0","id":2,"draft":false}]' > "$RELEASE_PAGES"
+            : > "$OUT"
+            bash "$SH/state.sh"
+            grep -qxF 'state=published' "$OUT"
+          )
 
       - name: Remove settle rehearsal resources
         if: always()
@@ -1910,6 +1949,7 @@ jobs:
                 GITHUB_REPOSITORY=megaeth-labs/fake \
                 TAG="$(out_get tag)" \
                 NOTES="$(out_get notes_file)" \
+                ASSET_DIR="$(out_get asset_dir)" \
                 GITHUB_OUTPUT="$OUT.release" \
                 bash "$SH/release.sh" )
           }
@@ -2003,6 +2043,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin" "$FIX"
           : > "$ARGS"
           : > "$RELEASES"
+          printf '[]\n' > "$FIX/drafts.json"
           cat > "$RUNNER_TEMP/bin/gh" <<'SH'
           #!/usr/bin/env bash
           # Only what the shell under test calls. The pull request comes from a
@@ -2023,13 +2064,35 @@ jobs:
             echo "gh: Not Found (HTTP 404)" >&2
             exit 1
           fi
+          if [[ "$1 $2" == 'api --paginate' && "$3" == repos/*/releases ]]; then
+            jq -r "$5" "$FIX/drafts.json"
+            exit 0
+          fi
+          if [[ "$1" == api && "$2" == repos/*/releases/[0-9]* ]]; then
+            jq -r --argjson id "${2##*/}" '.[] | select(.id == $id) | .draft' "$FIX/drafts.json"
+            exit 0
+          fi
+          if [[ "$1 $2 $3" == 'api --method DELETE' && "$4" == repos/*/releases/[0-9]* ]]; then
+            jq -e --argjson id "${4##*/}" 'any(.[]; .id == $id and .draft == true)' "$FIX/drafts.json" >/dev/null
+            jq --argjson id "${4##*/}" 'map(select(.id != $id))' "$FIX/drafts.json" > "$FIX/remaining-drafts.json"
+            mv "$FIX/remaining-drafts.json" "$FIX/drafts.json"
+            echo "delete ${4##*/}" >> "$FIX/release-events"
+            exit 0
+          fi
           if [[ "${1:-}" == release && "${2:-}" == view ]]; then
+            draft=true
+            assets='[]'
             if grep -qxF "${3:-}" "$RELEASES"; then
-              echo "https://github.com/megaeth-labs/fake/releases/tag/$3"
-              exit 0
+              draft=false
+              if [[ -f "$FIX/assets-$3.json" ]]; then assets="$(cat "$FIX/assets-$3.json")"; fi
+            elif ! jq -e --arg tag "$3" 'any(.[]; .tag_name == $tag and .draft == true)' "$FIX/drafts.json" >/dev/null; then
+              echo "release not found" >&2
+              exit 1
             fi
-            echo "release not found" >&2
-            exit 1
+            json="$(jq -cn --arg url "https://github.com/megaeth-labs/fake/releases/tag/$3" \
+              --argjson draft "$draft" --argjson assets "$assets" '{url: $url, isDraft: $draft, assets: $assets}')"
+            if [[ "${6:-}" == -q ]]; then jq -r "$7" <<< "$json"; else echo "$json"; fi
+            exit 0
           fi
           if [[ "${1:-}" == release && "${2:-}" == create ]]; then
             if [[ -e "$FIX/fail-create" ]]; then
@@ -2046,6 +2109,8 @@ jobs:
               if [[ "${args[i]}" == --notes-file ]]; then notes="${args[i + 1]}"; fi
             done
             [[ -s "$notes" ]] || { echo "gh: --notes-file '$notes' is missing or empty" >&2; exit 1; }
+            printf '%s\0' "$@" > "$FIX/create-argv"
+            echo "create $3" >> "$FIX/release-events"
             echo "$*" >> "$ARGS"
             echo "$3" >> "$RELEASES"
             # GitHub's "latest" moves only for a Release created with --latest.
@@ -2272,6 +2337,103 @@ jobs:
           [[ "$(cat "$FIX/latest-release")" == v3.1.0 ]] || { echo "latest moved back to $(cat "$FIX/latest-release")"; exit 1; }
           echo "v1.9.5 refused after v2.1.0; v3.0.0 not tagged after v3.1.0, and its late Release is not latest"
 
+      - name: No asset input preserves the exact Release create arguments
+        run: |
+          set -euo pipefail
+          printf '%s\0' release create v3.0.0 --verify-tag --latest=false --title v3.0.0 \
+            --notes-file "$RUNNER_TEMP/release-notes-v3.0.0.md" > "$FIX/legacy-argv"
+          cmp "$FIX/create-argv" "$FIX/legacy-argv"
+
+      - name: Asset validation refuses invalid paths before tagging
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 3.2.0 140
+          mkdir -p "$REPO/dist" "$FIX/other"
+          printf 'binary\n' > "$REPO/dist/my tool"
+          printf 'different file\n' > "$FIX/other/my tool"
+          printf 'second binary\n' > "$FIX/other/tool-debug"
+          ln -s "$REPO/dist/my tool" "$FIX/other/linked"
+          touch "$FIX/other/SHA256SUMS"
+          count="$(grep -c . "$ARGS")"
+          ASSET_FILES=dist/missing GITHUB_WORKSPACE="$REPO" refuse 140 'existing regular file'
+          ASSET_FILES="$(printf '%s\n' 'dist/my tool' "$FIX/other/my tool")" GITHUB_WORKSPACE="$REPO" \
+            refuse 140 'reserved or duplicated: my tool'
+          ASSET_FILES="$FIX/other/linked" refuse 140 'existing regular file'
+          ASSET_FILES="$FIX/other/SHA256SUMS" refuse 140 'reserved or duplicated: SHA256SUMS'
+          [[ -z "$(remote_tag_object v3.2.0)" ]]
+          [[ "$(grep -c . "$ARGS")" == "$count" ]]
+
+      - name: Asset validation refuses blank lists before tagging
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          for files in $'\n\n' $'\n  \n'; do
+            ASSET_FILES="$files" refuse 140 '::error::asset_files is set but names no usable paths'
+            [[ -z "$(remote_tag_object v3.2.0)" ]]
+          done
+
+      - name: Asset paths and basename checksums reach Release create
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          ASSET_FILES="$(printf '%s\n' 'dist/my tool' '' "$FIX/other/tool-debug")" GITHUB_WORKSPACE="$REPO" publish 140
+          sums="$(out_get asset_dir)/SHA256SUMS"
+          [[ "$(remote_commit v3.2.0)" == "$(cat "$FIX/merge-140")" ]]
+          printf '%s\0' release create v3.2.0 --verify-tag --latest --title v3.2.0 \
+            --notes-file "$(out_get notes_file)" "$REPO/dist/my tool" "$FIX/other/tool-debug" "$sums" \
+            > "$FIX/asset-argv"
+          cmp "$FIX/create-argv" "$FIX/asset-argv"
+          { (cd "$REPO/dist" && sha256sum 'my tool'); (cd "$FIX/other" && sha256sum tool-debug); } > "$FIX/expected-sums"
+          cmp "$sums" "$FIX/expected-sums"
+
+      - name: A stranded draft resumes and is deleted before asset publication
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 3.3.0 141
+          seed_tag v3.3.0 "$(cat "$FIX/merge-141")"
+          printf '%s\n' '[{"tag_name":"v3.3.0","id":11,"draft":true},{"tag_name":"v3.1.0","id":13,"draft":true}]' > "$FIX/drafts.json"
+          tag_object="$(remote_tag_object v3.3.0)"
+          guard 141
+          expect_output 'tag_exists=true'
+          expect_output 'published=false'
+          expect_output 'release_url='
+
+          : > "$FIX/release-events"
+          touch "$FIX/fail-create"
+          if release_step > "$FIX/draft.log" 2>&1; then
+            echo "create failed but a draft was accepted"; exit 1
+          fi
+          grep -qF 'could not create the Release for v3.3.0' "$FIX/draft.log"
+          [[ ! -s "$FIX/release-events" && ! -s "$OUT.release" ]]
+          rm "$FIX/fail-create"
+
+          ASSET_FILES="$FIX/other/tool-debug" publish 141
+          [[ ! -e "$FIX/tag-ran" && "$(remote_tag_object v3.3.0)" == "$tag_object" ]]
+          printf '%s\n' 'delete 11' 'create v3.3.0' > "$FIX/expected-events"
+          cmp "$FIX/release-events" "$FIX/expected-events"
+
+      - name: A concurrent published Release must have every uploaded asset
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 3.4.0 142
+          ASSET_FILES="$FIX/other/tool-debug" guard 142
+          tag_step
+          echo v3.4.0 >> "$RELEASES"
+          printf '%s\n' '[{"tag_name":"v3.4.0","id":12,"draft":false}]' > "$FIX/drafts.json"
+          printf '%s\n' '[{"name":"tool-debug","state":"uploaded"},{"name":"SHA256SUMS","state":"starter"}]' > "$FIX/assets-v3.4.0.json"
+          if release_step > "$FIX/fallback.log" 2>&1; then
+            echo "a published Release without SHA256SUMS was accepted"; exit 1
+          fi
+          grep -qF 'published Release v3.4.0 is missing asset: SHA256SUMS' "$FIX/fallback.log"
+          [[ ! -s "$OUT.release" ]]
+
+          printf '%s\n' '[{"name":"tool-debug","state":"uploaded"},{"name":"SHA256SUMS","state":"uploaded"}]' > "$FIX/assets-v3.4.0.json"
+          release_step
+          grep -qxF 'url=https://github.com/megaeth-labs/fake/releases/tag/v3.4.0' "$OUT.release"
+
   release-route:
     runs-on: ubuntu-24.04
     permissions:
@@ -2393,7 +2555,10 @@ jobs:
               cat "$FIX/fallback.json" ;;
             "release view "*)
               [[ -e "$FIX/release-exists" ]] || exit 1
-              echo '{"tagName":"v1.2.0"}' ;;
+              is_draft=false
+              [[ ! -e "$FIX/release-draft" ]] || is_draft=true
+              jq -nr --arg tag "$3" --argjson draft "$is_draft" \
+                '{tagName: $tag, isDraft: $draft} | '"$7" ;;
             *) echo "unexpected gh call: $*" >&2; exit 99 ;;
           esac
           SH
@@ -2619,6 +2784,29 @@ jobs:
             done
           done
           echo "a missing or unparsable version file fails push and dispatch routes, naming file and pattern"
+
+      - name: Push and dispatch do not count a draft as published
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          touch "$FIX/release-exists" "$FIX/release-draft"
+
+          # Dispatch still includes a tagged branch whose Release is a draft.
+          route settle main "$(cat "$FIX/candidate")" workflow_dispatch
+          expect_output action refresh
+          [[ "$(out_get targets | jq -c 'map(.release_branch) | sort')" == '["release-v1.1.0","release-v1.2.0"]' ]]
+
+          # A push at the settle merge resumes the draft's tagged version.
+          merge="$(cat "$FIX/merge")"
+          git -C "$REPO" tag -a v1.2.0 "$merge" -m 'interrupted publish'
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin refs/tags/v1.2.0
+          cp "$FIX/settle.json" "$FIX/pulls.json"
+          route settle release-v1.2.0 "$merge"
+          expect_output action publish
+          expect_output commit "$merge"
+          "$AUTH_WRAPPER" git -C "$REPO" push --quiet origin :refs/tags/v1.2.0
+          git -C "$REPO" tag -d v1.2.0
+          rm "$FIX/release-exists" "$FIX/release-draft"
 
       - name: Partial publication resumes and reports the actual tag commit
         run: |
