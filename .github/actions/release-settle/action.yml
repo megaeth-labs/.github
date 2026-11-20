@@ -207,7 +207,7 @@ runs:
         fi
         release_exists=false
         releases="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq \
-          ".[] | select(.tag_name == \"v$VERSION\") | .id")"
+          ".[] | select(.tag_name == \"v$VERSION\" and .draft == false) | .id")"
         [[ -z "$releases" ]] || release_exists=true
         section_matches=true
         if [[ -n "$CHANGELOG" ]]; then

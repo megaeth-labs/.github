@@ -38,8 +38,8 @@ job log.
 |---|---|---|
 | **Candidate** | a maintainer dispatches `release-candidate.yml` with a version | a PR on the default branch that bumps the version and drafts the changelog entry; merging it creates `release-vX.Y.Z` at the merge commit |
 | **Settle** | a push to `release-vX.Y.Z`: the branch being cut, and every later push to it | `route` answers `refresh`, and `release-settle` opens or updates one reviewed `chore/release-settle-vX.Y.Z` PR onto the release branch, carrying the changelog entry for the commits since the previous tag |
-| **Publish** | the settle PR merging, or a dispatch of `release-settle.yml` with a version whose branch needs no settle PR | `release-publish` creates the annotated tag `vX.Y.Z` at the settled commit and publishes the GitHub Release with the changelog section as notes |
-| **Publish targets** | the GitHub Release being published | whatever the repository ships: crates to crates.io, binaries to the artifact registry, downloads on the Release page, composed in `on-release.yml` from the publish-target actions |
+| **Publish** | the settle PR merging, or a dispatch of `release-settle.yml` with a version whose branch needs no settle PR | `release-publish` creates the annotated tag `vX.Y.Z` at the settled commit and publishes the GitHub Release with the changelog section as notes and any `asset_files` as downloads |
+| **Publish targets** | the GitHub Release being published | whatever the repository ships, such as crates to crates.io and binaries to the artifact registry, composed in `on-release.yml` from the publish-target actions |
 
 The choices that shape it:
 
@@ -188,6 +188,12 @@ at that commit once, and publishes the GitHub Release with the entry as
 notes, marked latest only when it is newer than the current latest Release.
 A version that is not newer than every other `vX.Y.Z` tag is refused before
 the tag, so an older line merged late is never tagged or made latest.
+
+For GitHub Release downloads, add a credential-free build job that checks out
+`needs.route.outputs.commit` and uploads the binaries as a workflow artifact.
+Download the artifact in the publish job and list its paths in
+`release-publish`'s `asset_files`. The action attaches the files and a
+`SHA256SUMS` manifest before publishing, when the Release can still take assets.
 
 **5. Publish targets.** The Release's `published` event starts
 `on-release.yml`, which builds and publishes whatever the repository ships.
@@ -384,6 +390,9 @@ release workflow (rule L4).
 
 ## Publish targets (`on-release.yml`)
 
+Immutable GitHub Releases cannot accept assets after publication. Use
+`release-publish`'s `asset_files` for downloads on the Release page.
+
 The Release's `published` event runs the repository's `on-release.yml`. What
 every one of them carries, and why (the template has all of it):
 
@@ -399,8 +408,7 @@ every one of them carries, and why (the template has all of it):
   `2>/dev/null || echo …`: that turns a binary that cannot load into a green
   step and a published download.
 - One build feeding every target when several targets ship the same file
-  (a workflow artifact between jobs), so the Release page and the registry
-  carry the same bytes.
+  (a workflow artifact between jobs), so the targets carry the same bytes.
 - `dry_run` threaded from a `workflow_dispatch` input (default true there)
   into every target, so the whole workflow can be rehearsed on a tag ref:
   `gh workflow run on-release.yml --ref vX.Y.Z -f dry_run=true`. A run
@@ -410,9 +418,8 @@ A `release` event resolves the workflow from the tagged commit's tree, so
 the file must exist at the tag. A release branch cut from a default branch
 that has it carries it; a branch cut before it landed needs it cherry-picked
 (through its own PR, the `release-*` ruleset requires one) before the settle
-PR is merged, or the Release publishes with nothing attached and no failed
-run. Settle warns when the settled commit lacks a workflow the default
-branch has.
+PR is merged, or the target jobs will not run. Settle warns when the settled
+commit lacks a workflow the default branch has.
 
 The targets:
 
@@ -420,7 +427,7 @@ The targets:
 |---|---|---|---|
 | `release-publish-rust-crates` | an explicit crate list to crates.io at the release version: one `cargo publish -p … -p …` (Cargo ≥ 1.90 orders and waits); polls the index afterwards. Every crate's manifest must already be at the version. Never `--workspace`: list the crates. | crates already at the version are skipped | `cargo publish --dry-run` for every listed crate, nothing uploaded |
 | `release-upload-artifact` | one file to Artifact Registry (generic repository) or a GCS bucket; every destination is an input. Authentication is the caller's: run `google-github-actions/auth` before it. | identical file already there → `exists`; different → fails, never overwrites | checksum and destination check only |
-| `release-assets` | files plus a generated `SHA256SUMS` on the GitHub Release; needs the job token with `contents: write` | `--clobber` | prints the sums, attaches nothing |
+| `release-assets` | files plus a generated `SHA256SUMS` on a mutable Release; needs the job token with `contents: write` | `--clobber` | prints the sums, attaches nothing |
 | `release-verify-version` | nothing: runs a version probe (`my-binary --version`) and requires `<name> <version>` (`expected` overrides, with `{name}` and `{version}`) | n/a | a mismatch warns; a probe that cannot run fails even here |
 
 ## Snapshots (`snapshot-publish.yml`)

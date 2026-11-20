@@ -99,6 +99,12 @@ runs:
             return 1
           fi
         }
+        has_published_release() {
+          local published_tag
+          published_tag="$(gh release view "$1" --json tagName,isDraft \
+            --jq 'select(.isDraft == false) | .tagName' 2>/dev/null)" &&
+            [[ "$published_tag" == "$1" ]]
+        }
         # Sets $actual to the version at <commit>. A version file that is
         # missing or does not parse is a configuration error, not a candidate
         # that has not landed yet, so it fails the route instead of skipping.
@@ -129,7 +135,7 @@ runs:
               if [[ -z "$tag_commit" ]]; then
                 tag_commit="$(git ls-remote origin "refs/tags/$tag" | cut -f1)"
               fi
-              if gh release view "$tag" --json tagName >/dev/null 2>&1; then release_exists=true; fi
+              if has_published_release "$tag"; then release_exists=true; fi
             fi
             if [[ "$release_exists" == false ]]; then
               read_version "$GITHUB_SHA" "$GITHUB_REF_NAME"
@@ -156,7 +162,7 @@ runs:
             tagged=false; branch_release_exists=false; actual=""
             if has_tag "v$version"; then
               tagged=true
-              if gh release view "v$version" --json tagName >/dev/null 2>&1; then branch_release_exists=true; fi
+              if has_published_release "v$version"; then branch_release_exists=true; fi
             else
               read_version "$tip" "$branch"
             fi

@@ -3,7 +3,7 @@
 `uses: megaeth-labs/.github/.github/actions/release-publish@main`
 
 <!-- generated: description -->
-Publish a settled release. By default, runs on a push to `release-vX.Y.Z` (the consumer passes the `commit` and `pr_number` that `release-route` resolved for the push). Re-verifies the merged `chore/release-settle-vX.Y.Z` PR through the API — merged, merge commit equals the pushed commit, head/base names, author, and the settled-SHA marker against the merge commit's parent. With `settle_source: dispatch`, verifies the merged candidate PR's merge SHA, head, base and author, and that `release_branch` still points at `commit` for a fresh publish, or contains `commit` when resuming an existing tag; repeats this state check immediately before tagging. Then creates the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release with the changelog section as notes. A tag already at the commit without a Release (a run that died between the two steps) is resumed: the tag step is skipped and the Release is still created. Re-run the push-triggered workflow for the settle-PR shape, or dispatch for the direct shape. A tag at the commit with its Release already there is a retry of a finished run and exits 0 with a notice; a tag at any other commit refuses, because a release is published once. A version that is not newer than every other `vX.Y.Z` tag (the rule `release-route` applies) is refused before the tag, and the Release is marked latest only when it is newer than the current latest Release. A tag push or Release create that loses a race to a concurrent run of the same publish keeps the winner's, if it is at this commit. This is the only place in the release flow that creates a tag; merging the settle PR is the approval. The default branch's changelog catches up in the next release candidate PR — nothing is back-merged. The consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
+Publish a settled release. By default, runs on a push to `release-vX.Y.Z` (the consumer passes the `commit` and `pr_number` that `release-route` resolved for the push). Re-verifies the merged `chore/release-settle-vX.Y.Z` PR through the API — merged, merge commit equals the pushed commit, head/base names, author, and the settled-SHA marker against the merge commit's parent. With `settle_source: dispatch`, verifies the merged candidate PR's merge SHA, head, base and author, and that `release_branch` still points at `commit` for a fresh publish, or contains `commit` when resuming an existing tag; repeats this state check immediately before tagging. Then creates the annotated tag `vX.Y.Z` at that commit and publishes the GitHub Release with the changelog section as notes. Pass `asset_files` to attach files and `SHA256SUMS` before the Release becomes immutable. A tag already at the commit without a published Release (a run that died between the two steps) is resumed: the tag step is skipped and the Release is still created. Re-run the push-triggered workflow for the settle-PR shape, or dispatch for the direct shape. A tag at the commit with its Release already there is a retry of a finished run and exits 0 with a notice; a tag at any other commit refuses, because a release is published once. A version that is not newer than every other `vX.Y.Z` tag (the rule `release-route` applies) is refused before the tag, and the Release is marked latest only when it is newer than the current latest Release. A tag push or Release create that loses a race to a concurrent run of the same publish keeps the winner's, if it is at this commit. This is the only place in the release flow that creates a tag; merging the settle PR is the approval. The default branch's changelog catches up in the next release candidate PR — nothing is back-merged. The consumer checks the repository out first (`fetch-depth: 0`, `persist-credentials: false`). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 <!-- /generated -->
 
 Family: [Release pipeline](../RELEASE.md).
@@ -22,6 +22,7 @@ Family: [Release pipeline](../RELEASE.md).
 | `release_branch` | no |  | Release branch that must equal <release_branch_prefix>X.Y.Z; for dispatch its tip must equal commit for a fresh publish, or contain commit when resuming an existing tag. |
 | `commit` | yes |  | The commit to publish (full SHA); it must be the settle PR's merge commit for pr, or the candidate PR's merge commit for dispatch. |
 | `pr_number` | yes |  | Number of the merged settle PR for pr, or the merged candidate PR for dispatch. |
+| `asset_files` | no |  | Newline-separated regular file paths, absolute or relative to the workspace. Use unique basenames and reserve SHA256SUMS for the generated checksum file. Paths cannot contain `#`, which GitHub CLI treats as an asset label separator. |
 | `pr_author` | no | `mega-gutenberg[bot]` | Login the settle or candidate PR must have been opened by — the app identity `release-settle` runs under. Stops a hand-made `chore/release-settle-*` branch from reaching the tag step. Empty disables the check only for pr. |
 | `git_user_name` | no | `mega-gutenberg[bot]` | Committer identity for the commits this action makes. |
 | `git_user_email` | no | `348780249+mega-gutenberg[bot]@users.noreply.github.com` | Committer email for the commits this action makes. |
@@ -70,9 +71,13 @@ Family: [Release pipeline](../RELEASE.md).
 - `tag $tag already exists (at $(git rev-parse`
 - `$FILE at $MERGE_SHA says $actual, expected $version`
 - `changelog section for v$version at $MERGE_SHA disagrees with regenerated notes; let the settle refresh land first, then publish.`
+- `release asset must be an existing regular file and not a symlink: $file`
+- `release asset basename is reserved or duplicated: $name`
+- `release asset path cannot contain GitHub CLI`
 - `could not push $TAG; the remote tag is at $(git rev-parse`
 - `cannot read the latest Release to decide whether $TAG is the latest; re-run to resume`
 - `could not create the Release for $TAG`
+- `published Release $TAG is missing asset: $name`
 <!-- /generated -->
 
 ## Example
@@ -117,11 +122,15 @@ ancestry rule.
   `commit` in dispatch mode; then publishes the GitHub Release with the
   changelog section as notes, marked latest only when it is newer than the
   current latest Release.
-- If the tag exists at `commit` but its Release does not, both sources skip
-  tagging and resume Release creation after their verification passes. Resume
-  the settle-PR shape by re-running the push-triggered workflow; resume the
-  direct shape by dispatching again with the same inputs. A tag elsewhere is
-  always refused; a tag at `commit` with a Release already present is a no-op.
+- If the tag exists at `commit` and there is no published Release, both
+  sources skip tagging and resume Release creation once verification passes.
+  Re-run the push-triggered workflow for the settle-PR shape or dispatch again
+  with the same inputs for the direct shape. A tag elsewhere is refused.
+  A tag at `commit` with a published Release is a no-op.
+- With `asset_files`, the guard checks the files and generates `SHA256SUMS`
+  before tagging. The publish step replaces stranded drafts for the tag and
+  uploads the files before publication. Keep the publish job in the template's
+  per-release-branch concurrency group when using this input.
 - The Release body is the changelog section extracted from the tagged tree,
   verbatim, with no injected date. With an empty `changelog_file`, notes are
   generated from non-merge commits since the previous release tag (or all
