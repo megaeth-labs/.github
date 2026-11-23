@@ -46,7 +46,7 @@ inputs:
     description: >
       Optional override for the per-invocation turn budget (`--max-turns`).
       Empty (default) uses the built-in budget derived from model tier and
-      review depth (fast 12, standard 44, deep 56). Set a positive integer to
+      review depth (fast 24, standard 44, deep 56). Set a positive integer to
       pin the ceiling for the main analysis pass; the retry pass keeps its 1.5x
       headroom relative to this value.
   debug_logs:
@@ -156,7 +156,7 @@ runs:
         max_turns=44
         if [[ "$MODEL_TIER" == "fast" ]]; then
           selected_model="$INCREMENTAL_MODEL"
-          max_turns=12
+          max_turns=24
         fi
         if [[ "$REVIEW_DEPTH" == "deep" ]]; then
           max_turns=56
