@@ -2072,21 +2072,18 @@ def compile_review(
                 f"prior_findings has invalid disposition for {item_id}",
                 code="PRIOR_FINDING_INVALID",
             )
-        if (
-            item.get("status") == "resolved"
-            and item.get("thread_resolution") == "confirmed"
-        ):
-            # Someone resolved the thread on GitHub between rounds, so prepare
-            # already closed this finding. That human action is authoritative:
-            # a concordant `resolved` is a no-op, and an `open` must not reopen
-            # a thread a reviewer deliberately closed.
+        if item.get("status") != "open":
+            # Already closed in an earlier round or resolved on GitHub between
+            # rounds; kept in the manifest as context so the model does not
+            # re-raise it. Ignore any echoed disposition so a resolved finding
+            # is not reopened or re-queued.
             trace.append(
                 f"prior finding {item_id}: ignored '{status}' disposition — "
-                "already resolved on GitHub"
+                "already resolved"
             )
             print(
                 f"ignoring {status} disposition for {item_id}: already "
-                "resolved on GitHub",
+                "resolved in manifest",
                 file=sys.stderr,
             )
             continue
@@ -2250,10 +2247,10 @@ def compile_review(
 
 
     question_state = manifest.setdefault("questions", {})
-    open_question_ids = {
+    known_question_ids = {
         item_id
         for item_id, item in question_state.items()
-        if isinstance(item, dict) and item.get("status") == "open"
+        if isinstance(item, dict)
     }
     returned_question_ids = [
         str(item.get("question_id") or "")
@@ -2265,10 +2262,10 @@ def compile_review(
             "prior_questions contains duplicate question IDs",
             code="PRIOR_QUESTION_INVALID",
         )
-    unknown_questions = sorted(set(returned_question_ids) - open_question_ids)
+    unknown_questions = sorted(set(returned_question_ids) - known_question_ids)
     if unknown_questions:
         raise PipelineError(
-            "prior_questions references questions that are not open "
+            "prior_questions references questions that are not in the manifest "
             f"(unknown={unknown_questions})",
             code="PRIOR_QUESTION_INVALID",
         )
@@ -2286,6 +2283,20 @@ def compile_review(
                 f"prior_questions has invalid disposition for {item_id}",
                 code="PRIOR_QUESTION_INVALID",
             )
+        if item.get("status") != "open":
+            # Closed in an earlier round; kept in the manifest as context so
+            # the model does not re-ask it. Ignore any echoed disposition so a
+            # prior answer or withdrawal is not reopened or re-annotated.
+            trace.append(
+                f"prior question {item_id}: ignored '{status}' disposition — "
+                f"already {item.get('status')}"
+            )
+            print(
+                f"ignoring {status} disposition for {item_id}: already "
+                f"{item.get('status')} in manifest",
+                file=sys.stderr,
+            )
+            continue
         item["status"] = status
         item["last_checked_sha"] = head
         trace.append(

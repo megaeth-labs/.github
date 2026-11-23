@@ -277,7 +277,11 @@ runs:
              for it is ignored.
              Do the same for every open manifest question: return a prior_questions
              disposition (`open`, `answered`, or `withdrawn`) with a one-line reason.
-             An omitted question stays open. Disposition each question from the whole
+             An omitted question stays open. Disposition only questions whose
+             manifest `status` is `open`; a question already carrying another status
+             was closed in an earlier round, appears in the manifest as context so
+             you do not re-ask it, and a disposition for it is ignored. Disposition
+             each open question from the whole
              discussion, not just the code delta: mark it `answered` when a human
              reply resolves it — even when the delta does not touch the code the
              question is about — and `withdrawn` when it no longer applies. An open
@@ -393,7 +397,8 @@ runs:
           `.pr-review/full.diff`, `.pr-review/rubric.md`, and
           `.pr-review/rubric-detail.md`. If review-input.json enables the internal
           pre-mortem, also read `.pr-review/premortem.md`. Apply the same frozen
-          scope, prior-finding and prior-question disposition, confidence, and
+          scope, prior-finding and prior-question disposition (disposition only
+          findings and questions whose manifest `status` is `open`), confidence, and
           security rules encoded in those files. Do not re-ask a question that the
           manifest already lists as open.
           Reconcile the previous automated review, general comments,
