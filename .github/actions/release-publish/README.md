@@ -23,6 +23,7 @@ Family: [Release pipeline](../RELEASE.md).
 | `commit` | yes |  | The commit to publish (full SHA); it must be the settle PR's merge commit for pr, or the candidate PR's merge commit for dispatch. |
 | `pr_number` | yes |  | Number of the merged settle PR for pr, or the merged candidate PR for dispatch. |
 | `asset_files` | no |  | Newline-separated regular file paths, absolute or relative to the workspace. Use unique basenames and reserve SHA256SUMS for the generated checksum file. Paths cannot contain `#`, which GitHub CLI treats as an asset label separator. |
+| `release_author` | no | `mega-gutenberg[bot]` | Login a draft Release at the tag must have been created by for the publish step to delete it as debris from its own interrupted run — the app identity this action runs under. Any other draft at the tag is refused, never deleted, so a hand-written draft is never destroyed. Only consulted with `asset_files`. Empty refuses every pre-existing draft. |
 | `pr_author` | no | `mega-gutenberg[bot]` | Login the settle or candidate PR must have been opened by — the app identity `release-settle` runs under. Stops a hand-made `chore/release-settle-*` branch from reaching the tag step. Empty disables the check only for pr. |
 | `git_user_name` | no | `mega-gutenberg[bot]` | Committer identity for the commits this action makes. |
 | `git_user_email` | no | `348780249+mega-gutenberg[bot]@users.noreply.github.com` | Committer email for the commits this action makes. |
@@ -77,6 +78,8 @@ Family: [Release pipeline](../RELEASE.md).
 - `asset_files is set but names no usable paths`
 - `could not push $TAG; the remote tag is at $(git rev-parse`
 - `cannot read the latest Release to decide whether $TAG is the latest; re-run to resume`
+- `draft Release $id for $TAG was created by ${author:-<unknown>}, not $RELEASE_AUTHOR; publishing would delete it. Publish or delete that draft by hand, then re-run.`
+- `cannot read draft Release $id for $TAG to decide whether to replace it; re-run to resume`
 - `could not create the Release for $TAG`
 - `published Release $TAG is missing asset: $name`
 <!-- /generated -->
@@ -129,9 +132,15 @@ ancestry rule.
   with the same inputs for the direct shape. A tag elsewhere is refused.
   A tag at `commit` with a published Release is a no-op.
 - With `asset_files`, the guard checks the files and generates `SHA256SUMS`
-  before tagging. The publish step replaces stranded drafts for the tag and
-  uploads the files before publication. Keep the publish job in the template's
-  per-release-branch concurrency group when using this input.
+  before tagging, and only for a publish that will create the Release: a retry
+  of a finished run is still a no-op whatever `asset_files` names. The publish
+  step uploads the files before publication. Keep the publish job in the
+  template's per-release-branch concurrency group when using this input.
+- A draft Release at the tag is only replaced when it is this action's own: it
+  must have been created by `release_author`, the identity publishing here, and
+  the deletion is announced as a warning. Any other draft at the tag — someone's
+  unpublished notes — is refused with an error and left untouched, because
+  deleting a Release cannot be undone.
 - The Release body is the changelog section extracted from the tagged tree,
   verbatim, with no injected date. With an empty `changelog_file`, notes are
   generated from non-merge commits since the previous release tag (or all

@@ -73,6 +73,15 @@ inputs:
       Paths cannot contain `#`, which GitHub CLI treats as an asset label separator.
     required: false
     default: ""
+  release_author:
+    description: >-
+      Login a draft Release at the tag must have been created by for the publish
+      step to delete it as debris from its own interrupted run — the app identity
+      this action runs under. Any other draft at the tag is refused, never
+      deleted, so a hand-written draft is never destroyed. Only consulted with
+      `asset_files`. Empty refuses every pre-existing draft.
+    required: false
+    default: "mega-gutenberg[bot]"
   pr_author:
     description: >-
       Login the settle or candidate PR must have been opened by — the app identity
@@ -311,7 +320,9 @@ runs:
             echo "::error::changelog section for v$version at $MERGE_SHA disagrees with regenerated notes; let the settle refresh land first, then publish."; exit 1
           fi
         fi
-        if [[ -n "${ASSET_FILES:-}" ]]; then
+        # Only for a publish that will create the Release. A retry of a finished
+        # run exits 0 below, and must not need the files to still be on disk.
+        if [[ "$published" != true && -n "${ASSET_FILES:-}" ]]; then
           asset_dir="$(mktemp -d "$RUNNER_TEMP/release-publish-assets.XXXXXXXX")"
           touch "$asset_dir/files" "$asset_dir/names" "$asset_dir/SHA256SUMS"
           while IFS= read -r file; do
@@ -410,8 +421,12 @@ runs:
         NOTES: ${{ steps.guard.outputs.notes_file }}
         TOOLS: ${{ github.action_path }}/../release-tools/release_tools.py
         ASSET_DIR: ${{ steps.guard.outputs.asset_dir }}
+        RELEASE_AUTHOR: ${{ inputs.release_author }}
       run: |
         set -euo pipefail
+        # Unset means no attributable author, which refuses every pre-existing
+        # draft below: a harness that extracts this step never deletes one.
+        RELEASE_AUTHOR="${RELEASE_AUTHOR:-}"
         # Mark the Release latest only if it is newer than the Release GitHub
         # calls latest now (a concurrent publish of a newer line may have won).
         if current="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>"$RUNNER_TEMP/latest-release.err")"; then
@@ -444,14 +459,27 @@ runs:
           done < "$ASSET_DIR/files"
           set -- "$@" "$ASSET_DIR/SHA256SUMS"
           releases="repos/$GITHUB_REPOSITORY/releases"
-          drafts="$(gh api --paginate "$releases" --jq ".[] | select(.tag_name == \"$TAG\" and .draft == true) | .id")"
-          while IFS= read -r id; do
+          drafts="$(gh api --paginate "$releases" \
+            --jq ".[] | select(.tag_name == \"$TAG\" and .draft == true) | [.id, .author.login] | @tsv")"
+          while IFS=$'\t' read -r id author; do
             [[ -n "$id" ]] || continue
+            # Only this action's own interrupted run leaves a draft to replace,
+            # and gh creates it as the identity publishing here. Any other draft
+            # at the tag is someone's unpublished notes: refuse, never delete.
+            if [[ -z "$RELEASE_AUTHOR" || "$author" != "$RELEASE_AUTHOR" ]]; then
+              echo "::error::draft Release $id for $TAG was created by ${author:-<unknown>}, not $RELEASE_AUTHOR; publishing would delete it. Publish or delete that draft by hand, then re-run."; exit 1
+            fi
             # The publish job serializes each release branch. Recheck by ID
             # immediately before deleting so a published Release is skipped.
-            draft="$(gh api "$releases/$id" --jq .draft)"
+            # A 404 is the outcome this loop wants, not a failure: continue.
+            if ! draft="$(gh api "$releases/$id" --jq .draft 2>"$RUNNER_TEMP/draft-$id.err")"; then
+              grep -qF "HTTP 404" "$RUNNER_TEMP/draft-$id.err" && continue
+              cat "$RUNNER_TEMP/draft-$id.err" >&2
+              echo "::error::cannot read draft Release $id for $TAG to decide whether to replace it; re-run to resume"; exit 1
+            fi
             if [[ "$draft" == true ]]; then
               gh api --method DELETE "$releases/$id"
+              echo "::warning title=Deleted stranded draft::draft Release $id at $TAG was left by an interrupted publish and was deleted before creating the Release"
             fi
           done <<< "$drafts"
         fi

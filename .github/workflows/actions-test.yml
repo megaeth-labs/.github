@@ -1950,6 +1950,7 @@ jobs:
                 TAG="$(out_get tag)" \
                 NOTES="$(out_get notes_file)" \
                 ASSET_DIR="$(out_get asset_dir)" \
+                RELEASE_AUTHOR="${RELEASE_AUTHOR-mega-gutenberg[bot]}" \
                 GITHUB_OUTPUT="$OUT.release" \
                 bash "$SH/release.sh" )
           }
@@ -2069,6 +2070,15 @@ jobs:
             exit 0
           fi
           if [[ "$1" == api && "$2" == repos/*/releases/[0-9]* ]]; then
+            # The real API 404s for a draft deleted since the listing was read.
+            if [[ -e "$FIX/vanished-${2##*/}" ]]; then
+              echo "gh: Not Found (HTTP 404)" >&2
+              exit 1
+            fi
+            if [[ -e "$FIX/unreadable-${2##*/}" ]]; then
+              echo "gh: Server Error (HTTP 500)" >&2
+              exit 1
+            fi
             jq -r --argjson id "${2##*/}" '.[] | select(.id == $id) | .draft' "$FIX/drafts.json"
             exit 0
           fi
@@ -2182,6 +2192,20 @@ jobs:
           [[ "$(remote_tag_object v1.2.0)" == "$before" ]] || { echo "the tag moved"; exit 1; }
           [[ "$(grep -c 'release create v1.2.0 ' "$ARGS")" == 1 ]] || { echo "a second Release was created"; exit 1; }
           echo "tag and Release both at the commit: exit 0, notice, nothing changed"
+
+      - name: A finished publish stays a no-op whatever asset_files says
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          # The Release is already there, so no asset is ever uploaded from this
+          # run: the files need not still be on disk for the retry to be green.
+          ASSET_FILES="$(printf '%s\n' dist/gone /nowhere/SHA256SUMS)" GITHUB_WORKSPACE="$REPO" \
+            publish 101 > "$RUNNER_TEMP/retry-assets.log" 2>&1 \
+            || { echo "a retry of a finished publish failed on asset_files"; cat "$RUNNER_TEMP/retry-assets.log"; exit 1; }
+          expect_output "published=true"
+          grep -qF "Already published" "$RUNNER_TEMP/retry-assets.log"
+          [[ -z "$(out_get asset_dir)" ]] || { echo "asset work ran for a finished publish"; exit 1; }
+          [[ ! -e "$FIX/tag-ran" && ! -e "$FIX/release-ran" ]] || { echo "a step ran on the retry"; exit 1; }
 
       - name: A run that died after the tag is resumed, not refused
         run: |
@@ -2393,7 +2417,8 @@ jobs:
           source "$SH/helpers.sh"
           settle 3.3.0 141
           seed_tag v3.3.0 "$(cat "$FIX/merge-141")"
-          printf '%s\n' '[{"tag_name":"v3.3.0","id":11,"draft":true},{"tag_name":"v3.1.0","id":13,"draft":true}]' > "$FIX/drafts.json"
+          printf '%s\n' '[{"tag_name":"v3.3.0","id":11,"draft":true,"author":{"login":"mega-gutenberg[bot]"}},
+            {"tag_name":"v3.1.0","id":13,"draft":true,"author":{"login":"mega-gutenberg[bot]"}}]' > "$FIX/drafts.json"
           tag_object="$(remote_tag_object v3.3.0)"
           guard 141
           expect_output 'tag_exists=true'
@@ -2409,10 +2434,12 @@ jobs:
           [[ ! -s "$FIX/release-events" && ! -s "$OUT.release" ]]
           rm "$FIX/fail-create"
 
-          ASSET_FILES="$FIX/other/tool-debug" publish 141
+          ASSET_FILES="$FIX/other/tool-debug" publish 141 > "$FIX/publish-141.log" 2>&1
           [[ ! -e "$FIX/tag-ran" && "$(remote_tag_object v3.3.0)" == "$tag_object" ]]
           printf '%s\n' 'delete 11' 'create v3.3.0' > "$FIX/expected-events"
           cmp "$FIX/release-events" "$FIX/expected-events"
+          # The deletion is announced, so it is never silent in the run log.
+          grep -qF '::warning title=Deleted stranded draft::draft Release 11 at v3.3.0' "$FIX/publish-141.log"
 
       - name: A concurrent published Release must have every uploaded asset
         run: |
@@ -2433,6 +2460,68 @@ jobs:
           printf '%s\n' '[{"name":"tool-debug","state":"uploaded"},{"name":"SHA256SUMS","state":"uploaded"}]' > "$FIX/assets-v3.4.0.json"
           release_step
           grep -qxF 'url=https://github.com/megaeth-labs/fake/releases/tag/v3.4.0' "$OUT.release"
+
+      - name: A draft the publish did not create is refused, never deleted
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 3.5.0 143
+          printf '%s\n' '[{"tag_name":"v3.5.0","id":21,"draft":true,"author":{"login":"a-maintainer"}}]' > "$FIX/drafts.json"
+          ASSET_FILES="$FIX/other/tool-debug" guard 143
+          tag_step
+          : > "$FIX/release-events"
+          if release_step > "$FIX/foreign.log" 2>&1; then
+            echo "a foreign draft was accepted"; exit 1
+          fi
+          grep -qF 'draft Release 21 for v3.5.0 was created by a-maintainer' "$FIX/foreign.log"
+          # Refused before any destructive call, and the draft is still there.
+          [[ ! -s "$FIX/release-events" && ! -s "$OUT.release" ]]
+          [[ "$(jq -r 'length' "$FIX/drafts.json")" == 1 ]]
+
+          # An unattributable draft (no author) is refused the same way.
+          printf '%s\n' '[{"tag_name":"v3.5.0","id":21,"draft":true}]' > "$FIX/drafts.json"
+          if release_step > "$FIX/anon.log" 2>&1; then
+            echo "an unattributable draft was accepted"; exit 1
+          fi
+          grep -qF 'created by <unknown>' "$FIX/anon.log"
+          [[ ! -s "$FIX/release-events" ]]
+
+          # Its own draft publishes, and the run is clean once the draft is ours.
+          printf '%s\n' '[{"tag_name":"v3.5.0","id":21,"draft":true,"author":{"login":"mega-gutenberg[bot]"}}]' > "$FIX/drafts.json"
+          release_step
+          printf '%s\n' 'delete 21' 'create v3.5.0' > "$FIX/expected-events"
+          cmp "$FIX/release-events" "$FIX/expected-events"
+
+      - name: A draft that vanishes between the listing and the read is not fatal
+        run: |
+          set -euo pipefail
+          source "$SH/helpers.sh"
+          settle 3.6.0 144
+          printf '%s\n' '[{"tag_name":"v3.6.0","id":31,"draft":true,"author":{"login":"mega-gutenberg[bot]"}},
+            {"tag_name":"v3.6.0","id":32,"draft":true,"author":{"login":"mega-gutenberg[bot]"}}]' > "$FIX/drafts.json"
+          # 31 is deleted by something else after the listing; 404 means the
+          # loop already has what it wanted, so the publish must carry on.
+          touch "$FIX/vanished-31"
+          : > "$FIX/release-events"
+          ASSET_FILES="$FIX/other/tool-debug" publish 144
+          printf '%s\n' 'delete 32' 'create v3.6.0' > "$FIX/expected-events"
+          cmp "$FIX/release-events" "$FIX/expected-events"
+          grep -qxF "url=https://github.com/megaeth-labs/fake/releases/tag/v3.6.0" "$OUT.release"
+          rm "$FIX/vanished-31"
+
+          # Any other read failure still refuses, with a named error.
+          settle 3.7.0 145
+          printf '%s\n' '[{"tag_name":"v3.7.0","id":33,"draft":true,"author":{"login":"mega-gutenberg[bot]"}}]' > "$FIX/drafts.json"
+          touch "$FIX/unreadable-33"
+          ASSET_FILES="$FIX/other/tool-debug" guard 145
+          tag_step
+          : > "$FIX/release-events"
+          if release_step > "$FIX/unreadable.log" 2>&1; then
+            echo "an unreadable draft was accepted"; exit 1
+          fi
+          grep -qF 'cannot read draft Release 33 for v3.7.0' "$FIX/unreadable.log"
+          [[ ! -s "$FIX/release-events" ]]
+          rm "$FIX/unreadable-33"
 
   release-route:
     runs-on: ubuntu-24.04
