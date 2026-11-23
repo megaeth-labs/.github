@@ -92,12 +92,16 @@ one-sentence reason in the job log.
    no date is injected. A settle PR that went stale before it merged publishes
    nothing; `route` answers `refresh` and a fresh PR follows.
 
-4. **Assets: the tag push (the Release) fires On Release.** Publishing the
-   Release runs the repository's `on-release.yml`, which builds, verifies the
+   For GitHub Release downloads, pass the built files to
+   [`release-publish`](../.github/actions/release-publish/README.md) as
+   `asset_files`. It attaches them with `SHA256SUMS` before the Release becomes
+   immutable.
+
+4. **Publish targets.** Publishing the Release runs the repository's
+   `on-release.yml`, which builds, verifies the
    version ([`release-verify-version`](../.github/actions/release-verify-version/README.md)),
    uploads ([`release-upload-artifact`](../.github/actions/release-upload-artifact/README.md)),
-   attaches [release assets](../.github/actions/release-assets/README.md), and
-   publishes crates.
+   and publishes crates.
 
 ## Environments and their variables
 

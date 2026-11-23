@@ -111,6 +111,11 @@ jobs:
           version_pattern: plain
           changelog_file: CHANGELOG.md
 
+  # To attach Release assets, add a build job that needs route and runs when
+  # route returns publish. Check out `needs.route.outputs.commit` with
+  # persist-credentials: false and build without release credentials.
+  # Upload the files as a workflow artifact. Add the build to publish.needs,
+  # download the artifact after checkout, and list its paths in asset_files.
   publish:
     needs: route
     # Route permits a merged settle PR on push or a clean branch on dispatch;

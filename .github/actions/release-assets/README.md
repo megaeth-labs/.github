@@ -3,7 +3,7 @@
 `uses: megaeth-labs/.github/.github/actions/release-assets@main`
 
 <!-- generated: description -->
-Attach files, plus a generated `SHA256SUMS`, to the GitHub Release for a tag. Re-runs replace assets of the same name (`--clobber`), so the step is idempotent. `dry_run` writes and prints `SHA256SUMS` but attaches nothing. Needs a token with `contents: write` on the repository (the job token is enough). Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
+Attach files, plus a generated `SHA256SUMS`, to the GitHub Release for a tag. Re-runs replace assets of the same name (`--clobber`), so the step is idempotent. `dry_run` writes and prints `SHA256SUMS` but attaches nothing. Needs a token with `contents: write` on the repository (the job token is enough). This post-publish action cannot attach files to an immutable Release. Use `release-publish` with `asset_files` to attach them before publication. Guide: .github/actions/RELEASE.md in megaeth-labs/.github.
 <!-- /generated -->
 
 Family: [Release pipeline](../RELEASE.md).
