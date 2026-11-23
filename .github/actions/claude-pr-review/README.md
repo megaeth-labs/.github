@@ -21,7 +21,7 @@ Family: [Claude CI](../CLAUDE-CI.md).
 | `model` | no | `claude-opus-4-7` | Model used for full, high-risk, and deep reviews. |
 | `incremental_model` | no |  | Model used for low-risk incremental reviews. Empty uses the Claude Code default (Sonnet class). |
 | `review_depth` | no | `standard` | `standard` runs one lead review. `deep` asks the lead to fan out review dimensions and adversarially verify them before returning structured data. |
-| `max_turns` | no |  | Optional override for the per-invocation turn budget (`--max-turns`). Empty (default) uses the built-in budget derived from model tier and review depth (fast 12, standard 44, deep 56). Set a positive integer to pin the ceiling for the main analysis pass; the retry pass keeps its 1.5x headroom relative to this value. |
+| `max_turns` | no |  | Optional override for the per-invocation turn budget (`--max-turns`). Empty (default) uses the built-in budget derived from model tier and review depth (fast 24, standard 44, deep 56). Set a positive integer to pin the ceiling for the main analysis pass; the retry pass keeps its 1.5x headroom relative to this value. |
 | `debug_logs` | no | `false` | Deprecated and ignored. The analysis session's full output — its tool calls, the files it opened, and the ones it never read — is now always printed, and the whole `.pr-review` state directory plus the session transcript are uploaded as a run artifact. Kept only so consumers that still pass it do not break. |
 | `state_artifact` | no | `true` | `true` uploads the `.pr-review` state directory — routing input, both diffs, the raw model output, the compiled payload, the pipeline trace, and the analysis session transcript — as a run artifact. This is the only copy that outlives the runner, so leave it on unless the repository forbids artifacts. |
 | `state_artifact_retention_days` | no | `14` | Retention in days for the review state artifact. |
@@ -96,6 +96,6 @@ jobs:
   step.
 - A PR that edits the calling repository's own `claude.yml` skips the review
   by design of `claude-code-action`; it works again once the change merges.
-- Turn budgets: 12 for a low-risk incremental round, 44 for a strong-tier
+- Turn budgets: 24 for a low-risk incremental round, 44 for a strong-tier
   one, 56 for `deep`; `max_turns` overrides, and the retry gets half again
   as many.

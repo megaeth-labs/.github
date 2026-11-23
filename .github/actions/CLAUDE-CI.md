@@ -285,7 +285,7 @@ The `pr-review` action additionally accepts:
 - `debug_logs` - deprecated and ignored. The analysis session's full output is now always
   printed. Consumers still passing it are unaffected; drop it at your convenience.
 
-The semantic-analysis stage runs under a turn budget: 12 for a low-risk incremental review,
+The semantic-analysis stage runs under a turn budget: 24 for a low-risk incremental review,
 44 for a strong-tier one, and 56 for `deep`. Set `max_turns` to override any of these.
 Roughly ten turns go on mandated context — six pipeline files plus repo guidance — before the
 diff is read, and a small diff inside a large file spends many more paging through it, so the
@@ -304,7 +304,7 @@ with:
   github_identity_token: ${{ steps.app-token.outputs.token }}
 ```
 
-The semantic stage is bounded to 12 turns for fast incremental reviews, 44 for standard
+The semantic stage is bounded to 24 turns for fast incremental reviews, 44 for standard
 full or high-risk reviews, and 56 for explicit deep reviews, unless `max_turns` overrides it.
 
 ## Inspecting a review run

@@ -2471,6 +2471,102 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("session limit", classified["message"].lower())
         self.assertIn("11:30am", classified["message"])
 
+    def test_classify_ignores_allowed_rate_limit_event_and_max_turns_transcript(
+        self,
+    ):
+        transcript = [
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "resetsAt": 1795431000,
+                    "rateLimitType": "five_hour",
+                    "overageStatus": "rejected",
+                    "overageDisabledReason": "org_level_disabled",
+                    "isUsingOverage": False,
+                },
+            },
+            {
+                "type": "user",
+                "tool_use_result": {
+                    "content": (
+                        "You've hit your session limit · rateLimitType: "
+                        "five_hour · rate_limit in reviewed file"
+                    )
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Checking rate limit and session limit "
+                                "handling in the PR diff."
+                            ),
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": True,
+                "terminal_reason": "max_turns",
+                "errors": ["Reached maximum number of turns (24)"],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "analysis-transcript.json")
+            path.write_text(json.dumps(transcript), encoding="utf-8")
+            classified = pipeline.classify_model_failure(
+                execution_file=str(path)
+            )
+
+        self.assertTrue(classified["retryable"])
+        self.assertEqual(classified["code"], "")
+
+    def test_classify_rejected_rate_limit_event_and_api_error_assistant_message(
+        self,
+    ):
+        transcript = [
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "resetsAt": 1795431000,
+                    "rateLimitType": "five_hour",
+                },
+            },
+            {
+                "type": "assistant",
+                "is_api_error_message": True,
+                "error": "rate_limit",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You've hit your session limit · resets "
+                                "3:00pm (UTC)"
+                            ),
+                        }
+                    ]
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "analysis-transcript.json")
+            path.write_text(json.dumps(transcript), encoding="utf-8")
+            classified = pipeline.classify_model_failure(
+                execution_file=str(path)
+            )
+
+        self.assertEqual(classified["code"], "MODEL_SESSION_LIMIT")
+        self.assertFalse(classified["retryable"])
+        self.assertIn("3:00pm", classified["message"])
+
     def test_classify_missing_file_is_retryable(self):
         classified = pipeline.classify_model_failure(
             execution_file="/no/such/transcript.json"
@@ -2509,6 +2605,48 @@ class ObservabilityTests(unittest.TestCase):
                     )
         self.assertEqual(raised.exception.code, "MODEL_SESSION_LIMIT")
         self.assertIn("session limit", str(raised.exception))
+
+    def test_compile_classifies_retry_transcript_when_first_attempt_was_retryable(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / "review-input.json").write_text(
+                json.dumps(review_input()),
+                encoding="utf-8",
+            )
+            pipeline.write_model_failure(
+                state,
+                {
+                    "code": "",
+                    "retryable": True,
+                    "message": "",
+                    "remediation": "",
+                },
+            )
+            (state / "analysis-retry-transcript.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": True,
+                            "result": (
+                                "You've hit your session limit · resets "
+                                "4:00pm (UTC)"
+                            ),
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict("os.environ", {"REVIEW_STRUCTURED_OUTPUT": ""}):
+                with self.assertRaises(pipeline.PipelineError) as raised:
+                    pipeline.compile_command(
+                        SimpleNamespace(state_dir=str(state))
+                    )
+        self.assertEqual(raised.exception.code, "MODEL_SESSION_LIMIT")
+        self.assertIn("4:00pm", str(raised.exception))
 
     def test_failed_status_includes_provider_message_and_run_url(self):
         payload = {

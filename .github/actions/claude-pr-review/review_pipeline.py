@@ -1162,6 +1162,74 @@ def iter_json_strings(value: Any):
             yield from iter_json_strings(item)
 
 
+def iter_transcript_error_strings(value: Any):
+    """Yield strings only from error-bearing records in a Claude transcript.
+
+    Every Claude Code session emits a routine ``rate_limit_event`` with
+    ``status: "allowed"``, ``rateLimitType: "five_hour"``, and
+    ``overageStatus: "rejected"``, and ``user``/``assistant`` turns contain
+    repository files and diffs read during the review. Walking every string in
+    the JSON tree would misclassify normal sessions (such as
+    ``error_max_turns``) or PRs discussing rate limits as provider quota
+    failures.
+    """
+    if isinstance(value, list):
+        for item in value:
+            yield from iter_transcript_error_strings(item)
+        return
+    if not isinstance(value, dict):
+        return
+    entry_type = value.get("type")
+    if entry_type == "rate_limit_event":
+        info = value.get("rate_limit_info")
+        source = info if isinstance(info, dict) else value
+        status = str(source.get("status") or "").strip().lower()
+        if status == "rejected":
+            yield "rate_limit"
+            for key in ("rateLimitType", "message", "error"):
+                text = source.get(key)
+                if isinstance(text, str) and text:
+                    yield text
+        return
+    if entry_type == "assistant":
+        if value.get("is_api_error_message") is True or bool(
+            value.get("error")
+        ):
+            error_text = value.get("error")
+            if isinstance(error_text, str) and error_text:
+                yield error_text
+            message = value.get("message")
+            if isinstance(message, dict):
+                yield from iter_json_strings(message.get("content"))
+        return
+    if entry_type == "result":
+        if value.get("is_error") is not True:
+            return
+        is_max_turns = (
+            value.get("subtype") == "error_max_turns"
+            or value.get("terminal_reason") == "max_turns"
+        )
+        if not is_max_turns:
+            result_text = value.get("result")
+            if isinstance(result_text, str) and result_text:
+                yield result_text
+        for error_item in value.get("errors") or ():
+            if isinstance(error_item, str):
+                if error_item and not is_max_turns:
+                    yield error_item
+            elif isinstance(error_item, dict):
+                status = str(error_item.get("status") or "").strip().lower()
+                if status != "allowed":
+                    yield from iter_json_strings(error_item)
+        return
+    if entry_type in {"system", "user"}:
+        return
+    if entry_type is None:
+        status = str(value.get("status") or "").strip().lower()
+        if status != "allowed":
+            yield from iter_json_strings(value)
+
+
 def load_json_value(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -1221,13 +1289,13 @@ def classify_model_text(text: str) -> dict[str, Any] | None:
 
 
 def classify_model_failure(*, execution_file: str = "") -> dict[str, Any]:
-    """Read the first analysis transcript and decide whether retry can help."""
+    """Read an analysis transcript and decide whether retry can help."""
     chunks: list[str] = []
     path = Path(execution_file) if execution_file else None
     if path is not None and path.is_file():
         value = load_json_value(path)
         if value is not None:
-            chunks.extend(iter_json_strings(value))
+            chunks.extend(iter_transcript_error_strings(value))
         else:
             try:
                 chunks.append(path.read_text(encoding="utf-8", errors="replace"))
@@ -2549,6 +2617,16 @@ def compile_command(args: argparse.Namespace) -> None:
         raw = os.environ.get("REVIEW_STRUCTURED_OUTPUT", "")
         if not raw:
             classified = read_json_file(state_dir / MODEL_FAILURE_FILENAME) or {}
+            if not (
+                classified.get("code") and classified.get("retryable") is False
+            ):
+                retry_transcript = state_dir / "analysis-retry-transcript.json"
+                if retry_transcript.is_file():
+                    classified = classify_model_failure(
+                        execution_file=str(retry_transcript),
+                    )
+                    if classified.get("code"):
+                        write_model_failure(state_dir, classified)
             if classified.get("code") and classified.get("retryable") is False:
                 raise PipelineError(
                     str(
