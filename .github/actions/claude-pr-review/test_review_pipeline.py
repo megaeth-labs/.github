@@ -239,10 +239,29 @@ class ReviewPipelineTests(unittest.TestCase):
         )
         salvage = steps["Salvage completed retry output"]
         self.assertIn("id: salvage", salvage)
-        self.assertIn("if: always() && steps.prepare.outputs.mode != 'skip'", salvage)
+        conditions = {
+            "Capture first analysis transcript before retry":
+                "if: always() && steps.prepare.outputs.mode != 'skip'",
+            "Salvage completed retry output":
+                "if: always() && steps.prepare.outputs.mode != 'skip' && "
+                "steps.review_retry.outcome == 'failure'",
+            "Compile and validate review":
+                "if: always() && steps.prepare.outcome == 'success' && "
+                "steps.compose.outcome == 'success'",
+            "Publish atomically and persist state":
+                "if: ${{ !cancelled() && steps.compile.outcome == 'success' }}",
+        }
+        for name, condition in conditions.items():
+            with self.subTest(step=name):
+                self.assertEqual(
+                    [
+                        line.strip() for line in steps[name].splitlines()
+                        if line.startswith("      if:")
+                    ],
+                    [condition],
+                )
         self.assertIn('review_pipeline.py" salvage', salvage)
         compile_step = steps["Compile and validate review"]
-        self.assertIn("if: always()", compile_step)
         self.assertIn(
             "REVIEW_STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output || "
             "steps.review_retry.outputs.structured_output || steps.salvage.outputs.structured_output }}",
@@ -250,15 +269,16 @@ class ReviewPipelineTests(unittest.TestCase):
         )
         self.assertIn("continue-on-error: true", steps["Retry missing structured review output"])
         self.assertIn(
-            "steps.compile.outcome == 'success'", steps["Publish atomically and persist state"]
-        )
-        self.assertIn(
             "REVIEW_SALVAGED: ${{ steps.salvage.outputs.salvaged }}",
             steps["Report concise review outcome"],
         )
         # Run the actual capture scripts against a reused vendor path.
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory, "state")
+            state_dir.mkdir()
+            state_dir.joinpath("analysis-retry-transcript.json").write_text(
+                "stale retry from an earlier round", encoding="utf-8"
+            )
             execution_file = Path(directory, "execution.json")
             execution_file.write_text("first attempt", encoding="utf-8")
             environment = {
@@ -283,6 +303,20 @@ class ReviewPipelineTests(unittest.TestCase):
                 execution_file.write_text("retry attempt", encoding="utf-8")
             self.assertEqual(state_dir.joinpath("analysis-transcript.json").read_text(), "first attempt")
             self.assertEqual(state_dir.joinpath("analysis-retry-transcript.json").read_text(), "retry attempt")
+            # Exercise the first-attempt preserve branch against the reused path.
+            environment["RETRY_EXECUTION_FILE"] = ""
+            script = textwrap.dedent(
+                steps["Capture analysis session transcript"].split("      run: |\n", 1)[1]
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], env=environment,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("preserved analysis-transcript.json", result.stdout)
+            self.assertEqual(
+                state_dir.joinpath("analysis-transcript.json").read_text(), "first attempt"
+            )
 
     def test_action_allows_structured_output(self):
         action = Path(pipeline.__file__).with_name("action.yml").read_text(

@@ -448,7 +448,7 @@ runs:
         mkdir -p "$STATE_DIR"
         copy_transcript() {
           local source="$1" name="$2" session="$3"
-          if [[ -f "$STATE_DIR/$name" ]]; then
+          if [[ "$name" == "analysis-transcript.json" && -f "$STATE_DIR/$name" ]]; then
             echo "preserved $name captured before retry"
           elif [[ -n "$source" && -f "$source" ]]; then
             cp "$source" "$STATE_DIR/$name"
@@ -474,7 +474,7 @@ runs:
 
     - name: Salvage completed retry output
       id: salvage
-      if: always() && steps.prepare.outputs.mode != 'skip'
+      if: always() && steps.prepare.outputs.mode != 'skip' && steps.review_retry.outcome == 'failure'
       shell: bash
       env:
         REVIEW_STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output || steps.review_retry.outputs.structured_output }}
