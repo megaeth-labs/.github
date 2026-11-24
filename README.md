@@ -24,6 +24,8 @@ by every repository, and the workflow templates that show up under
   [`.github/scripts/copy_templates.py`](.github/scripts/copy_templates.py)
   renders the release templates with one repository's values filled in.
 - [`profile/`](profile/) — the organisation profile page.
+- [`docs/github-org-admin-review-guide.md`](docs/github-org-admin-review-guide.md) —
+  review guide for ambiguous GitHub organization administration requests.
 
 `actions-test.yml` is the only gate between a change here and every
 consumer's CI: unit tests of the helpers, an end-to-end drive of the actions
