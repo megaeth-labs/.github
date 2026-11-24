@@ -2168,8 +2168,79 @@ class ReviewPipelineTests(unittest.TestCase):
             }
         ]
 
-        with self.assertRaisesRegex(pipeline.PipelineError, "not open"):
+        with self.assertRaisesRegex(
+            pipeline.PipelineError,
+            "not in the manifest",
+        ):
             pipeline.compile_review(review_input(), output)
+
+    def test_disposition_for_already_closed_prior_question_is_tolerated(self):
+        value = review_input()
+        value["manifest"]["questions"]["Q-existing"] = {
+            "question_id": "Q-existing",
+            "status": "answered",
+            "question": "Can the upstream return duplicate records?",
+            "confidence": "medium",
+            "review_id": 42,
+            "asked_sha": "a" * 40,
+            "last_checked_sha": "b" * 40,
+            "closed_sha": "b" * 40,
+            "disposition_reason": "Already answered in round 2.",
+            "annotation": "applied",
+        }
+        output = clean_output()
+        output["prior_questions"] = [
+            {
+                "question_id": "Q-existing",
+                "disposition": "answered",
+                "reason": "Still answered in the current spec.",
+            }
+        ]
+
+        payload = pipeline.compile_review(value, output)
+
+        item = payload["manifest"]["questions"]["Q-existing"]
+        self.assertEqual(item["status"], "answered")
+        self.assertEqual(item["closed_sha"], "b" * 40)
+        self.assertEqual(
+            item["disposition_reason"],
+            "Already answered in round 2.",
+        )
+        self.assertEqual(item["annotation"], "applied")
+        self.assertEqual(payload["question_annotations"], [])
+
+    def test_open_disposition_cannot_reopen_already_closed_prior_question(
+        self,
+    ):
+        value = review_input()
+        value["manifest"]["questions"]["Q-existing"] = {
+            "question_id": "Q-existing",
+            "status": "answered",
+            "question": "Can the upstream return duplicate records?",
+            "confidence": "medium",
+            "review_id": 42,
+            "asked_sha": "a" * 40,
+            "last_checked_sha": "b" * 40,
+            "closed_sha": "b" * 40,
+            "disposition_reason": "Already answered in round 2.",
+            "annotation": "applied",
+        }
+        output = clean_output()
+        output["prior_questions"] = [
+            {
+                "question_id": "Q-existing",
+                "disposition": "open",
+                "reason": "Model tried to reopen.",
+            }
+        ]
+
+        payload = pipeline.compile_review(value, output)
+
+        item = payload["manifest"]["questions"]["Q-existing"]
+        self.assertEqual(item["status"], "answered")
+        self.assertEqual(item["closed_sha"], "b" * 40)
+        self.assertEqual(item["annotation"], "applied")
+        self.assertEqual(payload["question_annotations"], [])
 
     def test_missing_prior_questions_leaves_them_open(self):
         value = review_input()
