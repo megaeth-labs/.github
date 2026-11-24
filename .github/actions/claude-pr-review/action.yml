@@ -348,6 +348,23 @@ runs:
 
           ${{ inputs.extra_prompt }}
 
+    - name: Capture first analysis transcript before retry
+      id: capture_first
+      if: always() && steps.prepare.outputs.mode != 'skip'
+      continue-on-error: true
+      shell: bash
+      env:
+        EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        STATE_DIR: ${{ github.workspace }}/.pr-review
+      run: |
+        set -euo pipefail
+        # Both invocations reuse the vendor's execution-file path.
+        if [[ -n "$EXECUTION_FILE" && -f "$EXECUTION_FILE" ]]; then
+          mkdir -p "$STATE_DIR"
+          cp "$EXECUTION_FILE" "$STATE_DIR/analysis-transcript.json"
+          echo "captured first analysis transcript before retry"
+        fi
+
     - name: Classify first analysis attempt
       id: classify
       if: steps.prepare.outputs.mode != 'skip'
@@ -363,6 +380,7 @@ runs:
 
     - name: Retry missing structured review output
       id: review_retry
+      continue-on-error: true
       if: >-
         steps.prepare.outputs.mode != 'skip' &&
         steps.classify.outputs.retryable != 'false' &&
@@ -430,14 +448,19 @@ runs:
         mkdir -p "$STATE_DIR"
         copy_transcript() {
           local source="$1" name="$2" session="$3"
-          if [[ -n "$source" && -f "$source" ]]; then
+          if [[ "$name" == "analysis-transcript.json" && -f "$STATE_DIR/$name" ]]; then
+            echo "preserved $name captured before retry"
+          elif [[ -n "$source" && -f "$source" ]]; then
             cp "$source" "$STATE_DIR/$name"
             echo "captured $name from $source (session ${session:-unknown})"
           else
             echo "no transcript available for $name"
           fi
         }
-        copy_transcript "$EXECUTION_FILE" "analysis-transcript.json" "$SESSION_ID"
+        # After a retry the shared source is no longer the first attempt.
+        if [[ -z "$RETRY_EXECUTION_FILE" ]]; then
+          copy_transcript "$EXECUTION_FILE" "analysis-transcript.json" "$SESSION_ID"
+        fi
         copy_transcript "$RETRY_EXECUTION_FILE" "analysis-retry-transcript.json" "$RETRY_SESSION_ID"
         # Keep the raw structured output beside the transcript. `compile` also
         # writes a parsed copy, but it never runs when compilation is what
@@ -449,11 +472,24 @@ runs:
           printf '%s' "$RETRY_STRUCTURED_OUTPUT" > "$STATE_DIR/structured-output-retry.json"
         fi
 
-    - name: Compile and validate review
-      id: compile
+    - name: Salvage completed retry output
+      id: salvage
+      if: always() && steps.prepare.outputs.mode != 'skip' && steps.review_retry.outcome == 'failure'
       shell: bash
       env:
         REVIEW_STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output || steps.review_retry.outputs.structured_output }}
+        STATE_DIR: ${{ github.workspace }}/.pr-review
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/review_pipeline.py" salvage \
+          --state-dir "$STATE_DIR"
+
+    - name: Compile and validate review
+      id: compile
+      if: always() && steps.prepare.outcome == 'success' && steps.compose.outcome == 'success'
+      shell: bash
+      env:
+        REVIEW_STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output || steps.review_retry.outputs.structured_output || steps.salvage.outputs.structured_output }}
         STATE_DIR: ${{ github.workspace }}/.pr-review
       run: |
         set -euo pipefail
@@ -462,6 +498,7 @@ runs:
 
     - name: Publish atomically and persist state
       id: publish
+      if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_identity_token || github.token }}
@@ -485,6 +522,7 @@ runs:
         COMPOSE_OUTCOME: ${{ steps.compose.outcome }}
         REVIEW_OUTCOME: ${{ steps.review.outcome }}
         REVIEW_RETRY_OUTCOME: ${{ steps.review_retry.outcome }}
+        REVIEW_SALVAGED: ${{ steps.salvage.outputs.salvaged }}
         COMPILE_OUTCOME: ${{ steps.compile.outcome }}
         PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
         PUBLISH_PUBLISHED: ${{ steps.publish.outputs.published }}

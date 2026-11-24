@@ -2,7 +2,9 @@
 
 import copy
 import json
+import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -100,6 +102,222 @@ def sample_finding(**overrides):
 
 
 class ReviewPipelineTests(unittest.TestCase):
+    def test_salvage_completed_retry_compiles_and_reports_success(self):
+        completed = {
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "completed",
+            "is_error": False,
+            "num_turns": 67,
+            "structured_output": clean_output(),
+        }
+        # The SDK execution file can be JSONL or a JSON array of records.
+        for transcript in (
+            json.dumps({"type": "assistant"}) + "\n" + json.dumps(completed),
+            json.dumps([{"type": "assistant"}, completed]),
+        ):
+            with self.subTest(transcript=transcript), tempfile.TemporaryDirectory() as directory:
+                state_dir = Path(directory)
+                state_dir.joinpath("analysis-retry-transcript.json").write_text(
+                    transcript, encoding="utf-8"
+                )
+                state_dir.joinpath("review-input.json").write_text(
+                    json.dumps(review_input()), encoding="utf-8"
+                )
+                args = pipeline.parser().parse_args(["salvage", "--state-dir", directory])
+                with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+                    "review_pipeline.write_github_output"
+                ) as output, mock.patch("review_pipeline.log") as log:
+                    args.func(args)
+                recovered = output.call_args.args[0]
+                self.assertEqual(recovered["salvaged"], "1")
+                self.assertEqual(json.loads(recovered["structured_output"]), clean_output())
+                self.assertEqual(
+                    json.loads(state_dir.joinpath("structured-output-retry.json").read_text()),
+                    clean_output(),
+                )
+                log.assert_called_once_with("salvaged=1 reason=completed_retry_result")
+                environment = {
+                    "REVIEW_STRUCTURED_OUTPUT": recovered["structured_output"],
+                    "REVIEW_SALVAGED": recovered["salvaged"],
+                    "GITHUB_STEP_SUMMARY": str(state_dir / "summary.md"),
+                    "PREPARE_OUTCOME": "success",
+                    "COMPOSE_OUTCOME": "success",
+                    "REVIEW_OUTCOME": "failure",
+                    "REVIEW_RETRY_OUTCOME": "failure",
+                    "COMPILE_OUTCOME": "success",
+                    "PUBLISH_OUTCOME": "success",
+                    "PUBLISH_PUBLISHED": "true",
+                }
+                with mock.patch.dict("os.environ", environment, clear=True), mock.patch(
+                    "builtins.print"
+                ):
+                    pipeline.compile_command(args)
+                    pipeline.report(args)
+                summary = state_dir.joinpath("summary.md").read_text()
+                self.assertEqual(
+                    json.loads(state_dir.joinpath("review-payload.json").read_text())["verdict"],
+                    "clean",
+                )
+                self.assertIn("Review completed and publication succeeded", summary)
+                self.assertIn(
+                    "Retry output was salvaged after a wrapper turn-count rejection", summary
+                )
+                self.assertNotIn("MODEL_ACTION_FAILED", summary)
+                environment["PUBLISH_OUTCOME"] = "failure"
+                with mock.patch.dict("os.environ", environment, clear=True):
+                    diagnostic = pipeline.inferred_action_failure(
+                        pipeline.step_outcomes(), state_dir=state_dir
+                    )
+                self.assertEqual(diagnostic["code"], "PUBLISH_ACTION_FAILED")
+
+    def test_salvage_rejects_incomplete_or_invalid_transcripts(self):
+        completed = {
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "completed",
+            "is_error": False,
+            "structured_output": clean_output(),
+        }
+        cases = {
+            "max_turns": json.dumps({
+                **completed, "subtype": "error_max_turns",
+                "terminal_reason": "max_turns", "is_error": True,
+            }),
+            "malformed": '{"type":"result",',
+            "truncated_after_result": json.dumps(completed) + "\n{",
+            "non_object": json.dumps({**completed, "structured_output": []}),
+            "string_payload": json.dumps({**completed, "structured_output": "{}"}),
+            "empty_object": json.dumps({**completed, "structured_output": {}}),
+            "stream_event": json.dumps({**completed, "type": "stream_event"}),
+            "nested_tool_result": json.dumps({"type": "user", "content": completed}),
+            "error_result": json.dumps({**completed, "is_error": True}),
+        }
+        for name, transcript in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state_dir = Path(directory)
+                state_dir.joinpath("analysis-retry-transcript.json").write_text(
+                    transcript, encoding="utf-8"
+                )
+                with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+                    "review_pipeline.write_github_output"
+                ) as output, mock.patch("review_pipeline.log") as log:
+                    pipeline.salvage_command(SimpleNamespace(state_dir=directory))
+                output.assert_called_once_with({"salvaged": "0"})
+                self.assertIn("salvaged=0 reason=", log.call_args.args[0])
+                self.assertFalse(state_dir.joinpath("structured-output-retry.json").exists())
+
+    def test_salvage_preserves_existing_action_output(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            "os.environ", {"REVIEW_STRUCTURED_OUTPUT": json.dumps(clean_output())},
+            clear=True,
+        ), mock.patch("review_pipeline.write_github_output") as output, mock.patch(
+            "review_pipeline.log"
+        ) as log:
+            pipeline.salvage_command(SimpleNamespace(state_dir=directory))
+        output.assert_called_once_with({"salvaged": "0"})
+        log.assert_called_once_with("salvaged=0 reason=action_output_available")
+
+    def test_action_salvage_and_capture_wiring(self):
+        action = Path(pipeline.__file__).with_name("action.yml").read_text(encoding="utf-8")
+        steps = {
+            block.splitlines()[0]: block
+            for block in action.split("    - name: ")[1:]
+        }
+        names = list(steps)
+        self.assertEqual(
+            names[names.index("Analyze and verify findings") + 1],
+            "Capture first analysis transcript before retry",
+        )
+        self.assertLess(
+            names.index("Capture analysis session transcript"),
+            names.index("Salvage completed retry output"),
+        )
+        self.assertLess(
+            names.index("Salvage completed retry output"),
+            names.index("Compile and validate review"),
+        )
+        salvage = steps["Salvage completed retry output"]
+        self.assertIn("id: salvage", salvage)
+        conditions = {
+            "Capture first analysis transcript before retry":
+                "if: always() && steps.prepare.outputs.mode != 'skip'",
+            "Salvage completed retry output":
+                "if: always() && steps.prepare.outputs.mode != 'skip' && "
+                "steps.review_retry.outcome == 'failure'",
+            "Compile and validate review":
+                "if: always() && steps.prepare.outcome == 'success' && "
+                "steps.compose.outcome == 'success'",
+            "Publish atomically and persist state":
+                "if: ${{ !cancelled() && steps.compile.outcome == 'success' }}",
+        }
+        for name, condition in conditions.items():
+            with self.subTest(step=name):
+                self.assertEqual(
+                    [
+                        line.strip() for line in steps[name].splitlines()
+                        if line.startswith("      if:")
+                    ],
+                    [condition],
+                )
+        self.assertIn('review_pipeline.py" salvage', salvage)
+        compile_step = steps["Compile and validate review"]
+        self.assertIn(
+            "REVIEW_STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output || "
+            "steps.review_retry.outputs.structured_output || steps.salvage.outputs.structured_output }}",
+            compile_step,
+        )
+        self.assertIn("continue-on-error: true", steps["Retry missing structured review output"])
+        self.assertIn(
+            "REVIEW_SALVAGED: ${{ steps.salvage.outputs.salvaged }}",
+            steps["Report concise review outcome"],
+        )
+        # Run the actual capture scripts against a reused vendor path.
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory, "state")
+            state_dir.mkdir()
+            state_dir.joinpath("analysis-retry-transcript.json").write_text(
+                "stale retry from an earlier round", encoding="utf-8"
+            )
+            execution_file = Path(directory, "execution.json")
+            execution_file.write_text("first attempt", encoding="utf-8")
+            environment = {
+                "STATE_DIR": str(state_dir),
+                "EXECUTION_FILE": str(execution_file),
+                "RETRY_EXECUTION_FILE": str(execution_file),
+                "SESSION_ID": "",
+                "RETRY_SESSION_ID": "",
+                "STRUCTURED_OUTPUT": "",
+                "RETRY_STRUCTURED_OUTPUT": "",
+            }
+            for name in (
+                "Capture first analysis transcript before retry",
+                "Capture analysis session transcript",
+            ):
+                script = textwrap.dedent(steps[name].split("      run: |\n", 1)[1])
+                result = subprocess.run(
+                    ["bash", "-c", script], env=environment,
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                execution_file.write_text("retry attempt", encoding="utf-8")
+            self.assertEqual(state_dir.joinpath("analysis-transcript.json").read_text(), "first attempt")
+            self.assertEqual(state_dir.joinpath("analysis-retry-transcript.json").read_text(), "retry attempt")
+            # Exercise the first-attempt preserve branch against the reused path.
+            environment["RETRY_EXECUTION_FILE"] = ""
+            script = textwrap.dedent(
+                steps["Capture analysis session transcript"].split("      run: |\n", 1)[1]
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], env=environment,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("preserved analysis-transcript.json", result.stdout)
+            self.assertEqual(
+                state_dir.joinpath("analysis-transcript.json").read_text(), "first attempt"
+            )
+
     def test_action_allows_structured_output(self):
         action = Path(pipeline.__file__).with_name("action.yml").read_text(
             encoding="utf-8"

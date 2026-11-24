@@ -1363,6 +1363,55 @@ def classify_command(args: argparse.Namespace) -> None:
         write_github_output({"retryable": "true", "code": ""})
 
 
+def salvage_command(args: argparse.Namespace) -> None:
+    """Recover only a completed SDK result, never intermediate tool output."""
+    state_dir = Path(args.state_dir)
+    if os.environ.get("REVIEW_STRUCTURED_OUTPUT", ""):
+        log("salvaged=0 reason=action_output_available")
+        write_github_output({"salvaged": "0"})
+        return
+    path = state_dir / "analysis-retry-transcript.json"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        log(f"salvaged=0 reason=transcript_unavailable error={error}")
+        write_github_output({"salvaged": "0"})
+        return
+    try:
+        try:
+            value = json.loads(text)
+            records = value if isinstance(value, list) else [value]
+        except json.JSONDecodeError:
+            records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    except json.JSONDecodeError:
+        log("salvaged=0 reason=malformed_transcript")
+        write_github_output({"salvaged": "0"})
+        return
+    # Only inspect top-level SDK records: nested tool results and stream events
+    # can contain arbitrary repository text resembling a completed result.
+    for record in reversed(records):
+        if not isinstance(record, dict) or record.get("type") != "result":
+            continue
+        output = record.get("structured_output")
+        if (
+            record.get("terminal_reason") != "completed"
+            or record.get("subtype") != "success"
+            or record.get("is_error") is not False
+            or not isinstance(output, dict)
+            or not output
+        ):
+            break
+        raw = compact_json(output)
+        (state_dir / "structured-output-retry.json").write_text(
+            raw + "\n", encoding="utf-8"
+        )
+        write_github_output({"salvaged": "1", "structured_output": raw})
+        log("salvaged=1 reason=completed_retry_result")
+        return
+    log("salvaged=0 reason=no_completed_structured_result")
+    write_github_output({"salvaged": "0"})
+
+
 def write_github_output(values: dict[str, Any]) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -3417,6 +3466,8 @@ def inferred_action_failure(
         ),
     )
     for phase, code, message in candidates:
+        if phase == "review_retry" and outcomes.get("compile") == "success":
+            continue
         if outcomes.get(phase) == "failure":
             return diagnostic_for(
                 phase,
@@ -3426,6 +3477,7 @@ def inferred_action_failure(
     if (
         outcomes.get("review") == "failure"
         and outcomes.get("review_retry") != "success"
+        and outcomes.get("compile") != "success"
     ):
         return diagnostic_for(
             "review",
@@ -3606,6 +3658,10 @@ def report(args: argparse.Namespace) -> None:
         f"`{'enabled' if review_input.get('thread_resolution_enabled') else 'disabled'}`",
         f"- **Model retry used:** `{'yes' if retry_used else 'no'}`",
     ]
+    if os.environ.get("REVIEW_SALVAGED", "") == "1":
+        rows.append(
+            "- **Note:** Retry output was salvaged after a wrapper turn-count rejection."
+        )
     rows.extend(analysis_settings())
     if payload:
         rows.append(
@@ -3839,6 +3895,10 @@ def parser() -> argparse.ArgumentParser:
     classify_parser.add_argument("--state-dir", required=True)
     classify_parser.add_argument("--execution-file", default="")
     classify_parser.set_defaults(func=classify_command)
+
+    salvage_parser = subparsers.add_parser("salvage")
+    salvage_parser.add_argument("--state-dir", required=True)
+    salvage_parser.set_defaults(func=salvage_command)
 
     compile_parser = subparsers.add_parser("compile")
     compile_parser.add_argument("--state-dir", required=True)
